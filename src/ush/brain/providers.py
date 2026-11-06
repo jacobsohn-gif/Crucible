@@ -13,13 +13,17 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import email.utils
 import http.client
+import importlib.util
+import inspect
 import json
 import os
+import pathlib
 import random
 import re
 import ssl
 import threading
 import time
+from types import ModuleType
 from typing import Any, Callable, Iterator, Protocol
 import urllib.parse
 
@@ -57,6 +61,80 @@ _CONTEXT_OVERFLOW_MARKERS: tuple[str, ...] = (
     "too many tokens",
 )
 RETRYABLE_HTTP_STATUSES: frozenset[int] = frozenset({408, 409, 425, 429, 499, 500, 502, 503, 504, 529})
+_SAFE_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_BUILTIN_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "google",
+        "vertex",
+        "gemini-enterprise",
+        "antigravity",
+        "anthropic",
+        "vertex-anthropic",
+        "openai",
+        "litellm",
+        "openrouter",
+        "local",
+    }
+)
+_LOCAL_PLUGIN_CACHE: dict[tuple[str, int], ModuleType] = {}
+_LOCAL_PLUGIN_LOCK = threading.Lock()
+
+
+def load_local_transport_plugin(ush_home: pathlib.Path, plugin_name: str) -> ModuleType | None:
+    """Loads a user-owned host-local transport plugin strictly from `~/.ush/providers/<plugin_name>.py`.
+
+    Enforces:
+    1. Strict identifier syntax (`^[A-Za-z0-9_-]{1,64}$`) — zero path traversal.
+    2. Confinement inside `ush_home / "providers"` with symlink rejection.
+    3. POSIX ownership (`st_uid == os.getuid()`) and zero group/world write bits (`st_mode & 0o022 == 0`).
+    """
+    clean = (plugin_name or "").strip()
+    if not _SAFE_PLUGIN_NAME_RE.match(clean):
+        raise ValueError(f"Invalid transport plugin name: {plugin_name!r}")
+
+    home_resolved = ush_home.expanduser().resolve()
+    providers_dir = home_resolved / "providers"
+    if not providers_dir.exists() and not providers_dir.is_symlink():
+        return None
+    if providers_dir.is_symlink() or not providers_dir.is_dir():
+        raise PermissionError(f"Refusing transport plugin directory `{providers_dir}`: must be a regular directory.")
+    if hasattr(os, "getuid"):
+        dir_st = providers_dir.stat()
+        if dir_st.st_uid != os.getuid() or (dir_st.st_mode & 0o022) != 0:
+            raise PermissionError(
+                f"Refusing transport plugin directory `{providers_dir}`: must be owned by current user without group/world write bits (`chmod 700`)."
+            )
+
+    raw_file = providers_dir / f"{clean}.py"
+    if not raw_file.exists() and not raw_file.is_symlink():
+        return None
+    if raw_file.is_symlink():
+        raise PermissionError(f"Refusing symlinked transport plugin `{raw_file}`.")
+    resolved_file = raw_file.resolve()
+    if not resolved_file.is_relative_to(providers_dir.resolve()) or not resolved_file.is_file():
+        raise PermissionError(f"Refusing transport plugin outside `{providers_dir}`.")
+
+    st = resolved_file.stat()
+    if hasattr(os, "getuid"):
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"Refusing transport plugin `{resolved_file}`: not owned by current user.")
+        if (st.st_mode & 0o022) != 0:
+            raise PermissionError(
+                f"Refusing transport plugin `{resolved_file}`: group/world-writable file (`chmod 600` required)."
+            )
+
+    cache_key = (str(resolved_file), st.st_mtime_ns)
+    with _LOCAL_PLUGIN_LOCK:
+        cached = _LOCAL_PLUGIN_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        spec = importlib.util.spec_from_file_location(f"ush_local_provider_{clean}", resolved_file)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load transport plugin spec from `{resolved_file}`.")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LOCAL_PLUGIN_CACHE[cache_key] = mod
+        return mod
 
 
 def _parse_duration_str(raw: str) -> float | None:
@@ -1132,6 +1210,8 @@ class HttpProviderTransport:
         self.vault = vault
         self.timeout_seconds = timeout_seconds
         self.thinking_effort = thinking_effort
+        self._code_assist_projects: dict[tuple[str, str], str] = {}
+        self._ca_lock = threading.Lock()
 
     def _open_sse(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -1195,6 +1275,114 @@ class HttpProviderTransport:
         low_id = profile.model_id.lower()
         return any(k in low_id for k in ("gpt-5", "o1", "o3", "o4", "codex"))
 
+    def _resolve_code_assist_project(
+        self, auth: AuthProfile, base_clean: str, api_ver: str, token: str
+    ) -> str:
+        """Resolves `cloudaicompanionProject` via `v1internal:loadCodeAssist` when `project_id` is unset."""
+        if auth.project_id:
+            return auth.project_id
+        cache_key = (auth.name, base_clean)
+        with self._ca_lock:
+            if cache_key in self._code_assist_projects:
+                return self._code_assist_projects[cache_key]
+
+        url = f"{base_clean}/{api_ver}:loadCodeAssist"
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        body = canonical_json(
+            {
+                "metadata": {
+                    "ideType": "IDE_UNSPECIFIED",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI",
+                }
+            }
+        ).encode("utf-8")
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "crux-cli/0.1",
+            **dict(auth.extra_headers or {}),
+        }
+        if auth.auth_kind == "api_key":
+            headers["x-goog-api-key"] = token
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        resolved_proj = ""
+        conn: http.client.HTTPConnection | None = None
+        resp: http.client.HTTPResponse | None = None
+        try:
+            if parsed.scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    host, port or 443, context=secure_ssl_context(), timeout=min(15.0, self.timeout_seconds)
+                )
+            else:
+                conn = http.client.HTTPConnection(host, port or 80, timeout=min(15.0, self.timeout_seconds))
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            raw_bytes = resp.read(65_536)
+            if 200 <= resp.status < 300 and raw_bytes:
+                data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                if isinstance(data, dict):
+                    cp = data.get("cloudaicompanionProject")
+                    if isinstance(cp, str):
+                        resolved_proj = cp.strip()
+                    elif isinstance(cp, dict):
+                        resolved_proj = str(cp.get("id") or "").strip()
+        except (http.client.HTTPException, OSError, json.JSONDecodeError, ValueError):
+            resolved_proj = ""
+        finally:
+            if resp is not None:
+                resp.close()
+            if conn is not None:
+                conn.close()
+
+        with self._ca_lock:
+            self._code_assist_projects[cache_key] = resolved_proj
+        return resolved_proj
+
+    def _invoke_local_plugin(
+        self,
+        mod: ModuleType,
+        *,
+        profile: ModelCapabilityProfile,
+        auth_profile: AuthProfile,
+        token: str,
+        system_prompt: str,
+        messages: list[CanonicalMessage],
+        tools: list[dict[str, Any]],
+        session_id: str,
+        on_event: Callable[[StreamEvent], None] | None,
+    ) -> CanonicalMessage:
+        fn = getattr(mod, "stream_turn", None)
+        if fn is None and hasattr(mod, "Transport"):
+            inst = mod.Transport(self.vault)
+            fn = inst.stream_turn
+        if not callable(fn):
+            raise RuntimeError(f"Transport plugin `{mod.__name__}` must define `stream_turn(...)` or `Transport`.")
+        candidate_kwargs: dict[str, Any] = {
+            "profile": profile,
+            "auth_profile": auth_profile,
+            "token": token,
+            "system_prompt": system_prompt,
+            "messages": messages,
+            "tools": tools,
+            "session_id": session_id,
+            "on_event": on_event,
+            "transport": self,
+        }
+        sig = inspect.signature(fn)
+        accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        call_kwargs = (
+            candidate_kwargs
+            if accepts_varkw
+            else {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
+        )
+        return fn(**call_kwargs)
+
     def stream_turn(
         self,
         *,
@@ -1208,14 +1396,45 @@ class HttpProviderTransport:
     ) -> CanonicalMessage:
         token = self.vault.resolve_bearer_or_key(auth_profile)
         prov = auth_profile.provider
+
+        # Host-local drop-in transport plugin (`~/.ush/providers/<plugin>.py`, strictly outside Git)
+        plugin_slug = auth_profile.transport_plugin or (prov if prov not in _BUILTIN_PROVIDERS else "")
+        if plugin_slug:
+            if auth_profile.source not in ("vault", "keychain", "workstation"):
+                raise PermissionError(
+                    f"Refused `transport_plugin` on profile '{auth_profile.name}': allowed strictly from `~/.ush/`."
+                )
+            mod = load_local_transport_plugin(self.vault.ush_home, plugin_slug)
+            if mod is not None:
+                return self._invoke_local_plugin(
+                    mod,
+                    profile=profile,
+                    auth_profile=auth_profile,
+                    token=token,
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                    session_id=session_id,
+                    on_event=on_event,
+                )
+            if auth_profile.transport_plugin:
+                raise RuntimeError(
+                    f"Configured transport plugin `{auth_profile.transport_plugin}` not found at "
+                    f"`{self.vault.ush_home / 'providers' / (auth_profile.transport_plugin + '.py')}`."
+                )
+
         if prov in ("google", "vertex", "gemini-enterprise"):
-            return self._stream_gemini(profile, auth_profile, token, system_prompt, messages, tools, on_event)
+            return self._stream_gemini(
+                profile, auth_profile, token, system_prompt, messages, tools, on_event, session_id=session_id
+            )
         if prov == "antigravity":
             if self._is_antigravity_openai_endpoint(profile, auth_profile):
                 return self._stream_openai_compat(
                     profile, auth_profile, token, system_prompt, messages, tools, session_id, on_event
                 )
-            return self._stream_gemini(profile, auth_profile, token, system_prompt, messages, tools, on_event)
+            return self._stream_gemini(
+                profile, auth_profile, token, system_prompt, messages, tools, on_event, session_id=session_id
+            )
         if prov in ("anthropic", "vertex-anthropic"):
             return self._stream_anthropic(profile, auth_profile, token, system_prompt, messages, tools, on_event)
         if self._should_use_openai_responses(profile, auth_profile, token):
@@ -1243,6 +1462,7 @@ class HttpProviderTransport:
         messages: list[CanonicalMessage],
         tools: list[dict[str, Any]],
         on_event: Callable[[StreamEvent], None] | None,
+        session_id: str = "",
     ) -> CanonicalMessage:
         base_clean = auth.base_url.rstrip("/")
         is_code_assist = auth.api_mode == "code_assist" or "cloudcode-pa.googleapis.com" in base_clean
@@ -1290,18 +1510,20 @@ class HttpProviderTransport:
             # 1. Gemini Enterprise Code Assist (`cloudcode-pa` `v1internal:streamGenerateContent?alt=sse`)
             if is_code_assist:
                 api_ver = os.environ.get("CODE_ASSIST_API_VERSION", "v1internal").strip("/")
+                ca_proj = auth.project_id or self._resolve_code_assist_project(auth, base_clean, api_ver, token)
                 url = f"{base_clean}/{api_ver}:streamGenerateContent?alt=sse"
                 if auth.auth_kind == "api_key":
                     headers["x-goog-api-key"] = token
                 elif token:
                     headers["Authorization"] = f"Bearer {token}"
+                req_inner = {**body_payload, "session_id": session_id} if session_id else body_payload
                 ca_envelope: dict[str, Any] = {
                     "model": profile.model_id,
                     "user_prompt_id": new_id("prompt"),
-                    "request": body_payload,
+                    "request": req_inner,
                 }
-                if auth.project_id:
-                    ca_envelope["project"] = auth.project_id
+                if ca_proj:
+                    ca_envelope["project"] = ca_proj
                 return self._open_sse(url, headers, ca_envelope)
 
             # 2. Gemini Enterprise / Vertex Express Mode (API key without project/location)
@@ -2292,8 +2514,8 @@ class UniversalModelClient:
                 if is_context_overflow_error(exc.status, exc.detail):
                     raise
 
-                # 1. Expired OAuth / gcloud ADC token -> invalidate cache & refresh once immediately
-                if exc.status == 401 and not refreshed_401 and cur_auth.auth_kind in ("gcloud_adc", "oauth"):
+                # 1. Expired OAuth / gcloud ADC / command token -> invalidate cache & refresh once immediately
+                if exc.status == 401 and not refreshed_401 and cur_auth.auth_kind in ("gcloud_adc", "oauth", "command"):
                     refreshed_401 = True
                     self.vault.invalidate_token_cache(cur_auth)
                     if on_event:

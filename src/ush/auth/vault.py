@@ -21,6 +21,7 @@ import os
 import pathlib
 import platform
 import secrets
+import shlex
 import shutil
 import socket
 import ssl
@@ -103,28 +104,60 @@ def secure_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def is_trusted_host_local_file(path: pathlib.Path) -> bool:
+    """Verifies `path` is a regular non-symlink file owned by the current user and not group/world-writable."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        st = path.stat()
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            return False
+        if hasattr(os, "getuid") and (st.st_mode & 0o022) != 0:
+            return False
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class AuthProfile:
     name: str
-    # google | vertex | gemini-enterprise | antigravity | vertex-anthropic | anthropic | openai | litellm | openrouter | local
+    # google | vertex | gemini-enterprise | antigravity | vertex-anthropic | anthropic | openai | litellm | openrouter | local | <plugin>
     provider: str
-    # api_key | bearer | oauth | gcloud_adc | none
+    # api_key | bearer | oauth | gcloud_adc | command | none
     auth_kind: str
     base_url: str
     project_id: str | None = None
     region: str = "global"
     default_model: str | None = None
-    source: str = "vault"  # vault | keychain | env:* | gcloud | localhost | codex_cli | claude_cli
+    source: str = "vault"  # vault | keychain | workstation | env:* | gcloud | localhost | codex_cli | claude_cli
     # Wire sub-mode: "" (auto) | "express" | "code_assist" | "responses" | "chat_completions"
     api_mode: str = ""
     # Optional service tier (e.g., "priority" on Gemini Enterprise / Antigravity / OpenAI)
     service_tier: str = ""
     # Optional non-secret organizational/tenant headers (e.g., OpenAI-Organization, OpenAI-Project, ChatGPT-Account-Id)
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # Host-local credential helper command (`shlex.split`, `shell=False`) strictly from `~/.ush/` when `auth_kind == "command"`
+    credential_command: str = ""
+    token_ttl_seconds: int = 1800
+    # Optional host marker path predicate: profile is eligible only on machines where this path exists
+    require_host_path: str = ""
+    # Optional host-local transport plugin module name in `~/.ush/providers/<transport_plugin>.py`
+    transport_plugin: str = ""
     # Ephemeral runtime cooldown timestamp after HTTP 429
     cooldown_until: float = 0.0
 
+    def is_available_on_host(self) -> bool:
+        if not self.require_host_path:
+            return True
+        try:
+            return pathlib.Path(self.require_host_path).expanduser().exists()
+        except OSError:
+            return False
+
     def is_available(self, now: float | None = None) -> bool:
+        if not self.is_available_on_host():
+            return False
         return (now if now is not None else time.time()) >= self.cooldown_until
 
     def to_metadata_dict(self) -> dict[str, Any]:
@@ -144,6 +177,14 @@ class AuthProfile:
             d["service_tier"] = self.service_tier
         if self.extra_headers:
             d["extra_headers"] = dict(self.extra_headers)
+        if self.credential_command:
+            d["credential_command"] = self.credential_command
+        if self.token_ttl_seconds != 1800:
+            d["token_ttl_seconds"] = int(self.token_ttl_seconds)
+        if self.require_host_path:
+            d["require_host_path"] = self.require_host_path
+        if self.transport_plugin:
+            d["transport_plugin"] = self.transport_plugin
         return d
 
 
@@ -187,10 +228,13 @@ class CredentialVault:
     def __init__(self, ush_home: pathlib.Path | None = None, probe_ambient: bool = True) -> None:
         self.ush_home = (ush_home or pathlib.Path(os.environ.get("USH_HOME", "~/.ush"))).expanduser().resolve()
         self.profiles_path = self.ush_home / "auth_profiles.json"
+        self.workstation_path = self.ush_home / "workstation.json"
         self.fallback_vault_path = self.ush_home / "credentials.vault.json"
         self._profiles: dict[str, AuthProfile] = {}
         self._active_profile: str | None = None
         self._gcloud_token_cache: tuple[str, float] | None = None
+        self._cmd_token_cache: dict[str, tuple[str, float]] = {}
+        self.security_warnings: list[str] = []
         self._lock = threading.Lock()
         self._load_profiles()
         if probe_ambient:
@@ -325,20 +369,54 @@ class CredentialVault:
     # ---- Profile Metadata Persistence ----
 
     def _load_profiles(self) -> None:
-        if not self.profiles_path.is_file():
-            return
-        try:
-            data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            self._active_profile = data.get("active_profile")
-            valid_keys = set(AuthProfile.__dataclass_fields__.keys())
-            for item in data.get("profiles", []):
-                if not isinstance(item, dict):
-                    continue
-                filtered = {k: v for k, v in item.items() if k in valid_keys}
-                prof = AuthProfile(**filtered)
-                self._profiles[prof.name] = prof
-        except (OSError, json.JSONDecodeError, TypeError):
-            pass
+        valid_keys = set(AuthProfile.__dataclass_fields__.keys()) - {"cooldown_until"}
+        if self.profiles_path.is_file():
+            trusted_main = is_trusted_host_local_file(self.profiles_path)
+            if not trusted_main:
+                self.security_warnings.append(
+                    f"Ignoring privileged command/plugin hooks in `{self.profiles_path}` (unsafe permissions/owner; run `chmod 600`)."
+                )
+            try:
+                data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+                self._active_profile = data.get("active_profile")
+                for item in data.get("profiles", []):
+                    if not isinstance(item, dict):
+                        continue
+                    filtered = {k: v for k, v in item.items() if k in valid_keys}
+                    if not trusted_main:
+                        filtered.pop("credential_command", None)
+                        filtered.pop("transport_plugin", None)
+                        if filtered.get("auth_kind") == "command":
+                            continue
+                    prof = AuthProfile(**filtered)
+                    self._profiles[prof.name] = prof
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+
+        # Host-local workstation overlay (`~/.ush/workstation.json`, strictly outside Git, 0600/non-group-writable)
+        if self.workstation_path.exists() or self.workstation_path.is_symlink():
+            if not is_trusted_host_local_file(self.workstation_path):
+                self.security_warnings.append(
+                    f"Refused `{self.workstation_path}`: must be a regular user-owned file without group/world write bits (`chmod 600`)."
+                )
+            else:
+                try:
+                    ws_data = json.loads(self.workstation_path.read_text(encoding="utf-8"))
+                    ws_items = ws_data.get("profiles", []) if isinstance(ws_data, dict) else []
+                    for item in ws_items:
+                        if not isinstance(item, dict):
+                            continue
+                        filtered = {k: v for k, v in item.items() if k in valid_keys}
+                        filtered["source"] = "workstation"
+                        prof = AuthProfile(**filtered)
+                        self._profiles[prof.name] = prof
+                    ws_active = ws_data.get("active_profile") if isinstance(ws_data, dict) else None
+                    if ws_active and ws_active in self._profiles and self._profiles[ws_active].is_available_on_host():
+                        cur = self._profiles.get(self._active_profile or "")
+                        if cur is None or not cur.is_available_on_host() or bool(ws_data.get("prefer_active", False)):
+                            self._active_profile = str(ws_active)
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
 
     def _save_profiles(self) -> None:
         persisted = [
@@ -604,9 +682,14 @@ class CredentialVault:
                     ),
                 )
 
-        if not self._active_profile or self._active_profile not in self._profiles:
-            if self._profiles:
-                self._active_profile = next(iter(self._profiles.keys()))
+        if (
+            not self._active_profile
+            or self._active_profile not in self._profiles
+            or not self._profiles[self._active_profile].is_available_on_host()
+        ):
+            avail_first = next((k for k, p in self._profiles.items() if p.is_available_on_host()), None)
+            if avail_first:
+                self._active_profile = avail_first
 
     def _discover_ambient_cli_tokens(self) -> None:
         """Discovers user-owned `~/.codex/auth.json` and `~/.claude/.credentials.json` tokens strictly in memory."""
@@ -738,7 +821,10 @@ class CredentialVault:
         for prof in self._profiles.values():
             if prof.is_available():
                 return prof
-        return self._profiles.get(self._active_profile or "")
+        fallback = self._profiles.get(self._active_profile or "")
+        if fallback is not None and not fallback.is_available_on_host():
+            return next((p for p in self._profiles.values() if p.is_available_on_host()), None)
+        return fallback
 
     def select_failover_profile(
         self,
@@ -790,9 +876,13 @@ class CredentialVault:
             return self.get_active_profile()
 
     def invalidate_token_cache(self, profile: AuthProfile | None = None) -> None:
-        """Clears cached OAuth/ADC tokens after an HTTP 401 so the next retry fetches a fresh token."""
+        """Clears cached OAuth/ADC/command tokens after an HTTP 401 so the next retry fetches a fresh token."""
         with self._lock:
             self._gcloud_token_cache = None
+            if profile is not None:
+                self._cmd_token_cache.pop(profile.name, None)
+            else:
+                self._cmd_token_cache.clear()
             if profile and profile.auth_kind == "oauth":
                 secret = self.load_secret(profile.name)
                 if secret and secret.refresh_token and secret.token_url:
@@ -889,6 +979,67 @@ class CredentialVault:
         self._save_profiles()
         return prof
 
+    def register_command_profile(
+        self,
+        name: str,
+        provider: str,
+        credential_command: str,
+        base_url: str,
+        *,
+        default_model: str | None = None,
+        project_id: str | None = None,
+        region: str = "global",
+        api_mode: str = "",
+        service_tier: str = "",
+        token_ttl_seconds: int = 1800,
+        require_host_path: str = "",
+        transport_plugin: str = "",
+        extra_headers: dict[str, str] | None = None,
+        persist_to_workstation_overlay: bool = False,
+    ) -> AuthProfile:
+        """Registers a host-local `auth_kind='command'` profile in `~/.ush/workstation.json` or `auth_profiles.json`."""
+        cmd_clean = credential_command.strip()
+        if not cmd_clean or not shlex.split(cmd_clean):
+            raise ValueError("`credential_command` must not be empty.")
+        prof = AuthProfile(
+            name=name,
+            provider=provider,
+            auth_kind="command",
+            base_url=base_url.rstrip("/"),
+            project_id=project_id.strip() if project_id else None,
+            region=region.strip() or "global",
+            default_model=default_model,
+            source="workstation" if persist_to_workstation_overlay else "vault",
+            api_mode=api_mode,
+            service_tier=service_tier,
+            extra_headers=dict(extra_headers or {}),
+            credential_command=cmd_clean,
+            token_ttl_seconds=max(1, int(token_ttl_seconds)),
+            require_host_path=require_host_path.strip(),
+            transport_plugin=transport_plugin.strip(),
+        )
+        self._profiles[name] = prof
+        self._active_profile = name
+        if persist_to_workstation_overlay:
+            existing_ws: dict[str, Any] = {"active_profile": name, "prefer_active": True, "profiles": []}
+            if is_trusted_host_local_file(self.workstation_path):
+                try:
+                    loaded = json.loads(self.workstation_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        existing_ws = loaded
+                except (OSError, json.JSONDecodeError):
+                    pass
+            kept = [
+                p for p in (existing_ws.get("profiles") or [])
+                if isinstance(p, dict) and p.get("name") != name
+            ]
+            kept.append(prof.to_metadata_dict())
+            existing_ws["active_profile"] = name
+            existing_ws["profiles"] = kept
+            self._atomic_write_0600(self.workstation_path, json.dumps(existing_ws, indent=2))
+        self._save_profiles()
+        return prof
+
     def logout(self, name: str) -> bool:
         if name not in self._profiles:
             return False
@@ -909,6 +1060,8 @@ class CredentialVault:
             return os.environ.get(env_key, "")
         if profile.auth_kind == "gcloud_adc":
             return self._get_gcloud_access_token()
+        if profile.auth_kind == "command":
+            return self._resolve_command_token(profile)
         ambient = getattr(self, "_ambient_secrets", {}).get(profile.name)
         secret = ambient or self.load_secret(profile.name)
         if not secret:
@@ -925,6 +1078,91 @@ class CredentialVault:
             if ambient is not None:
                 self._ambient_secrets[profile.name] = secret
         return secret.access_token
+
+    def _resolve_command_token(self, profile: AuthProfile) -> str:
+        """Executes a user-owned host-local credential helper (`shell=False`) and caches the returned token."""
+        if profile.source not in ("vault", "keychain", "workstation"):
+            raise PermissionError(
+                f"Refused `credential_command` on profile '{profile.name}': allowed strictly from `~/.ush/`."
+            )
+        cfg_file = self.workstation_path if profile.source == "workstation" else self.profiles_path
+        if cfg_file.exists() and not is_trusted_host_local_file(cfg_file):
+            raise PermissionError(
+                f"Refused `credential_command` on profile '{profile.name}': `{cfg_file}` has unsafe permissions (`chmod 600` required)."
+            )
+        with self._lock:
+            now = time.time()
+            cached = self._cmd_token_cache.get(profile.name)
+            if cached and now < cached[1]:
+                return cached[0]
+
+        cmd_raw = (profile.credential_command or "").strip()
+        if not cmd_raw:
+            raise RuntimeError(f"Profile '{profile.name}' has `auth_kind='command'` without `credential_command`.")
+        argv = shlex.split(cmd_raw)
+        if not argv:
+            raise RuntimeError(f"Invalid `credential_command` for profile '{profile.name}'.")
+
+        from ush.kernel.security import scrub_child_environment
+
+        env = scrub_child_environment()
+        for ws_env in ("KRB5CCNAME", "CLOUDSDK_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS", "XDG_CONFIG_HOME"):
+            if ws_env in os.environ:
+                env[ws_env] = os.environ[ws_env]
+        env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
+        self._ensure_home()
+
+        try:
+            res = subprocess.run(
+                argv,
+                cwd=str(self.ush_home),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(f"Credential helper failed for '{profile.name}': {type(exc).__name__}") from exc
+
+        if res.returncode != 0:
+            err_msg = (res.stderr or "").strip()[:240]
+            raise RuntimeError(
+                f"Credential helper for '{profile.name}' exited with status {res.returncode}: {err_msg}"
+            )
+
+        out = (res.stdout or "").strip()
+        if not out:
+            raise RuntimeError(f"Credential helper for '{profile.name}' returned empty output.")
+
+        tok = ""
+        ttl = max(1.0, float(profile.token_ttl_seconds))
+        if out.startswith("{"):
+            try:
+                parsed = json.loads(out)
+                if isinstance(parsed, dict):
+                    status_obj = parsed.get("status") if isinstance(parsed.get("status"), dict) else {}
+                    tok = str(
+                        parsed.get("access_token")
+                        or parsed.get("token")
+                        or parsed.get("id_token")
+                        or parsed.get("SessionToken")
+                        or (status_obj or {}).get("token")
+                        or ""
+                    ).strip()
+                    if "expires_in" in parsed:
+                        exp_in = float(parsed["expires_in"])
+                        ttl = max(1.0, exp_in - min(60.0, exp_in * 0.1))
+                    elif "expires_at" in parsed:
+                        rem = float(parsed["expires_at"]) - time.time()
+                        ttl = max(1.0, rem - min(60.0, max(0.0, rem * 0.1)))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                tok = ""
+        if not tok:
+            tok = out.splitlines()[0].strip()
+
+        with self._lock:
+            self._cmd_token_cache[profile.name] = (tok, time.time() + ttl)
+        return tok
 
     def _try_refresh_adc_file_direct(self) -> tuple[str, float] | None:
         """Refreshes `authorized_user` ADC JSON directly over TLS without spawning a `gcloud` subprocess."""
@@ -1323,6 +1561,7 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         ("qwen", "Alibaba Qwen / DashScope API (Qwen3-Coder)"),
         ("kimi", "Moonshot Kimi API (Kimi-K2)"),
         ("local", "Local / Self-Hosted GPU Endpoint (Ollama / vLLM / SGLang)"),
+        ("workstation", "Host-Local Workstation Adapter (`~/.ush/workstation.json` — command helper / local plugin)"),
     ]
     provider = provider_arg
     if not provider:
@@ -1472,6 +1711,29 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
             base_url=url,
             default_model=mdl,
             auth_kind="api_key" if key else "none",
+        )
+
+    if provider == "workstation":
+        name = input("Workstation profile name [workstation]: ").strip() or "workstation"
+        wire_prov = input("Wire family (`gemini-enterprise`, `antigravity`, `openai`, `anthropic`, or plugin name) [gemini-enterprise]: ").strip() or "gemini-enterprise"
+        url = input("Workstation Endpoint Base URL: ").strip()
+        cmd = input("Token helper command (executed locally via `shell=False`, e.g. `gcloud auth print-access-token`): ").strip()
+        mode_s = input("Optional wire `api_mode` (`code_assist`, `express`, `responses`, `chat_completions`, or blank) []: ").strip()
+        proj = input("Optional project/tenant ID (press Enter to auto-resolve or skip) []: ").strip() or None
+        mdl = input("Default model [gemini-3.1-pro-preview]: ").strip() or "gemini-3.1-pro-preview"
+        host_marker = input("Optional host marker path required to activate profile (press Enter for always) []: ").strip()
+        plugin = input("Optional `~/.ush/providers/<plugin>.py` module name (press Enter for built-in wire) []: ").strip()
+        return vault.register_command_profile(
+            name=name,
+            provider=wire_prov,
+            credential_command=cmd,
+            base_url=url,
+            default_model=mdl,
+            project_id=proj,
+            api_mode=mode_s,
+            require_host_path=host_marker,
+            transport_plugin=plugin,
+            persist_to_workstation_overlay=True,
         )
 
     if provider == "local":

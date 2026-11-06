@@ -1,6 +1,6 @@
 """Visual Inline-Dock Terminal UI (`ush`): Navigable Menus, Live Thinking Threads & Concurrent Prompt Queue.
 
-Zero-third-party-dependency Jetski-CLI / Gemini-CLI-style inline terminal compositor:
+Zero-third-party-dependency Visual Inline-Dock terminal compositor:
 1. Preserves 100% native terminal scrollback & mouse text selection (no destructive alt-screen wipe).
 2. Enforces `INV-TUI-1`: every line in the pinned bottom dock is strictly clamped to `<= cols - 1` visible
    Unicode columns (`vis_width`), preventing terminal line-wrap row-count drift and ghost lines.
@@ -905,7 +905,7 @@ class InlineDockCompositor:
 
 
 class VisualStreamRenderer:
-    """Formats `StreamEvent`s into clean Jetski-style thinking thread cards + feeds `ThinkingThreadTracker`."""
+    """Formats `StreamEvent`s into clean Inline-Dock thinking thread cards + feeds `ThinkingThreadTracker`."""
 
     BOLD_MD_RE = re.compile(r"\*\*([^*\n]{1,90})\*\*")
 
@@ -1088,7 +1088,7 @@ class VisualStreamRenderer:
 
 
 class VisualTuiController:
-    """Drives the Jetski-style navigable menus, live thinking threads, and concurrent prompt queue."""
+    """Drives the Inline-Dock navigable menus, live thinking threads, and concurrent prompt queue."""
 
     def __init__(
         self,
@@ -1616,7 +1616,12 @@ class VisualTuiController:
         items: list[MenuItem] = []
         for p in self.rt.vault.list_profiles():
             cd_rem = max(0, int(p.cooldown_until - now))
-            badge = "● active" if p.name == cur else (f"⏳ cd {cd_rem}s" if cd_rem > 0 else p.auth_kind)
+            host_ok = p.is_available_on_host()
+            badge = (
+                "● active"
+                if p.name == cur
+                else ("⊘ host-skip" if not host_ok else (f"⏳ cd {cd_rem}s" if cd_rem > 0 else p.auth_kind))
+            )
             mode_tag = f" · {p.api_mode}" if p.api_mode else ""
             url_tag = f" · {p.base_url}" if p.base_url else ""
             items.append(
@@ -1635,6 +1640,10 @@ class VisualTuiController:
 
         def _pick(it: MenuItem) -> None:
             self.menu = None
+            cand = next((x for x in self.rt.vault.list_profiles() if x.name == it.key), None)
+            if cand is not None and not cand.is_available_on_host():
+                self.flash(f"Profile `{cand.name}` requires host path `{cand.require_host_path}` (not present on this machine)")
+                return
             prof = self.rt.vault.switch_profile(it.key)
             self.rt.runner.switch_model(prof.default_model or self.rt.runner.model_profile.model_id, prof)
             self.flash(f"Switched auth -> {prof.name} ({prof.provider} · {self.rt.runner.model_profile.model_id})")
@@ -2561,7 +2570,7 @@ def run_visual_tui(
     use_color: bool = True,
     open_sessions_on_start: bool = False,
 ) -> int:
-    """Runs the Jetski-style Visual Inline-Dock TUI on a real TTY with strict `termios` cleanup."""
+    """Runs the Visual Inline-Dock TUI on a real TTY with strict `termios` cleanup."""
     fd = sys.stdin.fileno()
     orig_attrs = termios.tcgetattr(fd)
     restored = [False]

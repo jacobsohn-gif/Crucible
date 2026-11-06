@@ -267,12 +267,18 @@ def render_auth_status(vault: CredentialVault) -> str:
             extras.append(f"tier={p.service_tier}")
         if p.base_url:
             extras.append(f"url={p.base_url}")
+        if p.transport_plugin:
+            extras.append(f"plugin={p.transport_plugin}")
+        if p.require_host_path and not p.is_available_on_host():
+            extras.append("host-gated=inactive")
         if p.cooldown_until > now:
             extras.append(f"cooldown={int(p.cooldown_until - now)}s")
         sfx = f" [{' · '.join(extras)}]" if extras else ""
         lines.append(
             f" {star} {p.name:26s} | provider={p.provider:18s} | kind={p.auth_kind:10s} | src={p.source}{sfx}"
         )
+    for warn in getattr(vault, "security_warnings", ()):
+        lines.append(f" ! {warn}")
     return "\n".join(lines)
 
 
@@ -690,9 +696,15 @@ def handle_slash_command(
 
     if cmd_name == "swarm":
         if not arg_str:
-            print("Usage: `/swarm [auto|g1|g2|g3|g4|argonclaw] <task>`")
+            print("Usage: `/swarm [auto|g1|g2|g3|g4|peer|argonclaw] <task>`")
             return False, None, []
         toks = arg_str.split(None, 1)
+        if toks[0].lower() in ("peer", "--peer-cli") and len(toks) > 1:
+            peer_res = rt.swarm.dispatch_to_peer_cli(toks[1])
+            if peer_res.conversation_id:
+                print(c_green(f"Peer conversation: `{peer_res.conversation_id}`"))
+            print(peer_res.output or f"Peer CLI exited with status {peer_res.returncode}")
+            return False, None, []
         if toks[0].lower() == "argonclaw" and len(toks) > 1:
             rc, out = rt.swarm.dispatch_to_argonclaw_cluster(
                 task_id=new_id("ush"), title=toks[1][:64], description=toks[1]
@@ -1506,14 +1518,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ext_p.add_argument("action", nargs="?", default="list", choices=["list", "install"])
     ext_p.add_argument("path", nargs="?", default=None)
 
-    sw_p = sub.add_parser("swarm", help="Dispatch task to local 4-Gear Swarm or remote container cluster")
-    sw_p.add_argument("task", help="Task prompt to solve")
+    sw_p = sub.add_parser("swarm", help="Dispatch task to local 4-Gear Swarm, peer CLI, or remote container cluster")
+    sw_p.add_argument("task", nargs="?", default="", help="Task prompt or message to solve")
     sw_p.add_argument(
         "--remote-cluster",
         "--argonclaw",
         dest="argonclaw",
         action="store_true",
         help="Dispatch directly to remote swarm cluster (`SWARM_HOST` / `SWARM_DISPATCHER_SCRIPT`)",
+    )
+    sw_p.add_argument(
+        "--peer-cli",
+        dest="peer_cli",
+        action="store_true",
+        help="Delegate task to external peer agent CLI (`USH_PEER_AGENT_BIN` / `agentapi`)",
+    )
+    sw_p.add_argument(
+        "--peer-conversation",
+        dest="peer_conversation",
+        default=None,
+        help="Existing peer conversation ID for `send-message` follow-up or `--peer-metadata`",
+    )
+    sw_p.add_argument(
+        "--peer-metadata",
+        dest="peer_metadata",
+        action="store_true",
+        help="Fetch JSON metadata for `--peer-conversation` via peer agent CLI",
+    )
+    sw_p.add_argument(
+        "--gear",
+        dest="swarm_gear",
+        choices=["auto", "g1", "g2", "g3", "g4"],
+        default=None,
+        help="Swarm gearbox override (`auto|g1|g2|g3|g4`)",
+    )
+    sw_p.add_argument(
+        "--output-format",
+        dest="swarm_output_format",
+        choices=["text", "json", "stream-json"],
+        default=None,
+        help="Output format (`text`, `json`, or `stream-json`)",
     )
 
     return p
@@ -1623,16 +1667,46 @@ def main(argv: list[str] | None = None) -> int:
             rt.runner.close()
 
     if args.subcommand == "swarm":
+        eff_fmt = getattr(args, "swarm_output_format", None) or args.output_format
+        eff_gear = getattr(args, "swarm_gear", None) or args.gear
         try:
+            if args.peer_cli or args.peer_metadata or args.peer_conversation:
+                if not args.peer_metadata and not args.task.strip():
+                    print("Usage: `crux swarm --peer-cli \"<task>\"`", file=sys.stderr)
+                    return 2
+                peer_res = rt.swarm.dispatch_to_peer_cli(
+                    args.task,
+                    conversation_id=args.peer_conversation,
+                    metadata_only=args.peer_metadata,
+                )
+                if eff_fmt == "json":
+                    print(
+                        json.dumps(
+                            {
+                                "returncode": peer_res.returncode,
+                                "conversation_id": peer_res.conversation_id,
+                                "metadata": peer_res.metadata,
+                                "output": peer_res.output,
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    if peer_res.output:
+                        print(peer_res.output)
+                return peer_res.returncode
+            if not args.task.strip():
+                print("Usage: `crux swarm \"<task>\"`", file=sys.stderr)
+                return 2
             if args.argonclaw:
                 rc, out = rt.swarm.dispatch_to_argonclaw_cluster(
                     task_id=new_id("ush"), title=args.task[:64], description=args.task
                 )
                 print(out)
                 return rc
-            rt.gear = select_initial_gear(args.task, Gear(args.gear))
+            rt.gear = select_initial_gear(args.task, Gear(eff_gear))
             print(c_cyan(f"[USH Swarm Gearbox -> {rt.gear.value.upper()}]"))
-            return run_headless(rt, args.task, output_format=args.output_format, max_turns=args.max_turns)
+            return run_headless(rt, args.task, output_format=eff_fmt, max_turns=args.max_turns)
         finally:
             rt.runner.close()
 

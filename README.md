@@ -138,8 +138,9 @@ crux -p "Audit src/ush/kernel/fsm.py invariants" --trace full
 crux -p "Verify pyproject.toml dependencies" --output-format json
 crux -p "Trace step-by-step execution" --output-format stream-json
 
-# 6. Dispatch the 4-Gear Elastic Swarm or start the loopback ACP JSON-RPC 2.0 daemon
+# 6. Dispatch the 4-Gear Elastic Swarm, Peer Agent CLI, or start the loopback ACP JSON-RPC 2.0 daemon
 crux swarm --gear auto "Implement feature X and verify unit tests"
+crux swarm --peer-cli "Review auth module invariants and return findings"
 crux swarm --argonclaw "Run parallel 6-stage architecture falsification review"
 crux serve --acp
 ```
@@ -301,7 +302,7 @@ Run the complete zero-dependency test suite in `<3 seconds`:
 ### Source Modules (`29` Files, `0` External Dependencies)
 - **CLI, Visual Inline-Dock TUI & ACP Server (`src/ush/cli/`)**
   - [`bin/crux`](bin/crux) & [`pyproject.toml`](pyproject.toml) — Symlink-safe source launcher & PEP 621 package config.
-  - [`src/ush/cli/tui.py`](src/ush/cli/tui.py) — Jetski-style Visual Inline-Dock TUI (`InlineDockCompositor`, `VisualTuiController`, `ThinkingThreadTracker`, `MenuOverlay`, DEC `?2026h` sync output, `Ctrl+O` Threads Explorer, Concurrent Prompt Queue).
+  - [`src/ush/cli/tui.py`](src/ush/cli/tui.py) — Visual Inline-Dock TUI (`InlineDockCompositor`, `VisualTuiController`, `ThinkingThreadTracker`, `MenuOverlay`, DEC `?2026h` sync output, `Ctrl+O` Threads Explorer, Concurrent Prompt Queue).
   - [`src/ush/cli/main.py`](src/ush/cli/main.py) — CLI entrypoint, slash command handlers, headless `-p` runner, `crux trace`, `crux auth`, `crux swarm`, and `crux doctor`.
   - [`src/ush/cli/acp_server.py`](src/ush/cli/acp_server.py) — Loopback-guarded (`127.0.0.1`) & `stdio` JSON-RPC 2.0 Agent Client Protocol (ACP) server.
 - **Universal Model Brain & Long-Form Thought Ledger (`src/ush/brain/`)**
