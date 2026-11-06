@@ -148,12 +148,16 @@ class SessionRunner:
                 if p.provider == resolved.provider and p.is_available(now)
             ]
             if not candidates and resolved.provider in ("google", "vertex", "gemini-enterprise", "antigravity", "code-assist"):
-                candidates = [
-                    p
-                    for p in self.client.vault.list_profiles()
-                    if p.provider in ("google", "vertex", "gemini-enterprise", "antigravity", "code-assist")
-                    and p.is_available(now)
-                ]
+                active_name = self.client.vault.active_profile_name
+                candidates = sorted(
+                    [
+                        p
+                        for p in self.client.vault.list_profiles()
+                        if p.provider in ("google", "vertex", "gemini-enterprise", "antigravity", "code-assist")
+                        and p.is_available(now)
+                    ],
+                    key=lambda p: (0 if p.name == active_name else 1, 0 if p.provider == "antigravity" else 1),
+                )
             if candidates:
                 self.auth_profile = candidates[0]
                 resolved = resolve_model_profile(model_id, self.auth_profile.provider)
