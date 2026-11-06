@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+if [ -x "$ROOT_DIR/.venv/bin/crux" ]; then
+  exec "$ROOT_DIR/.venv/bin/crux" "$@"
+elif [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+  PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" exec "$ROOT_DIR/.venv/bin/python" -m ush.cli.main "$@"
+fi
+PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m ush.cli.main "$@"

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crucible"
+version = "0.1"
+description = "Crucible (crux v0.1): Model-universal, Popperian thought-tracing coding and 4-Gear Elastic Swarm harness."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.scripts]
+crux = "ush.cli.main:main"
+ush = "ush.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ush"]
+
+[tool.uv]
+managed = true
