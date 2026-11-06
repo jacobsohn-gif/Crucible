@@ -42,8 +42,14 @@ ENV_PROVIDER_MAP: tuple[tuple[str, str, str, str], ...] = (
     # (env_var, profile_name, provider, base_url)
     ("GEMINI_API_KEY", "env-gemini", "google", "https://generativelanguage.googleapis.com"),
     ("GOOGLE_API_KEY", "env-google", "google", "https://generativelanguage.googleapis.com"),
+    ("GEMINI_ENTERPRISE_API_KEY", "env-gemini-enterprise", "gemini-enterprise", "https://aiplatform.googleapis.com"),
+    ("VERTEX_API_KEY", "env-vertex-express", "gemini-enterprise", "https://aiplatform.googleapis.com"),
+    ("GOOGLE_CLOUD_API_KEY", "env-gcloud-apikey", "gemini-enterprise", "https://aiplatform.googleapis.com"),
+    ("ANTIGRAVITY_API_KEY", "env-antigravity", "antigravity", "https://generativelanguage.googleapis.com"),
     ("ANTHROPIC_API_KEY", "env-anthropic", "anthropic", "https://api.anthropic.com"),
     ("OPENAI_API_KEY", "env-openai", "openai", "https://api.openai.com/v1"),
+    ("LITELLM_API_KEY", "env-litellm", "litellm", "http://127.0.0.1:4000/v1"),
+    ("LITELLM_MASTER_KEY", "env-litellm-master", "litellm", "http://127.0.0.1:4000/v1"),
     ("OPENROUTER_API_KEY", "env-openrouter", "openrouter", "https://openrouter.ai/api/v1"),
     ("DEEPSEEK_API_KEY", "env-deepseek", "openrouter", "https://api.deepseek.com/v1"),
     ("DASHSCOPE_API_KEY", "env-qwen", "openrouter", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
@@ -54,15 +60,32 @@ ENV_PROVIDER_MAP: tuple[tuple[str, str, str, str], ...] = (
 PROVIDER_DEFAULT_URLS: dict[str, str] = {
     "google": "https://generativelanguage.googleapis.com",
     "vertex": "https://aiplatform.googleapis.com",
+    "gemini-enterprise": "https://aiplatform.googleapis.com",
+    "code-assist": "https://cloudcode-pa.googleapis.com",
+    "antigravity": "https://aiplatform.googleapis.com",
     "vertex-anthropic": "https://aiplatform.googleapis.com",
     "anthropic": "https://api.anthropic.com",
     "openai": "https://api.openai.com/v1",
+    "litellm": "http://127.0.0.1:4000/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "qwen": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     "kimi": "https://api.moonshot.ai/v1",
     "glm": "https://open.bigmodel.cn/api/paas/v4",
     "local": "http://127.0.0.1:11434/v1",
+}
+
+PROVIDER_FAMILY_MAP: dict[str, str] = {
+    "google": "gemini",
+    "vertex": "gemini",
+    "gemini-enterprise": "gemini",
+    "antigravity": "gemini",
+    "anthropic": "anthropic",
+    "vertex-anthropic": "anthropic",
+    "openai": "openai",
+    "litellm": "litellm",
+    "openrouter": "openrouter",
+    "local": "local_oss",
 }
 
 
@@ -83,13 +106,21 @@ def secure_ssl_context() -> ssl.SSLContext:
 @dataclass
 class AuthProfile:
     name: str
-    provider: str  # google | vertex | vertex-anthropic | anthropic | openai | openrouter | local
-    auth_kind: str  # api_key | oauth | gcloud_adc | none
+    # google | vertex | gemini-enterprise | antigravity | vertex-anthropic | anthropic | openai | litellm | openrouter | local
+    provider: str
+    # api_key | bearer | oauth | gcloud_adc | none
+    auth_kind: str
     base_url: str
     project_id: str | None = None
     region: str = "global"
     default_model: str | None = None
-    source: str = "vault"  # vault | keychain | env | gcloud | localhost
+    source: str = "vault"  # vault | keychain | env:* | gcloud | localhost | codex_cli | claude_cli
+    # Wire sub-mode: "" (auto) | "express" | "code_assist" | "responses" | "chat_completions"
+    api_mode: str = ""
+    # Optional service tier (e.g., "priority" on Gemini Enterprise / Antigravity / OpenAI)
+    service_tier: str = ""
+    # Optional non-secret organizational/tenant headers (e.g., OpenAI-Organization, OpenAI-Project, ChatGPT-Account-Id)
+    extra_headers: dict[str, str] = field(default_factory=dict)
     # Ephemeral runtime cooldown timestamp after HTTP 429
     cooldown_until: float = 0.0
 
@@ -97,7 +128,7 @@ class AuthProfile:
         return (now if now is not None else time.time()) >= self.cooldown_until
 
     def to_metadata_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "name": self.name,
             "provider": self.provider,
             "auth_kind": self.auth_kind,
@@ -107,6 +138,13 @@ class AuthProfile:
             "default_model": self.default_model,
             "source": self.source,
         }
+        if self.api_mode:
+            d["api_mode"] = self.api_mode
+        if self.service_tier:
+            d["service_tier"] = self.service_tier
+        if self.extra_headers:
+            d["extra_headers"] = dict(self.extra_headers)
+        return d
 
 
 @dataclass
@@ -115,6 +153,7 @@ class StoredSecret:
     refresh_token: str = ""
     expires_at: float = 0.0
     client_id: str = ""
+    client_secret: str = ""
     token_url: str = ""
 
     def to_json(self) -> str:
@@ -124,6 +163,7 @@ class StoredSecret:
                 "refresh_token": self.refresh_token,
                 "expires_at": self.expires_at,
                 "client_id": self.client_id,
+                "client_secret": self.client_secret,
                 "token_url": self.token_url,
             }
         )
@@ -136,6 +176,7 @@ class StoredSecret:
             refresh_token=str(d.get("refresh_token", "")),
             expires_at=float(d.get("expires_at", 0.0)),
             client_id=str(d.get("client_id", "")),
+            client_secret=str(d.get("client_secret", "")),
             token_url=str(d.get("token_url", "")),
         )
 
@@ -189,30 +230,33 @@ class CredentialVault:
     def store_secret(self, profile_name: str, secret: StoredSecret) -> str:
         payload = secret.to_json()
         if self._use_macos_keychain():
-            res = subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    profile_name,
-                    "-w",
-                    payload,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if res.returncode == 0:
-                return "keychain"
+            try:
+                res = subprocess.run(
+                    [
+                        "/usr/bin/security",
+                        "add-generic-password",
+                        "-U",
+                        "-s",
+                        KEYCHAIN_SERVICE,
+                        "-a",
+                        profile_name,
+                        "-w",
+                        payload,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if res.returncode == 0:
+                    return "keychain"
+            except (subprocess.SubprocessError, OSError):
+                pass
         # Headless SSH / container fallback (`0600` strict permissions)
         vault: dict[str, Any] = {}
         if self.fallback_vault_path.is_file():
             try:
                 vault = json.loads(self.fallback_vault_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+            except (OSError, json.JSONDecodeError):
                 vault = {}
         vault[profile_name] = json.loads(payload)
         self._atomic_write_0600(self.fallback_vault_path, json.dumps(vault, indent=2))
@@ -220,25 +264,28 @@ class CredentialVault:
 
     def load_secret(self, profile_name: str) -> StoredSecret | None:
         if self._use_macos_keychain():
-            res = subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "find-generic-password",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    profile_name,
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                try:
-                    return StoredSecret.from_json(res.stdout.strip())
-                except json.JSONDecodeError:
-                    return StoredSecret(access_token=res.stdout.strip())
+            try:
+                res = subprocess.run(
+                    [
+                        "/usr/bin/security",
+                        "find-generic-password",
+                        "-s",
+                        KEYCHAIN_SERVICE,
+                        "-a",
+                        profile_name,
+                        "-w",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    try:
+                        return StoredSecret.from_json(res.stdout.strip())
+                    except json.JSONDecodeError:
+                        return StoredSecret(access_token=res.stdout.strip())
+            except (subprocess.SubprocessError, OSError):
+                pass
         if self.fallback_vault_path.is_file():
             try:
                 vault = json.loads(self.fallback_vault_path.read_text(encoding="utf-8"))
@@ -250,19 +297,22 @@ class CredentialVault:
 
     def delete_secret(self, profile_name: str) -> None:
         if self._use_macos_keychain():
-            subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "delete-generic-password",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    profile_name,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+            try:
+                subprocess.run(
+                    [
+                        "/usr/bin/security",
+                        "delete-generic-password",
+                        "-s",
+                        KEYCHAIN_SERVICE,
+                        "-a",
+                        profile_name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
         if self.fallback_vault_path.is_file():
             try:
                 vault = json.loads(self.fallback_vault_path.read_text(encoding="utf-8"))
@@ -280,8 +330,12 @@ class CredentialVault:
         try:
             data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
             self._active_profile = data.get("active_profile")
+            valid_keys = set(AuthProfile.__dataclass_fields__.keys())
             for item in data.get("profiles", []):
-                prof = AuthProfile(**item)
+                if not isinstance(item, dict):
+                    continue
+                filtered = {k: v for k, v in item.items() if k in valid_keys}
+                prof = AuthProfile(**filtered)
                 self._profiles[prof.name] = prof
         except (OSError, json.JSONDecodeError, TypeError):
             pass
@@ -299,23 +353,145 @@ class CredentialVault:
 
     # ---- Zero-Config Ambient Discovery ----
 
+    @staticmethod
+    def _resolve_env_base_url(provider: str, default_url: str) -> str:
+        if provider == "anthropic":
+            return (os.environ.get("ANTHROPIC_BASE_URL") or default_url).rstrip("/")
+        if provider == "openai":
+            return (os.environ.get("OPENAI_BASE_URL") or default_url).rstrip("/")
+        if provider in ("vertex", "gemini-enterprise"):
+            return (
+                os.environ.get("GOOGLE_VERTEX_BASE_URL")
+                or os.environ.get("VERTEX_BASE_URL")
+                or default_url
+            ).rstrip("/")
+        if provider == "antigravity":
+            return (
+                os.environ.get("ANTIGRAVITY_BASE_URL")
+                or os.environ.get("ANTIGRAVITY_ENDPOINT")
+                or os.environ.get("ANTIGRAVITY_LITERT_URL")
+                or default_url
+            ).rstrip("/")
+        if provider == "litellm":
+            return (
+                os.environ.get("LITELLM_BASE_URL")
+                or os.environ.get("LITELLM_PROXY_URL")
+                or default_url
+            ).rstrip("/")
+        if provider == "google":
+            return (os.environ.get("GEMINI_BASE_URL") or default_url).rstrip("/")
+        return default_url.rstrip("/")
+
+    @staticmethod
+    def _openai_env_headers() -> dict[str, str]:
+        hdrs: dict[str, str] = {}
+        org = (os.environ.get("OPENAI_ORG_ID") or os.environ.get("OPENAI_ORGANIZATION") or "").strip()
+        proj = (os.environ.get("OPENAI_PROJECT") or "").strip()
+        if org:
+            hdrs["OpenAI-Organization"] = org
+        if proj:
+            hdrs["OpenAI-Project"] = proj
+        return hdrs
+
     def discover_ambient_credentials(self) -> None:
+        self._ambient_secrets: dict[str, StoredSecret] = getattr(self, "_ambient_secrets", {})
+
         # 1. Standard Environment Variables (kept in memory only; never written to disk)
         for env_var, prof_name, provider, base_url in ENV_PROVIDER_MAP:
             if os.environ.get(env_var):
                 actual_provider = "openrouter" if provider == "openrouter" else provider
+                resolved_url = self._resolve_env_base_url(actual_provider, base_url)
+                api_mode = ""
+                svc_tier = ""
+                extra_hdrs: dict[str, str] = {}
+                if actual_provider == "gemini-enterprise":
+                    api_mode = "express"
+                    svc_tier = os.environ.get("GEMINI_SERVICE_TIER", "").strip()
+                elif actual_provider == "antigravity":
+                    svc_tier = os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip()
+                elif actual_provider == "openai":
+                    extra_hdrs = self._openai_env_headers()
+                    api_mode = os.environ.get("OPENAI_API_MODE", "").strip()
                 self._profiles.setdefault(
                     prof_name,
                     AuthProfile(
                         name=prof_name,
                         provider=actual_provider,
                         auth_kind="api_key",
-                        base_url=base_url,
+                        base_url=resolved_url,
+                        source=f"env:{env_var}",
+                        api_mode=api_mode,
+                        service_tier=svc_tier,
+                        extra_headers=extra_hdrs,
+                    ),
+                )
+
+        # 1b. Anthropic Bearer / OAuth Setup Tokens (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`)
+        for env_var, prof_name in (
+            ("ANTHROPIC_AUTH_TOKEN", "env-anthropic-bearer"),
+            ("ANTHROPIC_OAUTH_TOKEN", "env-anthropic-oauth"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "env-claude-oauth"),
+        ):
+            if os.environ.get(env_var):
+                self._profiles.setdefault(
+                    prof_name,
+                    AuthProfile(
+                        name=prof_name,
+                        provider="anthropic",
+                        auth_kind="bearer",
+                        base_url=self._resolve_env_base_url("anthropic", "https://api.anthropic.com"),
+                        default_model="claude-sonnet-4-20250514",
                         source=f"env:{env_var}",
                     ),
                 )
 
-        # 2. Google Cloud ADC (`gcloud` / ADC file) -> Vertex Gemini & Vertex Claude Model Garden
+        # 1c. Antigravity Bearer Token or Custom/LiteRT Endpoint env vars
+        if os.environ.get("ANTIGRAVITY_AUTH_TOKEN"):
+            self._profiles.setdefault(
+                "env-antigravity-token",
+                AuthProfile(
+                    name="env-antigravity-token",
+                    provider="antigravity",
+                    auth_kind="bearer",
+                    base_url=self._resolve_env_base_url("antigravity", "https://aiplatform.googleapis.com"),
+                    service_tier=os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip(),
+                    default_model="gemini-3.1-pro-preview",
+                    source="env:ANTIGRAVITY_AUTH_TOKEN",
+                ),
+            )
+        elif any(os.environ.get(k) for k in ("ANTIGRAVITY_BASE_URL", "ANTIGRAVITY_ENDPOINT", "ANTIGRAVITY_LITERT_URL")) and "env-antigravity" not in self._profiles:
+            ag_url = self._resolve_env_base_url("antigravity", "http://127.0.0.1:8080/v1")
+            is_google_host = "googleapis.com" in ag_url
+            self._profiles.setdefault(
+                "env-antigravity-endpoint",
+                AuthProfile(
+                    name="env-antigravity-endpoint",
+                    provider="antigravity",
+                    auth_kind="gcloud_adc" if is_google_host else "none",
+                    base_url=ag_url,
+                    project_id=os.environ.get("GOOGLE_CLOUD_PROJECT") or self._read_gcloud_default_project(),
+                    region=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+                    service_tier=os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip(),
+                    source="env:ANTIGRAVITY_BASE_URL",
+                ),
+            )
+
+        # 1d. LiteLLM Proxy Base URL without explicit API key (e.g. unauthenticated team/local gateway)
+        if (os.environ.get("LITELLM_BASE_URL") or os.environ.get("LITELLM_PROXY_URL")) and not any(
+            p.provider == "litellm" for p in self._profiles.values()
+        ):
+            self._profiles.setdefault(
+                "env-litellm-url",
+                AuthProfile(
+                    name="env-litellm-url",
+                    provider="litellm",
+                    auth_kind="none",
+                    base_url=self._resolve_env_base_url("litellm", "http://127.0.0.1:4000/v1"),
+                    source="env:LITELLM_BASE_URL",
+                ),
+            )
+
+        # 2. Google Cloud ADC (`gcloud` / ADC file) -> Vertex, Gemini Enterprise, Antigravity & Vertex Claude
         adc_file = pathlib.Path(
             os.environ.get(
                 "GOOGLE_APPLICATION_CREDENTIALS",
@@ -328,20 +504,51 @@ class CredentialVault:
         project = (
             os.environ.get("GOOGLE_CLOUD_PROJECT")
             or os.environ.get("CLOUD_ML_PROJECT_ID")
+            or os.environ.get("OPENCODE_GEMINI_PROJECT_ID")
             or self._read_gcloud_default_project()
         )
-        if (adc_file.is_file() or pathlib.Path(gcloud_bin).is_file()) and project:
+        has_gcp_creds = adc_file.is_file() or pathlib.Path(gcloud_bin).is_file()
+        if has_gcp_creds and project:
             region = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+            v_base = self._resolve_env_base_url("vertex", "https://aiplatform.googleapis.com")
             self._profiles.setdefault(
                 "gcloud-vertex",
                 AuthProfile(
                     name="gcloud-vertex",
                     provider="vertex",
                     auth_kind="gcloud_adc",
-                    base_url="https://aiplatform.googleapis.com",
+                    base_url=v_base,
                     project_id=project,
                     region=region,
                     default_model="gemini-3.1-pro-preview",
+                    source="gcloud",
+                ),
+            )
+            self._profiles.setdefault(
+                "gcloud-gemini-enterprise",
+                AuthProfile(
+                    name="gcloud-gemini-enterprise",
+                    provider="gemini-enterprise",
+                    auth_kind="gcloud_adc",
+                    base_url=v_base,
+                    project_id=project,
+                    region=region,
+                    default_model="gemini-3.1-pro-preview",
+                    service_tier=os.environ.get("GEMINI_SERVICE_TIER", "").strip(),
+                    source="gcloud",
+                ),
+            )
+            self._profiles.setdefault(
+                "gcloud-antigravity",
+                AuthProfile(
+                    name="gcloud-antigravity",
+                    provider="antigravity",
+                    auth_kind="gcloud_adc",
+                    base_url=self._resolve_env_base_url("antigravity", v_base),
+                    project_id=project,
+                    region=region,
+                    default_model="gemini-3.1-pro-preview",
+                    service_tier=os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip(),
                     source="gcloud",
                 ),
             )
@@ -351,22 +558,46 @@ class CredentialVault:
                     name="gcloud-vertex-claude",
                     provider="vertex-anthropic",
                     auth_kind="gcloud_adc",
-                    base_url="https://aiplatform.googleapis.com",
+                    base_url=v_base,
                     project_id=project,
                     region=os.environ.get("VERTEX_ANTHROPIC_REGION", "us-east5"),
                     default_model="claude-sonnet-4@20250514",
                     source="gcloud",
                 ),
             )
+            if os.environ.get("CODE_ASSIST_ENDPOINT") or os.environ.get("GEMINI_CODE_ASSIST") == "1":
+                ca_url = (os.environ.get("CODE_ASSIST_ENDPOINT") or "https://cloudcode-pa.googleapis.com").rstrip("/")
+                self._profiles.setdefault(
+                    "gcloud-code-assist",
+                    AuthProfile(
+                        name="gcloud-code-assist",
+                        provider="gemini-enterprise",
+                        auth_kind="gcloud_adc",
+                        base_url=ca_url,
+                        project_id=project,
+                        region=region,
+                        default_model="gemini-2.5-pro",
+                        api_mode="code_assist",
+                        source="gcloud",
+                    ),
+                )
 
-        # 3. Localhost zero-auth inference servers (`127.0.0.1` only, <80ms check)
-        for port, label in ((11434, "local-ollama"), (8000, "local-vllm"), (1234, "local-lmstudio")):
+        # 2b. Ambient OpenAI Codex CLI (`~/.codex/auth.json`) & Claude CLI (`~/.claude/.credentials.json`)
+        self._discover_ambient_cli_tokens()
+
+        # 3. Localhost zero-auth inference & LiteLLM servers (`127.0.0.1` only, <80ms check)
+        for port, label, prov in (
+            (4000, "local-litellm", "litellm"),
+            (11434, "local-ollama", "local"),
+            (8000, "local-vllm", "local"),
+            (1234, "local-lmstudio", "local"),
+        ):
             if _is_loopback_port_open(port):
                 self._profiles.setdefault(
                     label,
                     AuthProfile(
                         name=label,
-                        provider="local",
+                        provider=prov,
                         auth_kind="none",
                         base_url=f"http://127.0.0.1:{port}/v1",
                         source="localhost",
@@ -376,6 +607,93 @@ class CredentialVault:
         if not self._active_profile or self._active_profile not in self._profiles:
             if self._profiles:
                 self._active_profile = next(iter(self._profiles.keys()))
+
+    def _discover_ambient_cli_tokens(self) -> None:
+        """Discovers user-owned `~/.codex/auth.json` and `~/.claude/.credentials.json` tokens strictly in memory."""
+        self._ambient_secrets = getattr(self, "_ambient_secrets", {})
+
+        # OpenAI Codex CLI (`~/.codex/auth.json`)
+        codex_home = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+        codex_auth = codex_home / "auth.json"
+        if codex_auth.is_file():
+            try:
+                raw = json.loads(codex_auth.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    api_k = str(raw.get("OPENAI_API_KEY") or "").strip()
+                    tokens = raw.get("tokens") if isinstance(raw.get("tokens"), dict) else {}
+                    acc_tok = str((tokens or {}).get("access_token") or "").strip()
+                    ref_tok = str((tokens or {}).get("refresh_token") or "").strip()
+                    acct_id = str((tokens or {}).get("account_id") or "").strip()
+                    hdrs = self._openai_env_headers()
+                    if acct_id:
+                        hdrs["ChatGPT-Account-Id"] = acct_id
+                    if api_k and "env-openai" not in self._profiles:
+                        self._ambient_secrets["codex-openai"] = StoredSecret(access_token=api_k)
+                        self._profiles.setdefault(
+                            "codex-openai",
+                            AuthProfile(
+                                name="codex-openai",
+                                provider="openai",
+                                auth_kind="api_key",
+                                base_url=self._resolve_env_base_url("openai", "https://api.openai.com/v1"),
+                                default_model="gpt-5",
+                                source="codex_cli",
+                                api_mode="responses",
+                                extra_headers=hdrs,
+                            ),
+                        )
+                    elif acc_tok:
+                        self._ambient_secrets["codex-oauth"] = StoredSecret(
+                            access_token=acc_tok,
+                            refresh_token=ref_tok,
+                        )
+                        self._profiles.setdefault(
+                            "codex-oauth",
+                            AuthProfile(
+                                name="codex-oauth",
+                                provider="openai",
+                                auth_kind="oauth",
+                                base_url=self._resolve_env_base_url("openai", "https://api.openai.com/v1"),
+                                default_model="gpt-5",
+                                source="codex_cli",
+                                api_mode="responses",
+                                extra_headers=hdrs,
+                            ),
+                        )
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        # Anthropic Claude CLI (`~/.claude/.credentials.json`)
+        claude_dir = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+        claude_creds = claude_dir / ".credentials.json"
+        if claude_creds.is_file():
+            try:
+                raw = json.loads(claude_creds.read_text(encoding="utf-8"))
+                oauth_obj = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+                if isinstance(oauth_obj, dict):
+                    acc_tok = str(oauth_obj.get("accessToken") or "").strip()
+                    ref_tok = str(oauth_obj.get("refreshToken") or "").strip()
+                    exp_ms = float(oauth_obj.get("expiresAt") or 0.0)
+                    exp_s = exp_ms / 1000.0 if exp_ms > 1e11 else exp_ms
+                    if acc_tok and (exp_s <= 0 or exp_s > time.time()):
+                        self._ambient_secrets["claude-oauth"] = StoredSecret(
+                            access_token=acc_tok,
+                            refresh_token=ref_tok,
+                            expires_at=exp_s,
+                        )
+                        self._profiles.setdefault(
+                            "claude-oauth",
+                            AuthProfile(
+                                name="claude-oauth",
+                                provider="anthropic",
+                                auth_kind="oauth",
+                                base_url=self._resolve_env_base_url("anthropic", "https://api.anthropic.com"),
+                                default_model="claude-sonnet-4-20250514",
+                                source="claude_cli",
+                            ),
+                        )
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
 
     @staticmethod
     def _read_gcloud_default_project() -> str | None:
@@ -422,21 +740,34 @@ class CredentialVault:
                 return prof
         return self._profiles.get(self._active_profile or "")
 
+    def select_failover_profile(
+        self,
+        failed_profile: AuthProfile,
+        *,
+        target_family: str | None = None,
+    ) -> AuthProfile | None:
+        """Selects an available backup profile on HTTP 429/503, preferring exact provider then same model family."""
+        now = time.time()
+        wanted_fam = target_family or PROVIDER_FAMILY_MAP.get(failed_profile.provider, failed_profile.provider)
+        # Pass 1: exact same provider (e.g. second API key or second GCP project)
+        for prof in self._profiles.values():
+            if prof.name != failed_profile.name and prof.is_available(now) and prof.provider == failed_profile.provider:
+                return prof
+        # Pass 2: compatible provider serving the same model family (e.g. vertex <-> gemini-enterprise <-> google <-> antigravity)
+        for prof in self._profiles.values():
+            if prof.name == failed_profile.name or not prof.is_available(now):
+                continue
+            prof_fam = PROVIDER_FAMILY_MAP.get(prof.provider, prof.provider)
+            if prof_fam == wanted_fam:
+                return prof
+        return None
+
     def select_cross_family_profile(self, exclude_family: str, exclude_profile: str | None = None) -> AuthProfile | None:
         """Selects an authenticated profile from a DIFFERENT model family for blind judging."""
-        family_by_provider = {
-            "google": "gemini",
-            "vertex": "gemini",
-            "anthropic": "anthropic",
-            "vertex-anthropic": "anthropic",
-            "openai": "openai",
-            "openrouter": "openrouter",
-            "local": "local_oss",
-        }
         for prof in self._profiles.values():
             if prof.name == exclude_profile or not prof.is_available():
                 continue
-            fam = family_by_provider.get(prof.provider, prof.provider)
+            fam = PROVIDER_FAMILY_MAP.get(prof.provider, prof.provider)
             if fam != exclude_family:
                 return prof
         return None
@@ -450,9 +781,23 @@ class CredentialVault:
 
     def mark_rate_limited(self, name: str, cooldown_seconds: float = 45.0) -> AuthProfile | None:
         with self._lock:
-            if name in self._profiles:
-                self._profiles[name].cooldown_until = time.time() + cooldown_seconds
+            failed = self._profiles.get(name)
+            if failed is not None:
+                failed.cooldown_until = time.time() + max(1.0, cooldown_seconds)
+                alt = self.select_failover_profile(failed)
+                if alt is not None:
+                    return alt
             return self.get_active_profile()
+
+    def invalidate_token_cache(self, profile: AuthProfile | None = None) -> None:
+        """Clears cached OAuth/ADC tokens after an HTTP 401 so the next retry fetches a fresh token."""
+        with self._lock:
+            self._gcloud_token_cache = None
+            if profile and profile.auth_kind == "oauth":
+                secret = self.load_secret(profile.name)
+                if secret and secret.refresh_token and secret.token_url:
+                    secret.expires_at = 1.0
+                    self.store_secret(profile.name, secret)
 
     def register_api_key_profile(
         self,
@@ -461,19 +806,42 @@ class CredentialVault:
         api_key: str,
         base_url: str | None = None,
         default_model: str | None = None,
+        *,
+        auth_kind: str = "api_key",
+        api_mode: str = "",
+        service_tier: str = "",
+        project_id: str | None = None,
+        region: str = "global",
+        extra_headers: dict[str, str] | None = None,
     ) -> AuthProfile:
-        if not api_key.strip():
-            raise ValueError("API key must not be empty.")
-        backend_provider = "openrouter" if provider in ("deepseek", "qwen", "kimi", "glm") else provider
-        url = base_url or PROVIDER_DEFAULT_URLS.get(provider, PROVIDER_DEFAULT_URLS["openrouter"])
-        src = self.store_secret(name, StoredSecret(access_token=api_key.strip()))
+        if auth_kind != "none" and not api_key.strip():
+            raise ValueError("API key / token must not be empty.")
+        backend_provider = (
+            "openrouter"
+            if provider in ("deepseek", "qwen", "kimi", "glm")
+            else ("gemini-enterprise" if provider == "code-assist" else provider)
+        )
+        resolved_mode = api_mode or (
+            "code_assist"
+            if provider == "code-assist"
+            else ("express" if backend_provider == "gemini-enterprise" and auth_kind == "api_key" else "")
+        )
+        url = (base_url or PROVIDER_DEFAULT_URLS.get(provider, PROVIDER_DEFAULT_URLS["openrouter"])).rstrip("/")
+        src = "vault"
+        if auth_kind != "none":
+            src = self.store_secret(name, StoredSecret(access_token=api_key.strip()))
         prof = AuthProfile(
             name=name,
             provider=backend_provider,
-            auth_kind="api_key",
+            auth_kind=auth_kind,
             base_url=url,
+            project_id=project_id,
+            region=region,
             default_model=default_model,
             source=src,
+            api_mode=resolved_mode,
+            service_tier=service_tier,
+            extra_headers=dict(extra_headers or {}),
         )
         self._profiles[name] = prof
         self._active_profile = name
@@ -486,19 +854,26 @@ class CredentialVault:
         project_id: str,
         region: str = "global",
         include_claude: bool = True,
+        *,
+        provider: str = "vertex",
+        base_url: str = "https://aiplatform.googleapis.com",
+        api_mode: str = "",
+        service_tier: str = "",
     ) -> AuthProfile:
         prof = AuthProfile(
             name=name,
-            provider="vertex",
+            provider=provider,
             auth_kind="gcloud_adc",
-            base_url="https://aiplatform.googleapis.com",
-            project_id=project_id.strip(),
+            base_url=base_url.rstrip("/"),
+            project_id=project_id.strip() if project_id else None,
             region=region.strip() or "global",
             default_model="gemini-3.1-pro-preview",
             source="vault",
+            api_mode=api_mode,
+            service_tier=service_tier,
         )
         self._profiles[name] = prof
-        if include_claude:
+        if include_claude and project_id.strip():
             c_reg = region if region not in ("global", "us-central1") else "us-east5"
             self._profiles[f"{name}-claude"] = AuthProfile(
                 name=f"{name}-claude",
@@ -526,15 +901,18 @@ class CredentialVault:
 
     def resolve_bearer_or_key(self, profile: AuthProfile) -> str:
         if profile.auth_kind == "none":
+            if profile.provider == "litellm":
+                return os.environ.get("LITELLM_API_KEY") or os.environ.get("LITELLM_MASTER_KEY") or ""
             return os.environ.get("USH_LOCAL_API_KEY", "")
         if profile.source.startswith("env:"):
             env_key = profile.source.split(":", 1)[1]
             return os.environ.get(env_key, "")
         if profile.auth_kind == "gcloud_adc":
             return self._get_gcloud_access_token()
-        secret = self.load_secret(profile.name)
+        ambient = getattr(self, "_ambient_secrets", {}).get(profile.name)
+        secret = ambient or self.load_secret(profile.name)
         if not secret:
-            raise RuntimeError(f"Missing stored credentials for profile '{profile.name}'. Run `ush auth login`.")
+            raise RuntimeError(f"Missing stored credentials for profile '{profile.name}'. Run `crux auth login`.")
         # Auto-refresh OAuth token 5 minutes prior to expiry
         if (
             profile.auth_kind == "oauth"
@@ -543,14 +921,71 @@ class CredentialVault:
             and secret.expires_at > 0
             and time.time() >= (secret.expires_at - 300)
         ):
-            secret = self._refresh_oauth_token(profile.name, secret)
+            secret = self._refresh_oauth_token(profile.name, secret, persist=(ambient is None))
+            if ambient is not None:
+                self._ambient_secrets[profile.name] = secret
         return secret.access_token
+
+    def _try_refresh_adc_file_direct(self) -> tuple[str, float] | None:
+        """Refreshes `authorized_user` ADC JSON directly over TLS without spawning a `gcloud` subprocess."""
+        adc_file = pathlib.Path(
+            os.environ.get(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "~/.config/gcloud/application_default_credentials.json",
+            )
+        ).expanduser()
+        if not adc_file.is_file():
+            return None
+        try:
+            data = json.loads(adc_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or data.get("type") != "authorized_user":
+            return None
+        cid = str(data.get("client_id") or "").strip()
+        csec = str(data.get("client_secret") or "").strip()
+        rtok = str(data.get("refresh_token") or "").strip()
+        tok_uri = str(data.get("token_uri") or "https://oauth2.googleapis.com/token").strip()
+        if not (cid and csec and rtok):
+            return None
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "client_id": cid,
+                "client_secret": csec,
+                "refresh_token": rtok,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            tok_uri,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, context=secure_ssl_context(), timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            tok = str(payload.get("access_token") or "").strip()
+            exp_in = float(payload.get("expires_in", 3600))
+            if tok:
+                return tok, time.time() + max(60.0, exp_in - 300.0)
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+            return None
+        return None
 
     def _get_gcloud_access_token(self) -> str:
         with self._lock:
             now = time.time()
             if self._gcloud_token_cache and now < self._gcloud_token_cache[1]:
                 return self._gcloud_token_cache[0]
+
+            # Fast path: direct HTTPS OAuth refresh from ADC JSON (zero child-process overhead/hang risk)
+            direct = self._try_refresh_adc_file_direct()
+            if direct is not None:
+                self._gcloud_token_cache = direct
+                return direct[0]
+
+            # Fallback path: `gcloud` CLI wrapped against hangs (`TimeoutExpired`) or broken Python envs (`OSError`)
             gcloud_bin = shutil.which("gcloud") or str(
                 pathlib.Path("~/google-cloud-sdk/bin/gcloud").expanduser()
             )
@@ -560,24 +995,27 @@ class CredentialVault:
             ):
                 if not pathlib.Path(args[0]).is_file():
                     continue
-                res = subprocess.run(args, capture_output=True, text=True, timeout=10)
+                try:
+                    res = subprocess.run(args, capture_output=True, text=True, timeout=12)
+                except (subprocess.SubprocessError, OSError):
+                    continue
                 tok = res.stdout.strip()
                 if res.returncode == 0 and tok:
-                    # Cache for 50 minutes (Google OAuth access tokens last 60m)
-                    self._gcloud_token_cache = (tok, now + 3000)
+                    self._gcloud_token_cache = (tok, time.time() + 3000)
                     return tok
             raise RuntimeError(
                 "Google Cloud credentials unavailable or expired. Run `gcloud auth application-default login`."
             )
 
-    def _refresh_oauth_token(self, profile_name: str, secret: StoredSecret) -> StoredSecret:
-        body = urllib.parse.urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": secret.refresh_token,
-                "client_id": secret.client_id,
-            }
-        ).encode("utf-8")
+    def _refresh_oauth_token(self, profile_name: str, secret: StoredSecret, *, persist: bool = True) -> StoredSecret:
+        params: dict[str, str] = {
+            "grant_type": "refresh_token",
+            "refresh_token": secret.refresh_token,
+            "client_id": secret.client_id,
+        }
+        if secret.client_secret:
+            params["client_secret"] = secret.client_secret
+        body = urllib.parse.urlencode(params).encode("utf-8")
         req = urllib.request.Request(
             secret.token_url,
             data=body,
@@ -591,9 +1029,11 @@ class CredentialVault:
             refresh_token=str(payload.get("refresh_token") or secret.refresh_token),
             expires_at=time.time() + float(payload.get("expires_in", 3600)),
             client_id=secret.client_id,
+            client_secret=secret.client_secret,
             token_url=secret.token_url,
         )
-        self.store_secret(profile_name, updated)
+        if persist:
+            self.store_secret(profile_name, updated)
         return updated
 
 
@@ -734,14 +1174,151 @@ def run_oauth_pkce_login(
     return prof
 
 
+def run_oauth_device_code_login(
+    vault: CredentialVault,
+    *,
+    profile_name: str,
+    provider: str,
+    device_code_url: str,
+    token_url: str,
+    client_id: str,
+    scopes: list[str],
+    base_url: str,
+    api_mode: str = "",
+) -> AuthProfile:
+    """Runs standard RFC 8628 OAuth 2.0 Device Authorization Grant for headless / SSH terminals."""
+    req_body = urllib.parse.urlencode(
+        {"client_id": client_id, "scope": " ".join(scopes)}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        device_code_url,
+        data=req_body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, context=secure_ssl_context(), timeout=20) as resp:
+        dev = json.loads(resp.read().decode("utf-8"))
+
+    device_code = str(dev["device_code"])
+    user_code = str(dev.get("user_code", ""))
+    verify_uri = str(dev.get("verification_uri_complete") or dev.get("verification_uri") or "")
+    interval = max(1.0, float(dev.get("interval", 5)))
+    expires_in = float(dev.get("expires_in", 600))
+
+    print(f"\nAuthorize {provider} by visiting:\n  {verify_uri}")
+    if user_code:
+        print(f"Enter one-time code: {user_code}\n")
+
+    deadline = time.time() + expires_in
+    tok: dict[str, Any] | None = None
+    while time.time() < deadline:
+        time.sleep(interval)
+        poll_body = urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+                "client_id": client_id,
+            }
+        ).encode("utf-8")
+        poll_req = urllib.request.Request(
+            token_url,
+            data=poll_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(poll_req, context=secure_ssl_context(), timeout=20) as presp:
+                data = json.loads(presp.read().decode("utf-8"))
+        except urllib.error.HTTPError as hexc:
+            try:
+                data = json.loads(hexc.read().decode("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise hexc from None
+        err = str(data.get("error") or "")
+        if not err and data.get("access_token"):
+            tok = data
+            break
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5.0
+            continue
+        raise RuntimeError(f"OAuth device flow failed: {err or data}")
+
+    if not tok:
+        raise RuntimeError("OAuth device authorization timed out.")
+
+    src = vault.store_secret(
+        profile_name,
+        StoredSecret(
+            access_token=str(tok["access_token"]),
+            refresh_token=str(tok.get("refresh_token", "")),
+            expires_at=time.time() + float(tok.get("expires_in", 3600)),
+            client_id=client_id,
+            token_url=token_url,
+        ),
+    )
+    prof = AuthProfile(
+        name=profile_name,
+        provider=provider,
+        auth_kind="oauth",
+        base_url=base_url.rstrip("/"),
+        source=src,
+        api_mode=api_mode,
+    )
+    vault._profiles[profile_name] = prof
+    vault.switch_profile(profile_name)
+    return prof
+
+
+def fetch_openai_compat_models(
+    base_url: str,
+    token: str = "",
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 2.5,
+    *,
+    api_key: str = "",
+) -> list[str]:
+    """Queries `GET {base_url}/models` on LiteLLM / OpenAI / Ollama / vLLM endpoints; returns `[]` on failure."""
+    eff_tok = token or api_key
+    parsed = urllib.parse.urlparse(base_url.rstrip("/"))
+    url = f"{base_url.rstrip('/')}/v1/models" if parsed.path in ("", "/") else f"{base_url.rstrip('/')}/models"
+    hdrs: dict[str, str] = {"Accept": "application/json", "User-Agent": "crux-cli/0.1"}
+    if eff_tok:
+        hdrs["Authorization"] = f"Bearer {eff_tok}"
+        hdrs["x-litellm-api-key"] = eff_tok
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    try:
+        ctx = secure_ssl_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            payload = json.loads(resp.read(262_144).decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    models_raw = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(models_raw, list):
+        return []
+    out: list[str] = []
+    for item in models_raw:
+        if isinstance(item, dict) and item.get("id"):
+            out.append(str(item["id"]))
+        elif isinstance(item, str):
+            out.append(item)
+    return sorted(dict.fromkeys(out))
+
+
 def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = None) -> AuthProfile:
-    """Interactive terminal login wizard supporting GCP ADC, API keys, OpenRouter OAuth PKCE, and local servers."""
+    """Interactive terminal login wizard supporting Gemini Enterprise, Antigravity, Claude, OpenAI, LiteLLM, GCP ADC & local."""
     choices = [
+        ("gemini-enterprise", "Gemini Enterprise (Standard GCP ADC, Vertex Express API Key, or Code Assist)"),
+        ("antigravity", "Antigravity Endpoints (Hosted Priority / Standard or Local LiteRT / Custom URL)"),
         ("vertex", "Google Cloud Vertex AI (gcloud ADC — unlocks Gemini + Vertex Claude Model Garden)"),
         ("google", "Google Gemini API (AI Studio API Key)"),
-        ("anthropic", "Anthropic Direct (Claude Opus / Sonnet API Key)"),
-        ("openai", "OpenAI Direct (GPT-5 / o3 / o4-mini API Key)"),
-        ("openrouter", "OpenRouter (300+ Models via Browser OAuth PKCE or API Key)"),
+        ("anthropic", "Anthropic Claude (Default API Key `x-api-key`, Bearer/OAuth Token, or Custom URL)"),
+        ("openai", "OpenAI (Default `/v1/responses` + `/v1/chat/completions`, API Key or OAuth Token)"),
+        ("litellm", "LiteLLM Proxy Gateway (`http://127.0.0.1:4000/v1` or Team Gateway + Master/API Key)"),
+        ("openrouter", "OpenRouter (300+ Models via API Key)"),
         ("deepseek", "DeepSeek API (DeepSeek-V3 / R1)"),
         ("qwen", "Alibaba Qwen / DashScope API (Qwen3-Coder)"),
         ("kimi", "Moonshot Kimi API (Kimi-K2)"),
@@ -751,12 +1328,87 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
     if not provider:
         print("\n=== Crucible (crux v0.1) — Authentication Setup ===")
         for idx, (slug, desc) in enumerate(choices, 1):
-            print(f"  [{idx}] {slug:11s} — {desc}")
-        raw = input("\nSelect provider [1-9]: ").strip()
+            print(f"  [{idx:2d}] {slug:18s} — {desc}")
+        raw = input(f"\nSelect provider [1-{len(choices)}]: ").strip()
         if raw.isdigit() and 1 <= int(raw) <= len(choices):
             provider = choices[int(raw) - 1][0]
         else:
             provider = raw.lower()
+
+    if provider == "gemini-enterprise":
+        print("  Modes: [1] Standard Enterprise (gcloud ADC + Project)  [2] Express API Key  [3] Code Assist (`cloudcode-pa`)")
+        mode_in = input("Select Gemini Enterprise mode [1]: ").strip() or "1"
+        if mode_in == "2":
+            url = input("Enterprise Base URL [https://aiplatform.googleapis.com]: ").strip() or "https://aiplatform.googleapis.com"
+            name = input("Profile name [gemini-enterprise-express]: ").strip() or "gemini-enterprise-express"
+            key = getpass.getpass("Enter Gemini Enterprise / Vertex Express API key: ").strip()
+            return vault.register_api_key_profile(
+                name=name,
+                provider="gemini-enterprise",
+                api_key=key,
+                base_url=url,
+                default_model="gemini-2.5-pro",
+                api_mode="express",
+            )
+        detected = vault._read_gcloud_default_project() or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+        proj = input(f"GCP Project ID [{detected}]: ").strip() or detected
+        reg = input("Region [global]: ").strip() or "global"
+        if mode_in == "3":
+            ca_url = input("Code Assist Endpoint [https://cloudcode-pa.googleapis.com]: ").strip() or "https://cloudcode-pa.googleapis.com"
+            name = input("Profile name [gemini-code-assist]: ").strip() or "gemini-code-assist"
+            return vault.register_vertex_profile(
+                name=name,
+                project_id=proj,
+                region=reg,
+                include_claude=False,
+                provider="gemini-enterprise",
+                base_url=ca_url,
+                api_mode="code_assist",
+            )
+        url = input("Vertex / VPC-SC Base URL [https://aiplatform.googleapis.com]: ").strip() or "https://aiplatform.googleapis.com"
+        tier = input("Optional Service Tier (`priority` or blank) []: ").strip()
+        name = input("Profile name [gemini-enterprise]: ").strip() or "gemini-enterprise"
+        return vault.register_vertex_profile(
+            name=name,
+            project_id=proj,
+            region=reg,
+            include_claude=False,
+            provider="gemini-enterprise",
+            base_url=url,
+            service_tier=tier,
+        )
+
+    if provider == "antigravity":
+        default_url = os.environ.get("ANTIGRAVITY_BASE_URL") or "https://aiplatform.googleapis.com"
+        url = input(f"Antigravity Endpoint URL [{default_url}]: ").strip() or default_url
+        tier = input("Service Tier (`priority` or blank) [priority]: ").strip()
+        name = input("Profile name [antigravity]: ").strip() or "antigravity"
+        key = getpass.getpass("Optional API Key or Bearer Token (press Enter to use gcloud ADC / none): ").strip()
+        if key:
+            kind = "api_key" if key.startswith("AIza") else "bearer"
+            return vault.register_api_key_profile(
+                name=name,
+                provider="antigravity",
+                api_key=key,
+                base_url=url,
+                default_model="gemini-3.1-pro-preview",
+                auth_kind=kind,
+                service_tier=tier,
+            )
+        is_google = "googleapis.com" in url
+        proj = (vault._read_gcloud_default_project() or os.environ.get("GOOGLE_CLOUD_PROJECT", "")) if is_google else ""
+        if is_google:
+            proj = input(f"GCP Project ID [{proj}]: ").strip() or proj
+        return vault.register_api_key_profile(
+            name=name,
+            provider="antigravity",
+            api_key="",
+            base_url=url,
+            default_model="gemini-3.1-pro-preview" if is_google else "litert-local",
+            auth_kind="gcloud_adc" if is_google else "none",
+            project_id=proj or None,
+            service_tier=tier,
+        )
 
     if provider == "vertex":
         detected = vault._read_gcloud_default_project() or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
@@ -766,6 +1418,61 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         reg = input("Vertex Region [global]: ").strip() or "global"
         name = input(f"Profile name [vertex-{proj[:16]}]: ").strip() or f"vertex-{proj[:16]}"
         return vault.register_vertex_profile(name=name, project_id=proj, region=reg)
+
+    if provider == "anthropic":
+        default_url = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        url = input(f"Anthropic Base URL [{default_url}]: ").strip() or default_url
+        print("  Auth: [1] API Key (`x-api-key`)  [2] Auth / OAuth Bearer Token (`Authorization: Bearer`)")
+        ak = "bearer" if input("Select auth kind [1]: ").strip() == "2" else "api_key"
+        name = input("Profile name [anthropic]: ").strip() or "anthropic"
+        key = getpass.getpass("Enter Anthropic credential (hidden): ").strip()
+        return vault.register_api_key_profile(
+            name=name,
+            provider="anthropic",
+            api_key=key,
+            base_url=url,
+            default_model="claude-sonnet-4-20250514",
+            auth_kind=ak,
+        )
+
+    if provider == "openai":
+        default_url = os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        url = input(f"OpenAI Base URL [{default_url}]: ").strip() or default_url
+        org = input("Optional OpenAI Organization ID (press Enter to skip): ").strip()
+        proj = input("Optional OpenAI Project ID (press Enter to skip): ").strip()
+        hdrs: dict[str, str] = {}
+        if org:
+            hdrs["OpenAI-Organization"] = org
+        if proj:
+            hdrs["OpenAI-Project"] = proj
+        name = input("Profile name [openai]: ").strip() or "openai"
+        key = getpass.getpass("Enter OpenAI API key or OAuth access token (hidden): ").strip()
+        ak = "api_key" if key.startswith("sk-") else "oauth"
+        return vault.register_api_key_profile(
+            name=name,
+            provider="openai",
+            api_key=key,
+            base_url=url,
+            default_model="gpt-5",
+            auth_kind=ak,
+            api_mode="responses",
+            extra_headers=hdrs,
+        )
+
+    if provider == "litellm":
+        default_url = os.environ.get("LITELLM_BASE_URL") or "http://127.0.0.1:4000/v1"
+        url = input(f"LiteLLM Proxy Base URL [{default_url}]: ").strip() or default_url
+        name = input("Profile name [litellm]: ").strip() or "litellm"
+        key = getpass.getpass("LiteLLM API / Master Key (press Enter if unauthenticated): ").strip()
+        mdl = input("Default LiteLLM model (e.g. anthropic/claude-sonnet-4-20250514) []: ").strip() or None
+        return vault.register_api_key_profile(
+            name=name,
+            provider="litellm",
+            api_key=key,
+            base_url=url,
+            default_model=mdl,
+            auth_kind="api_key" if key else "none",
+        )
 
     if provider == "local":
         url = input("Local/Cluster Base URL [http://127.0.0.1:11434/v1]: ").strip() or "http://127.0.0.1:11434/v1"

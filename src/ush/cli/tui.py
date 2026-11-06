@@ -52,21 +52,24 @@ if TYPE_CHECKING:
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
-# Curated frontier & local models surfaced in `/model` visual menu (plus live custom entry & Ollama probe)
+# Curated frontier & local models surfaced in `/model` visual menu (plus live LiteLLM/local `/models` probe)
 RECOMMENDED_MODELS: tuple[tuple[str, str, str], ...] = (
-    ("gemini-4-argon", "vertex/google", "Tier S · Frontier Gemini 4 Argon (1M ctx, deep native thinking)"),
-    ("gemini-3.1-pro-preview", "vertex/google", "Tier S · Gemini 3.1 Pro Preview (1M ctx, LOW/MEDIUM/HIGH thinking)"),
-    ("gemini-3-flash-preview", "vertex/google", "Tier A · Gemini 3 Flash Preview (ultra-fast multi-step agentic loop)"),
-    ("gemini-2.5-pro", "vertex/google", "Tier S · Gemini 2.5 Pro GA (dynamic thinkingBudget, 1M ctx)"),
-    ("gemini-2.5-flash", "vertex/google", "Tier A · Gemini 2.5 Flash GA (low-latency high throughput)"),
+    ("gemini-4-argon", "gemini-enterprise/vertex", "Tier S · Frontier Gemini 4 Argon (1M ctx, deep native thinking)"),
+    ("gemini-3.1-pro-preview", "gemini-enterprise/vertex", "Tier S · Gemini 3.1 Pro Preview (1M ctx, LOW/MEDIUM/HIGH thinking)"),
+    ("gemini-3-flash-preview", "gemini-enterprise/vertex", "Tier A · Gemini 3 Flash Preview (ultra-fast multi-step agentic loop)"),
+    ("gemini-2.5-pro", "gemini-enterprise/antigravity", "Tier S · Gemini 2.5 Pro GA (Enterprise / Antigravity / AI Studio)"),
+    ("gemini-2.5-flash", "gemini-enterprise/antigravity", "Tier A · Gemini 2.5 Flash GA (low-latency high throughput)"),
+    ("antigravity:gemini-2.5-pro", "antigravity", "Tier S · Antigravity Hosted Endpoint (`priority` tier)"),
     ("claude-opus-4-20250514", "anthropic/vertex", "Tier S · Claude Opus 4 (interleaved thinking between tool calls)"),
     ("claude-sonnet-4@20250514", "vertex-anthropic", "Tier A · Claude Sonnet 4 on Vertex Model Garden"),
-    ("claude-sonnet-4-20250514", "anthropic", "Tier A · Claude Sonnet 4 Direct API"),
-    ("gpt-5", "openai", "Tier S · OpenAI GPT-5 (reasoning_effort + 400k ctx)"),
-    ("o3", "openai", "Tier S · OpenAI o3 native reasoner"),
-    ("deepseek-reasoner", "openrouter/openai", "Tier A · DeepSeek R1 (`reasoning_content` full CoT)"),
+    ("claude-sonnet-4-20250514", "anthropic", "Tier A · Claude Sonnet 4 (`api.anthropic.com` API Key / Bearer)"),
+    ("gpt-5", "openai", "Tier S · OpenAI GPT-5 (`/v1/responses` + `encrypted_content` CoT)"),
+    ("o3", "openai", "Tier S · OpenAI o3 native reasoner (`/v1/responses`)"),
+    ("litellm:anthropic/claude-sonnet-4-20250514", "litellm", "Tier A · LiteLLM Proxy -> Claude Sonnet 4"),
+    ("litellm:vertex_ai/gemini-2.5-pro", "litellm", "Tier S · LiteLLM Proxy -> Vertex Gemini 2.5 Pro"),
+    ("deepseek-reasoner", "openrouter/litellm", "Tier A · DeepSeek R1 (`reasoning_content` full CoT)"),
     ("qwen3-coder", "openrouter/local", "Tier A · Qwen3-Coder agentic coder"),
-    ("__custom__", "custom", "Type any custom provider:model-id (Ollama, vLLM, OpenRouter, etc.)..."),
+    ("__custom__", "custom", "Type any custom provider:model-id (LiteLLM, Antigravity, Enterprise, Ollama)..."),
 )
 
 
@@ -1337,7 +1340,7 @@ class VisualTuiController:
         items: list[MenuItem] = []
         seen: set[str] = set()
 
-        # Include defaults from discovered auth profiles first (e.g. local Ollama models if running!)
+        # Include defaults & live `/models` discovery from configured auth profiles (LiteLLM, Antigravity LiteRT, Ollama)
         for prof in self.rt.vault.list_profiles():
             if prof.default_model and prof.default_model not in seen:
                 act = prof.default_model == cur_m and prof.name == cur_p
@@ -1352,6 +1355,27 @@ class VisualTuiController:
                     )
                 )
                 seen.add(prof.default_model)
+            if prof.provider in ("litellm", "local") or (prof.provider == "antigravity" and prof.api_mode == "chat_completions"):
+                from ush.auth.vault import fetch_openai_compat_models
+
+                try:
+                    tok = self.rt.vault.resolve_bearer_or_key(prof) if prof.auth_kind != "none" else ""
+                except Exception:  # noqa: BLE001
+                    tok = ""
+                for live_mid in fetch_openai_compat_models(prof.base_url, token=tok, timeout=0.45)[:12]:
+                    if live_mid not in seen:
+                        act = live_mid == cur_m and prof.name == cur_p
+                        items.append(
+                            MenuItem(
+                                key=f"{prof.name}::{live_mid}",
+                                label=live_mid,
+                                detail=f"live `/models` on `{prof.name}` ({prof.base_url})",
+                                badge="● active" if act else f"{prof.provider}:live",
+                                active=act,
+                                payload=(prof, live_mid),
+                            )
+                        )
+                        seen.add(live_mid)
 
         for mid, prov_lbl, desc in RECOMMENDED_MODELS:
             if mid in seen and mid != "__custom__":
@@ -1583,18 +1607,24 @@ class VisualTuiController:
 
     def open_auth_menu(self) -> None:
         cur = self.rt.runner.auth_profile.name
-        items = [
-            MenuItem(
-                key=p.name,
-                label=p.name,
-                detail=f"{p.provider} · model={p.default_model or '-'} · source={p.source}",
-                badge="● active" if p.name == cur else p.auth_kind,
-                active=(p.name == cur),
+        now = time.time()
+        items: list[MenuItem] = []
+        for p in self.rt.vault.list_profiles():
+            cd_rem = max(0, int(p.cooldown_until - now))
+            badge = "● active" if p.name == cur else (f"⏳ cd {cd_rem}s" if cd_rem > 0 else p.auth_kind)
+            mode_tag = f" · {p.api_mode}" if p.api_mode else ""
+            url_tag = f" · {p.base_url}" if p.base_url else ""
+            items.append(
+                MenuItem(
+                    key=p.name,
+                    label=p.name,
+                    detail=f"{p.provider}{mode_tag} · model={p.default_model or '-'}{url_tag}",
+                    badge=badge,
+                    active=(p.name == cur),
+                )
             )
-            for p in self.rt.vault.list_profiles()
-        ]
         if not items:
-            self.flash("No auth profiles found — run `ush auth login`")
+            self.flash("No auth profiles found — run `crux auth login`")
             return
         sel = next((i for i, it in enumerate(items) if it.active), 0)
 
@@ -1606,10 +1636,10 @@ class VisualTuiController:
 
         self.menu = MenuOverlay(
             kind="picker",
-            title="Switch Auth Profile  (↑↓ navigate · Enter activate · Esc close)",
+            title="Switch Endpoint & Auth Profile  (↑↓ navigate · type filter · Enter activate · Esc close)",
             items=items,
             selected=sel,
-            allow_filter=False,
+            allow_filter=True,
             on_select=_pick,
             on_cancel=lambda: setattr(self, "menu", None),
         )
@@ -1932,6 +1962,12 @@ class VisualTuiController:
                         break
                     except Exception as exc:  # noqa: BLE001
                         self.comp.write_scroll(self.s.red(f"\n[Error]: {redact_secrets(str(exc))}\n"))
+                        with self._q_lock:
+                            paused_err = len(self.next_queue)
+                        if paused_err:
+                            self.flash(
+                                f"Turn paused after error · {paused_err} queued prompt(s) preserved (Alt+↑ to edit or Enter to resume)"
+                            )
                         break
 
                     if self.rt.runner.cancel_event.is_set():

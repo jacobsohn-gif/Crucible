@@ -77,28 +77,45 @@ BUILTIN_PROFILES: dict[str, ModelCapabilityProfile] = {
 }
 
 
-def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> ModelCapabilityProfile:
-    """Resolves exact or heuristic capability tier for any frontier, open-cloud, or local model."""
-    provider = default_provider
-    clean_id = model_id.strip()
-    if ":" in clean_id and clean_id.split(":", 1)[0] in (
-        "google",
-        "vertex",
-        "vertex-anthropic",
-        "anthropic",
-        "openai",
-        "openrouter",
-        "local",
-    ):
-        provider, clean_id = clean_id.split(":", 1)
+KNOWN_PROVIDER_PREFIXES: tuple[str, ...] = (
+    "google",
+    "vertex",
+    "gemini-enterprise",
+    "code-assist",
+    "antigravity",
+    "vertex-anthropic",
+    "anthropic",
+    "openai",
+    "litellm",
+    "openrouter",
+    "local",
+)
 
-    if clean_id in BUILTIN_PROFILES:
+
+def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> ModelCapabilityProfile:
+    """Resolves exact or heuristic capability tier for any frontier, enterprise, LiteLLM, or local model."""
+    provider = "gemini-enterprise" if default_provider == "code-assist" else default_provider
+    clean_id = model_id.strip()
+    if ":" in clean_id and clean_id.split(":", 1)[0] in KNOWN_PROVIDER_PREFIXES:
+        pfx, clean_id = clean_id.split(":", 1)
+        provider = "gemini-enterprise" if pfx == "code-assist" else pfx
+
+    is_proxy_gateway = provider in ("litellm", "openrouter")
+
+    if clean_id in BUILTIN_PROFILES and not is_proxy_gateway:
         base = BUILTIN_PROFILES[clean_id]
         if provider == base.provider:
             return base
+        # Preserve explicit compatible provider (e.g. gemini-enterprise / antigravity / google / vertex)
+        same_family_ok = (
+            (base.family == "gemini" and provider in ("google", "vertex", "gemini-enterprise", "antigravity"))
+            or (base.family == "anthropic" and provider in ("anthropic", "vertex-anthropic"))
+            or (base.family == "openai" and provider == "openai")
+        )
+        eff_prov = provider if same_family_ok else base.provider
         return ModelCapabilityProfile(
             model_id=clean_id,
-            provider=provider,
+            provider=eff_prov,
             family=base.family,
             tier=base.tier,
             context_window_tokens=base.context_window_tokens,
@@ -113,48 +130,78 @@ def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> Mo
         )
 
     low = clean_id.lower()
-    # Family classification
+
+    # Antigravity LiteRT local on-device / loopback models
+    if "litert" in low or (provider == "antigravity" and "local" in low):
+        return ModelCapabilityProfile(
+            model_id=clean_id,
+            provider=provider,
+            family="local_oss",
+            tier=ModelTier.B,
+            context_window_tokens=32_768,
+            max_output_tokens=8_192,
+            supports_vision=("vision" in low or "vl" in low),
+            tool_calling_mode="xml_fenced_fallback",
+            reasoning_wire_mode="inline_think_tags",
+            max_parallel_read_tools=1,
+            compaction_ratio=0.70,
+            tool_preview_bytes=4_096,
+            skill_catalog_budget_tokens=600,
+        )
+
+    # Family classification (preserving LiteLLM / OpenRouter gateway provider & prefixed model IDs verbatim!)
     if "gemini" in low or "argon" in low:
         family = "gemini"
         tier = ModelTier.A if ("flash" in low or "lite" in low) else ModelTier.S
+        eff_prov = (
+            provider
+            if provider in ("google", "vertex", "gemini-enterprise", "antigravity", "litellm", "openrouter")
+            else "google"
+        )
         return ModelCapabilityProfile(
             model_id=clean_id,
-            provider=provider if provider in ("google", "vertex") else "google",
+            provider=eff_prov,
             family=family,
             tier=tier,
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_vision=True,
-            reasoning_wire_mode="gemini_thought_sig",
+            reasoning_wire_mode="reasoning_content_field" if is_proxy_gateway else "gemini_thought_sig",
             max_parallel_read_tools=8 if tier == ModelTier.S else 4,
             compaction_ratio=0.85 if tier == ModelTier.S else 0.80,
             skill_catalog_budget_tokens=3_000 if tier == ModelTier.S else 1_500,
         )
     if "claude" in low or "opus" in low or "sonnet" in low or "haiku" in low or "fable" in low:
         tier = ModelTier.S if ("opus" in low or "fable" in low) else ModelTier.A
+        eff_prov = (
+            provider
+            if provider in ("anthropic", "vertex-anthropic", "litellm", "openrouter")
+            else "anthropic"
+        )
         return ModelCapabilityProfile(
             model_id=clean_id,
-            provider=provider if provider in ("anthropic", "vertex-anthropic", "openrouter") else "anthropic",
+            provider=eff_prov,
             family="anthropic",
             tier=tier,
             context_window_tokens=200_000,
             max_output_tokens=32_000,
             supports_vision=True,
-            reasoning_wire_mode="anthropic_signed_thinking",
+            reasoning_wire_mode="reasoning_content_field" if is_proxy_gateway else "anthropic_signed_thinking",
             max_parallel_read_tools=8 if tier == ModelTier.S else 4,
             skill_catalog_budget_tokens=3_000 if tier == ModelTier.S else 1_800,
         )
-    if any(k in low for k in ("gpt-5", "gpt-4", "o3", "o4", "codex")):
-        tier = ModelTier.S if any(k in low for k in ("gpt-5", "o3", "pro")) and "mini" not in low else ModelTier.A
+    if any(k in low for k in ("gpt-5", "gpt-4", "o1", "o3", "o4", "codex")):
+        tier = ModelTier.S if any(k in low for k in ("gpt-5", "o1", "o3", "pro")) and "mini" not in low else ModelTier.A
+        eff_prov = provider if provider in ("openai", "litellm", "openrouter") else "openai"
         return ModelCapabilityProfile(
             model_id=clean_id,
-            provider=provider if provider in ("openai", "openrouter") else "openai",
+            provider=eff_prov,
             family="openai",
             tier=tier,
             context_window_tokens=200_000,
             max_output_tokens=32_000,
             supports_vision=True,
-            reasoning_wire_mode="openai_encrypted",
+            reasoning_wire_mode="reasoning_content_field" if is_proxy_gateway else "openai_encrypted",
             max_parallel_read_tools=8 if tier == ModelTier.S else 4,
             skill_catalog_budget_tokens=3_000 if tier == ModelTier.S else 1_500,
         )
@@ -165,7 +212,7 @@ def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> Mo
         tier = ModelTier.B if is_small else ModelTier.A
         return ModelCapabilityProfile(
             model_id=clean_id,
-            provider=provider if provider in ("openrouter", "local") else "openrouter",
+            provider=provider if provider in ("openrouter", "litellm", "local") else "openrouter",
             family=fam,
             tier=tier,
             context_window_tokens=128_000 if tier == ModelTier.A else 32_768,
@@ -177,6 +224,24 @@ def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> Mo
             compaction_ratio=0.80 if tier == ModelTier.A else 0.70,
             tool_preview_bytes=10_240 if tier == ModelTier.A else 4_096,
             skill_catalog_budget_tokens=1_500 if tier == ModelTier.A else 600,
+        )
+
+    # Custom alias on LiteLLM / OpenRouter gateway -> Tier-A native OpenAI-compat profile
+    if provider in ("litellm", "openrouter"):
+        return ModelCapabilityProfile(
+            model_id=clean_id,
+            provider=provider,
+            family=provider,
+            tier=ModelTier.A,
+            context_window_tokens=128_000,
+            max_output_tokens=16_384,
+            supports_vision=True,
+            tool_calling_mode="native_loose",
+            reasoning_wire_mode="reasoning_content_field",
+            max_parallel_read_tools=4,
+            compaction_ratio=0.80,
+            tool_preview_bytes=12_288,
+            skill_catalog_budget_tokens=1_500,
         )
 
     # Default: Local / Open-Weight Tier-B adaptive profile (forgiving XML/JSON, 1-tool cap, 70% compact)

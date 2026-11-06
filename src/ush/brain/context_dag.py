@@ -279,19 +279,22 @@ class SessionDAG:
         context_limit_tokens: int,
         ratio: float = 0.85,
         summarizer: Callable[[list[CanonicalMessage]], str] | None = None,
+        *,
+        force: bool = False,
     ) -> bool:
-        threshold = max(256, int(context_limit_tokens * ratio))
+        threshold = 0 if force else max(256, int(context_limit_tokens * ratio))
         ver, leaf, msgs = self.snapshot_for_compaction()
-        if not leaf or len(msgs) < 6:
+        min_msgs = 3 if force else 6
+        if not leaf or len(msgs) < min_msgs:
             return False
         total_tok = sum(m.approx_tokens() for m in msgs)
-        if total_tok < threshold:
+        if not force and total_tok < threshold:
             return False
 
         # Prefer snapping `split_idx` to a `role == "user"` turn boundary near `len(msgs) - 4`;
         # on single-turn 10+ step loops without a second `user` message, snap to a `role == "assistant"`
         # boundary (`isSplitTurn`) and NEVER cut on `role == "tool"`.
-        target_idx = max(2, len(msgs) - 4)
+        target_idx = max(1 if force else 2, len(msgs) - (2 if force else 4))
         user_candidates = [k for k in range(1, len(msgs)) if msgs[k].role == "user"]
         if user_candidates:
             split_idx = min(user_candidates, key=lambda k: abs(k - target_idx))
@@ -308,6 +311,20 @@ class SessionDAG:
 
         head = msgs[:split_idx]
         tail = msgs[split_idx:]
+        if force:
+            # On emergency provider context-overflow (`400`/`413`), also trim oversized tool outputs in `tail`
+            trimmed_tail: list[CanonicalMessage] = []
+            for m in tail:
+                mc = CanonicalMessage.from_dict(m.to_dict())
+                for p in mc.parts:
+                    if p.kind == "tool_result" and len(p.text) > 4096:
+                        p.text = (
+                            f"{p.text[:2048]}\n"
+                            f"... [EMERGENCY_CONTEXT_TRIM: {len(p.text) - 4096:,} chars omitted] ...\n"
+                            f"{p.text[-2048:]}"
+                        )
+                trimmed_tail.append(mc)
+            tail = trimmed_tail
         anchor_id = msgs[-1].entry_id
         summary = summarizer(head) if summarizer else build_deterministic_epistemic_summary(head)
         return self.commit_compaction(ver, anchor_id, summary, keep_tail=tail)
