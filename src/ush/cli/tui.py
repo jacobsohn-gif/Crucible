@@ -54,12 +54,13 @@ SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 # Curated frontier & local models surfaced in `/model` visual menu (plus live LiteLLM/local `/models` probe)
 RECOMMENDED_MODELS: tuple[tuple[str, str, str], ...] = (
-    ("gemini-4-argon", "gemini-enterprise/vertex", "Tier S · Frontier Gemini 4 Argon (1M ctx, deep native thinking)"),
-    ("gemini-3.1-pro-preview", "gemini-enterprise/vertex", "Tier S · Gemini 3.1 Pro Preview (1M ctx, LOW/MEDIUM/HIGH thinking)"),
-    ("gemini-3-flash-preview", "gemini-enterprise/vertex", "Tier A · Gemini 3 Flash Preview (ultra-fast multi-step agentic loop)"),
-    ("gemini-2.5-pro", "gemini-enterprise/antigravity", "Tier S · Gemini 2.5 Pro GA (Enterprise / Antigravity / AI Studio)"),
-    ("gemini-2.5-flash", "gemini-enterprise/antigravity", "Tier A · Gemini 2.5 Flash GA (low-latency high throughput)"),
-    ("antigravity:gemini-2.5-pro", "antigravity", "Tier S · Antigravity Hosted Endpoint (`priority` tier)"),
+    ("gemini-4-argon", "antigravity/enterprise", "Tier S · Frontier Gemini 4 Argon (1M ctx, deep native thinking)"),
+    ("gemini-3.1-pro-preview", "antigravity/enterprise", "Tier S · Gemini 3.1 Pro Preview (1M ctx, LOW/MEDIUM/HIGH thinking)"),
+    ("gemini-3.8-flash", "antigravity", "Tier A · Antigravity SDK default fast reasoning model (`gemini-3.8-flash`)"),
+    ("gemini-3-flash-preview", "antigravity/enterprise", "Tier A · Gemini 3 Flash Preview (ultra-fast multi-step agentic loop)"),
+    ("gemini-2.5-pro", "antigravity/enterprise", "Tier S · Gemini 2.5 Pro GA (Antigravity / Enterprise / AI Studio)"),
+    ("gemini-2.5-flash", "antigravity/enterprise", "Tier A · Gemini 2.5 Flash GA (low-latency high throughput)"),
+    ("antigravity:gemini-3.1-pro-preview", "antigravity", "Tier S · Pin explicitly to Antigravity Hosted Endpoint"),
     ("claude-opus-4-20250514", "anthropic/vertex", "Tier S · Claude Opus 4 (interleaved thinking between tool calls)"),
     ("claude-sonnet-4@20250514", "vertex-anthropic", "Tier A · Claude Sonnet 4 on Vertex Model Garden"),
     ("claude-sonnet-4-20250514", "anthropic", "Tier A · Claude Sonnet 4 (`api.anthropic.com` API Key / Bearer)"),
@@ -1340,8 +1341,12 @@ class VisualTuiController:
         items: list[MenuItem] = []
         seen: set[str] = set()
 
-        # Include defaults & live `/models` discovery from configured auth profiles (LiteLLM, Antigravity LiteRT, Ollama)
-        for prof in self.rt.vault.list_profiles():
+        # Include defaults & live `/models` discovery from configured auth profiles, prioritizing the active profile first!
+        ordered_profs = sorted(
+            self.rt.vault.list_profiles(),
+            key=lambda p: (0 if p.name == cur_p else 1, 0 if p.provider == "antigravity" else 1),
+        )
+        for prof in ordered_profs:
             if prof.default_model and prof.default_model not in seen:
                 act = prof.default_model == cur_m and prof.name == cur_p
                 items.append(

@@ -512,15 +512,16 @@ class CredentialVault:
             region = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
             v_base = self._resolve_env_base_url("vertex", "https://aiplatform.googleapis.com")
             self._profiles.setdefault(
-                "gcloud-vertex",
+                "gcloud-antigravity",
                 AuthProfile(
-                    name="gcloud-vertex",
-                    provider="vertex",
+                    name="gcloud-antigravity",
+                    provider="antigravity",
                     auth_kind="gcloud_adc",
-                    base_url=v_base,
+                    base_url=self._resolve_env_base_url("antigravity", v_base),
                     project_id=project,
                     region=region,
                     default_model="gemini-3.1-pro-preview",
+                    service_tier=os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip(),
                     source="gcloud",
                 ),
             )
@@ -539,16 +540,15 @@ class CredentialVault:
                 ),
             )
             self._profiles.setdefault(
-                "gcloud-antigravity",
+                "gcloud-vertex",
                 AuthProfile(
-                    name="gcloud-antigravity",
-                    provider="antigravity",
+                    name="gcloud-vertex",
+                    provider="vertex",
                     auth_kind="gcloud_adc",
-                    base_url=self._resolve_env_base_url("antigravity", v_base),
+                    base_url=v_base,
                     project_id=project,
                     region=region,
                     default_model="gemini-3.1-pro-preview",
-                    service_tier=os.environ.get("ANTIGRAVITY_SERVICE_TIER", "").strip(),
                     source="gcloud",
                 ),
             )
