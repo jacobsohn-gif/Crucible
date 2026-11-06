@@ -157,33 +157,50 @@ class PersistentPtyManager:
                 parts.insert(0, s)
         return ":".join(parts)
 
+    @staticmethod
+    def _default_shell_argv(command: str | None = None) -> list[str]:
+        shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+        if shell.endswith("bash"):
+            base = [shell, "--norc", "--noprofile"]
+        else:
+            base = [shell]
+        if command is not None:
+            base.extend(["-c", command])
+        return base
+
     def _spawn_pty_process(self, argv: list[str], *, pty_id: str, persistent: bool, is_daemon: bool) -> _PtyHandle:
         master_fd, slave_fd = pty.openpty()
-        # Disable TTY input echo so injected OSC 633 wrapper commands don't pollute stdout!
-        attrs = termios.tcgetattr(slave_fd)
-        attrs[3] &= ~termios.ECHO
-        termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        try:
+            # Disable TTY input echo so injected OSC 633 wrapper commands don't pollute stdout!
+            attrs = termios.tcgetattr(slave_fd)
+            attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
 
-        env = scrub_child_environment(
-            explicit_allowlist=self.allowed_env_keys,
-            extra_overrides={
-                "PATH": self._normalized_path,
-                "PS1": "",
-                "PROMPT": "",
-                "TERM": "xterm-256color",
-            },
-        )
-        proc = subprocess.Popen(
-            argv,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            cwd=str(self.workspace_root),
-            env=env,
-            start_new_session=True,  # Dedicated process group for leak-free os.killpg
-            close_fds=True,
-        )
-        os.close(slave_fd)
+            env = scrub_child_environment(
+                explicit_allowlist=self.allowed_env_keys,
+                extra_overrides={
+                    "PATH": self._normalized_path,
+                    "PS1": "",
+                    "PROMPT": "",
+                    "TERM": "xterm-256color",
+                },
+            )
+            cwd_dir = self.workspace_root if self.workspace_root.is_dir() else pathlib.Path.cwd()
+            proc = subprocess.Popen(
+                argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(cwd_dir),
+                env=env,
+                start_new_session=True,  # Dedicated process group for leak-free os.killpg
+                close_fds=True,
+            )
+        except BaseException:
+            self._close_fd(slave_fd)
+            self._close_fd(master_fd)
+            raise
+        self._close_fd(slave_fd)
         fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
         handle = _PtyHandle(
@@ -193,7 +210,7 @@ class PersistentPtyManager:
             master_fd=master_fd,
             is_persistent_primary=persistent,
             is_daemon=is_daemon,
-            cwd=str(self.workspace_root),
+            cwd=str(cwd_dir),
         )
         with self._guard:
             self._handles[pty_id] = handle
@@ -208,7 +225,7 @@ class PersistentPtyManager:
             existing.alive = False
             self._close_fd(existing.master_fd)
         return self._spawn_pty_process(
-            ["/bin/bash", "--norc", "--noprofile"],
+            self._default_shell_argv(),
             pty_id=self.PRIMARY_ID,
             persistent=True,
             is_daemon=False,
@@ -243,87 +260,155 @@ class PersistentPtyManager:
     ) -> PtyExecResult:
         if is_daemon or dedicated_pty:
             pid_tag = f"pty_{uuid.uuid4().hex[:8]}"
-            handle = self._spawn_pty_process(
-                ["/bin/bash", "--norc", "--noprofile", "-c", command],
-                pty_id=pid_tag,
-                persistent=False,
-                is_daemon=is_daemon,
-            )
+            try:
+                handle = self._spawn_pty_process(
+                    self._default_shell_argv(command),
+                    pty_id=pid_tag,
+                    persistent=False,
+                    is_daemon=is_daemon,
+                )
+            except OSError as exc:
+                err_buf = HeadTailBuffer()
+                err_buf.append(f"[PTY spawn failed: {exc}]".encode("utf-8"))
+                return self._finalize_output(
+                    pid_tag, "crashed", -1, err_buf, str(self.workspace_root), preview_bytes
+                )
             effective_wait = min(wait_seconds, 0.4) if is_daemon else wait_seconds
             return self._collect_dedicated(handle, effective_wait, preview_bytes, cancel_event)
 
-        handle = self._ensure_primary()
-        with handle.lock:
-            # Drain any stale bytes before issuing the wrapped command
-            self._drain_nonblocking(handle.master_fd)
-            token = uuid.uuid4().hex[:12]
-            # OSC 633 completion + CWD frame emitted regardless of command exit status
-            wrapped = (
-                f"{command}\n"
-                f'__ush_rc=$?; printf "\\033]633;P;Cwd=%s\\007\\033]633;D;{token};%d\\007" "$PWD" "$__ush_rc"\n'
-            )
-            os.write(handle.master_fd, wrapped.encode("utf-8"))
+        for pty_attempt in range(2):
+            try:
+                handle = self._ensure_primary()
+            except OSError as exc:
+                err_buf = HeadTailBuffer()
+                err_buf.append(f"[Primary PTY spawn failed: {exc}]".encode("utf-8"))
+                return self._finalize_output(
+                    self.PRIMARY_ID, "crashed", -1, err_buf, str(self.workspace_root), preview_bytes
+                )
 
-            cmd_buf = HeadTailBuffer()
-            tail_window = ""
-            osc_re = re.compile(
-                rf"\x1b\]633;P;Cwd=([^\x07]*)\x07\x1b\]633;D;{token};(-?\d+)\x07"
-            )
-            deadline = time.monotonic() + wait_seconds
-            last_io = time.monotonic()
-
-            while True:
-                if cancel_event and cancel_event.is_set():
+            retry_on_fresh_pty = False
+            with handle.lock:
+                token = uuid.uuid4().hex[:12]
+                # OSC 633 completion + CWD frame emitted regardless of command exit status
+                wrapped = (
+                    f"{command}\n"
+                    f'__ush_rc=$?; printf "\\033]633;P;Cwd=%s\\007\\033]633;D;{token};%d\\007" "$PWD" "$__ush_rc"\n'
+                )
+                try:
+                    # Drain any stale bytes before issuing the wrapped command
+                    self._drain_nonblocking(handle.master_fd)
+                    os.write(handle.master_fd, wrapped.encode("utf-8"))
+                except (OSError, ValueError) as exc:
                     self._reset_primary(handle)
+                    if pty_attempt == 0:
+                        continue
+                    err_buf = HeadTailBuffer()
+                    err_buf.append(f"[Primary PTY write failed after respawn: {exc}]".encode("utf-8"))
                     return self._finalize_output(
-                        self.PRIMARY_ID, "killed", -9, cmd_buf, handle.cwd, preview_bytes
+                        self.PRIMARY_ID, "crashed", -1, err_buf, handle.cwd, preview_bytes
                     )
 
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    # Reset stuck primary shell cleanly or transfer to interactive if prompt detected
-                    cleaned_tail = _clean_terminal_text(tail_window[-512:])
-                    last_line = cleaned_tail.splitlines()[-1] if cleaned_tail.splitlines() else ""
-                    if STRONG_PROMPT_RE.search(last_line):
+                cmd_buf = HeadTailBuffer()
+                tail_window = ""
+                osc_re = re.compile(
+                    rf"\x1b\]633;P;Cwd=([^\x07]*)\x07\x1b\]633;D;{token};(-?\d+)\x07"
+                )
+                deadline = time.monotonic() + wait_seconds
+                last_io = time.monotonic()
+
+                while True:
+                    if cancel_event and cancel_event.is_set():
+                        self._reset_primary(handle)
                         return self._finalize_output(
-                            self.PRIMARY_ID, "interactive_prompt", None, cmd_buf, handle.cwd, preview_bytes
+                            self.PRIMARY_ID, "killed", -9, cmd_buf, handle.cwd, preview_bytes
                         )
-                    self._reset_primary(handle)
-                    return self._finalize_output(
-                        self.PRIMARY_ID, "timed_out", None, cmd_buf, handle.cwd, preview_bytes
-                    )
 
-                poll_timeout = min(0.10, rem)
-                rlist, _, _ = select.select([handle.master_fd], [], [], poll_timeout)
-                if rlist:
-                    chunk = self._read_chunk(handle.master_fd)
-                    if chunk:
-                        last_io = time.monotonic()
-                        decoded = chunk.decode("utf-8", errors="replace")
-                        tail_window = (tail_window + decoded)[-4096:]
-                        m = osc_re.search(tail_window)
-                        if m:
-                            handle.cwd = m.group(1) or handle.cwd
-                            rc = int(m.group(2))
-                            # Strip OSC 633 completion suffix from captured chunk
-                            clean_chunk = osc_re.sub("", decoded).encode("utf-8")
-                            cmd_buf.append(clean_chunk)
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        # Reset stuck primary shell cleanly or transfer to interactive if prompt detected
+                        cleaned_tail = _clean_terminal_text(tail_window[-512:])
+                        last_line = cleaned_tail.splitlines()[-1] if cleaned_tail.splitlines() else ""
+                        if STRONG_PROMPT_RE.search(last_line):
                             return self._finalize_output(
-                                self.PRIMARY_ID, "completed", rc, cmd_buf, handle.cwd, preview_bytes
+                                self.PRIMARY_ID, "interactive_prompt", None, cmd_buf, handle.cwd, preview_bytes
                             )
-                        cmd_buf.append(chunk)
-                    else:
-                        # Primary shell exited explicitly (e.g., user ran `exit`)
-                        handle.alive = False
-                        try:
-                            handle.proc.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            pass
-                        self._close_fd(handle.master_fd)
+                        self._reset_primary(handle)
                         return self._finalize_output(
-                            self.PRIMARY_ID, "completed", handle.proc.returncode or 0, cmd_buf, handle.cwd, preview_bytes
+                            self.PRIMARY_ID, "timed_out", None, cmd_buf, handle.cwd, preview_bytes
                         )
-                else:
+
+                    poll_timeout = min(0.10, rem)
+                    dead_fd = False
+                    try:
+                        rlist, _, _ = select.select([handle.master_fd], [], [], poll_timeout)
+                    except (OSError, ValueError):
+                        rlist = []
+                        dead_fd = True
+
+                    if rlist:
+                        chunk = self._read_chunk(handle.master_fd)
+                        if chunk:
+                            last_io = time.monotonic()
+                            decoded = chunk.decode("utf-8", errors="replace")
+                            tail_window = (tail_window + decoded)[-4096:]
+                            m = osc_re.search(tail_window)
+                            if m:
+                                handle.cwd = m.group(1) or handle.cwd
+                                rc = int(m.group(2))
+                                # Strip OSC 633 completion suffix from captured chunk
+                                clean_chunk = osc_re.sub("", decoded).encode("utf-8")
+                                cmd_buf.append(clean_chunk)
+                                return self._finalize_output(
+                                    self.PRIMARY_ID, "completed", rc, cmd_buf, handle.cwd, preview_bytes
+                                )
+                            cmd_buf.append(chunk)
+                            continue
+                        dead_fd = True
+
+                    if dead_fd or handle.proc.poll() is not None:
+                        # Primary shell exited or crashed (e.g., `exit`, `exec false`, or external SIGKILL)
+                        for extra in self._drain_chunks(handle.master_fd):
+                            dec_extra = extra.decode("utf-8", errors="replace")
+                            tail_window = (tail_window + dec_extra)[-4096:]
+                            m_extra = osc_re.search(tail_window)
+                            if m_extra:
+                                handle.cwd = m_extra.group(1) or handle.cwd
+                                rc_ok = int(m_extra.group(2))
+                                cmd_buf.append(osc_re.sub("", dec_extra).encode("utf-8"))
+                                self._reset_primary(handle)
+                                try:
+                                    self._ensure_primary()
+                                except OSError:
+                                    pass
+                                return self._finalize_output(
+                                    self.PRIMARY_ID, "completed", rc_ok, cmd_buf, handle.cwd, preview_bytes
+                                )
+                            cmd_buf.append(extra)
+                        try:
+                            handle.proc.wait(timeout=0.5)
+                        except (subprocess.TimeoutExpired, OSError):
+                            pass
+                        rc_exit = handle.proc.returncode if handle.proc.returncode is not None else -1
+                        saved_cwd = handle.cwd
+                        self._reset_primary(handle)
+                        # If the shell had died externally from a signal before producing any output, replay once!
+                        if pty_attempt == 0 and cmd_buf.total_bytes == 0 and rc_exit < 0:
+                            retry_on_fresh_pty = True
+                            break
+                        try:
+                            self._ensure_primary()
+                        except OSError:
+                            pass
+                        if rc_exit != 0:
+                            cmd_buf.append(
+                                f"\n[Primary shell process exited (rc={rc_exit}) — fresh primary PTY auto-respawned]\n".encode(
+                                    "utf-8"
+                                )
+                            )
+                        return self._finalize_output(
+                            self.PRIMARY_ID, "completed", rc_exit, cmd_buf, saved_cwd, preview_bytes
+                        )
+
                     # Markerless strong-prompt stall detection (`[y/N]`, `Password:`, `>>>` -> yield in 0.45s!)
                     idle = time.monotonic() - last_io
                     if idle >= 0.45 and tail_window:
@@ -334,6 +419,12 @@ class PersistentPtyManager:
                             return self._finalize_output(
                                 self.PRIMARY_ID, "interactive_prompt", None, cmd_buf, handle.cwd, preview_bytes
                             )
+            if retry_on_fresh_pty:
+                continue
+
+        return self._finalize_output(
+            self.PRIMARY_ID, "crashed", -1, HeadTailBuffer(), str(self.workspace_root), preview_bytes
+        )
 
     def _collect_dedicated(
         self,
@@ -366,7 +457,11 @@ class PersistentPtyManager:
                 state = "running_background"
                 return self._finalize_output(handle.pty_id, state, None, handle.buf, handle.cwd, preview_bytes)
 
-            rlist, _, _ = select.select([handle.master_fd], [], [], min(0.08, rem))
+            try:
+                rlist, _, _ = select.select([handle.master_fd], [], [], min(0.08, rem))
+            except (OSError, ValueError):
+                time.sleep(0.02)
+                continue
             if rlist:
                 chunk = self._read_chunk(handle.master_fd)
                 if chunk:
@@ -391,16 +486,26 @@ class PersistentPtyManager:
         with self._guard:
             handle = self._handles.get(pty_id)
         if not handle:
-            raise KeyError(f"Unknown PTY session `{pty_id}`.")
-        if chars and handle.alive:
-            os.write(handle.master_fd, chars.encode("utf-8"))
+            nf_buf = HeadTailBuffer()
+            nf_buf.append(f"Unknown or closed PTY session `{pty_id}`.".encode("utf-8"))
+            return self._finalize_output(
+                pty_id, "not_found", -1, nf_buf, str(self.workspace_root), preview_bytes
+            )
+        if chars and handle.alive and handle.proc.poll() is None:
+            try:
+                os.write(handle.master_fd, chars.encode("utf-8"))
+            except (OSError, ValueError):
+                handle.alive = False
         if handle.is_persistent_primary:
             # Read response after interactive prompt input (e.g. answering `y\n` to `[y/N]`)
             time.sleep(min(0.25, wait_seconds))
             tmp_buf = HeadTailBuffer()
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
-                r, _, _ = select.select([handle.master_fd], [], [], 0.08)
+                try:
+                    r, _, _ = select.select([handle.master_fd], [], [], 0.08)
+                except (OSError, ValueError):
+                    break
                 if not r:
                     break
                 ch = self._read_chunk(handle.master_fd)

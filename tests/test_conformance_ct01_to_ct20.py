@@ -1898,6 +1898,742 @@ class ConformanceSuiteCT01ToCT20(unittest.TestCase):
             self.assertEqual(anth_pay[2]["content"][0]["type"], "tool_result")
             self.assertEqual(anth_pay[2]["content"][1]["type"], "text")
 
+    def test_ct27_enterprise_antigravity_claude_openai_litellm_and_429_process_recovery(self) -> None:
+        """CT-27: Gemini Enterprise, Antigravity, Claude, OpenAI `/v1/responses`, LiteLLM, 429 & Dead-PTY Recovery."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import signal
+        from unittest.mock import patch
+
+        from ush.auth.vault import fetch_openai_compat_models
+        from ush.brain.providers import (
+            HttpProviderTransport,
+            WireError,
+            build_openai_responses_payload,
+            parse_retry_delay_seconds,
+        )
+        from ush.kernel.tools import ToolSpec
+
+        # 0. Verify retry-delay parser across RFC/ms headers and Google RetryInfo JSON
+        self.assertAlmostEqual(parse_retry_delay_seconds(429, {"retry-after-ms": "250"}, "") or 0.0, 0.25, places=2)
+        self.assertAlmostEqual(parse_retry_delay_seconds(429, {"retry-after": "3"}, "") or 0.0, 3.0, places=2)
+        google_429_body = json.dumps(
+            {
+                "error": {
+                    "code": 429,
+                    "message": "Resource exhausted",
+                    "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1.5s"}],
+                }
+            }
+        )
+        self.assertAlmostEqual(parse_retry_delay_seconds(429, {}, google_429_body) or 0.0, 1.5, places=2)
+
+        recorded_reqs: list[dict[str, Any]] = []
+        route_counters: dict[str, int] = {}
+
+        class _MultiEndpointMockHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def _send_sse(self, frames: list[str], status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
+                payload_bytes = "".join(frames).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload_bytes)))
+                self.send_header("Connection", "close")
+                for hk, hv in (extra_headers or {}).items():
+                    self.send_header(hk, hv)
+                self.end_headers()
+                self.wfile.write(payload_bytes)
+                self.wfile.flush()
+
+            def _send_json(self, obj: dict[str, Any], status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
+                raw = json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Connection", "close")
+                for hk, hv in (extra_headers or {}).items():
+                    self.send_header(hk, hv)
+                self.end_headers()
+                self.wfile.write(raw)
+                self.wfile.flush()
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.endswith("/models"):
+                    self._send_json(
+                        {
+                            "data": [
+                                {"id": "anthropic/claude-sonnet-4-20250514"},
+                                {"id": "vertex_ai/gemini-2.5-pro"},
+                            ]
+                        }
+                    )
+                    return
+                self._send_json({"error": "not found"}, status=404)
+
+            def do_POST(self) -> None:  # noqa: N802
+                nbytes = int(self.headers.get("Content-Length") or "0")
+                raw_body = self.rfile.read(nbytes).decode("utf-8") if nbytes > 0 else "{}"
+                body = json.loads(raw_body) if raw_body.strip() else {}
+                hdrs = {k.lower(): v for k, v in self.headers.items()}
+                recorded_reqs.append({"path": self.path, "headers": hdrs, "body": body})
+                cnt = route_counters.get(self.path, 0) + 1
+                route_counters[self.path] = cnt
+
+                # 1a. Gemini Enterprise Express Mode (`/v1/publishers/google/models/...`)
+                if "/v1/publishers/google/models/" in self.path:
+                    chunk = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [
+                                        {"thought": True, "text": "Enterprise Express thought.", "thoughtSignature": "c2lnX2V4cA=="},
+                                        {"text": "Enterprise Express OK"},
+                                    ],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ],
+                        "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 6, "thoughtsTokenCount": 5},
+                    }
+                    self._send_sse([f"data: {json.dumps(chunk)}\n\n"])
+                    return
+
+                # 1b. Gemini Enterprise Multi-Region Cascade (`global` -> 429, `us-central1` -> 200)
+                if "/locations/global/publishers/google/models/" in self.path:
+                    self._send_json({"error": {"code": 429, "message": "Global region saturated"}}, status=429)
+                    return
+                if "/locations/us-central1/publishers/google/models/" in self.path:
+                    chunk = {
+                        "candidates": [{"content": {"role": "model", "parts": [{"text": "Failover us-central1 OK"}]}, "finishReason": "STOP"}]
+                    }
+                    self._send_sse([f"data: {json.dumps(chunk)}\n\n"])
+                    return
+
+                # 1c. Gemini Enterprise Code Assist (`v1internal:streamGenerateContent?alt=sse`)
+                if "v1internal:streamGenerateContent" in self.path:
+                    wrapped_evt = {
+                        "response": {
+                            "candidates": [
+                                {"content": {"role": "model", "parts": [{"text": f"CodeAssist project={body.get('project')} OK"}]}, "finishReason": "STOP"}
+                            ]
+                        }
+                    }
+                    self._send_sse([f"data: {json.dumps(wrapped_evt)}\n\n"])
+                    return
+
+                # 2a. Antigravity Hosted Gemini Endpoint (`/antigravity/v1beta/models/...`)
+                if self.path.startswith("/antigravity/v1beta/models/"):
+                    chunk = {
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": f"Antigravity tier={body.get('serviceTier')} OK"}]},
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    }
+                    self._send_sse([f"data: {json.dumps(chunk)}\n\n"])
+                    return
+
+                # 3. Claude Default Endpoint (`/v1/messages`) with mid-stream 529 overloaded recovery on 1st attempt
+                if self.path == "/v1/messages":
+                    if cnt == 1:
+                        err_frame = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+                        self._send_sse([err_frame], status=200)
+                        return
+                    frames = [
+                        'data: {"type":"message_start","message":{"usage":{"input_tokens":15}}}\n\n',
+                        'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+                        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Claude deep thought"}}\n\n',
+                        'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_claude_ok"}}\n\n',
+                        'data: {"type":"content_block_stop","index":0}\n\n',
+                        'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+                        'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Claude Bearer OK"}}\n\n',
+                        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}\n\n',
+                    ]
+                    self._send_sse(frames)
+                    return
+
+                # 4a. OpenAI `/v1/responses` Endpoint
+                if self.path == "/openai/v1/responses":
+                    frames = [
+                        'data: {"type":"response.reasoning_summary_text.delta","delta":"Responses CoT step"}\n\n',
+                        'data: {"type":"response.output_text.delta","delta":"OpenAI Responses OK"}\n\n',
+                        (
+                            'data: {"type":"response.completed","response":{"status":"completed",'
+                            '"output":[{"type":"reasoning","id":"rs_1","encrypted_content":"enc_blob_xyz","summary":[{"type":"summary_text","text":"Responses CoT step"}]},'
+                            '{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OpenAI Responses OK"}]}],'
+                            '"usage":{"input_tokens":20,"output_tokens":10,"input_tokens_details":{"cached_tokens":8},"output_tokens_details":{"reasoning_tokens":6}}}}\n\n'
+                        ),
+                    ]
+                    self._send_sse(frames)
+                    return
+
+                # 4b. Legacy OpenAI proxy returning 404 on `/responses` -> automatic fallback to `/chat/completions`
+                if self.path == "/legacy-oai/v1/responses":
+                    self._send_json({"error": {"message": "Responses endpoint not implemented"}}, status=404)
+                    return
+                if self.path == "/legacy-oai/v1/chat/completions":
+                    frames = [
+                        'data: {"choices":[{"delta":{"content":"Fallback ChatCompletions OK"},"finish_reason":"stop"}]}\n\n',
+                        "data: [DONE]\n\n",
+                    ]
+                    self._send_sse(frames)
+                    return
+
+                # 5. LiteLLM Proxy (`/litellm/v1/chat/completions`):
+                #    - Rejects `stream_options` on 1st call -> client auto-retries without `stream_options`
+                #    - Rejects oversized prompt (`>900` chars) with `ContextWindowExceededError` -> SessionRunner auto-compacts & retries!
+                if self.path == "/litellm/v1/chat/completions":
+                    if "stream_options" in body:
+                        self._send_json(
+                            {"error": {"message": "Unsupported parameter: stream_options"}},
+                            status=400,
+                        )
+                        return
+                    serialized_msgs = json.dumps(body.get("messages", []))
+                    if len(serialized_msgs) > 1200 and "<epistemic_compaction_handoff>" not in serialized_msgs:
+                        self._send_json(
+                            {"error": {"message": "litellm.ContextWindowExceededError: prompt is too long (exceeds maximum context length)"}},
+                            status=400,
+                        )
+                        return
+                    frames = [
+                        'data: {"choices":[{"delta":{"reasoning_content":"LiteLLM R1 thought","content":"LiteLLM OK"},"finish_reason":"stop"}]}\n\n',
+                        "data: [DONE]\n\n",
+                    ]
+                    self._send_sse(frames)
+                    return
+
+                # 6a. Persistent 429 endpoint (fails 3x with Retry-After, succeeds on 4th attempt)
+                if self.path == "/ratelimit/v1/chat/completions":
+                    if cnt <= 3:
+                        self._send_json(
+                            {"error": {"message": "Rate limit reached, try again in 15ms"}},
+                            status=429,
+                            extra_headers={"Retry-After-Ms": "15"},
+                        )
+                        return
+                    self._send_sse(
+                        [
+                            'data: {"choices":[{"delta":{"content":"Recovered after 3x 429"},"finish_reason":"stop"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ]
+                    )
+                    return
+
+                # 6b. Multi-profile 429 failover (`primary` always 429, `backup` 200)
+                if self.path == "/failover-primary/v1/chat/completions":
+                    self._send_json({"error": {"message": "Primary quota exhausted"}}, status=429, extra_headers={"Retry-After": "1"})
+                    return
+                if self.path == "/failover-backup/v1/chat/completions":
+                    self._send_sse(
+                        [
+                            'data: {"choices":[{"delta":{"content":"Backup profile rescued turn"},"finish_reason":"stop"}]}\n\n',
+                            "data: [DONE]\n\n",
+                        ]
+                    )
+                    return
+
+                self._send_json({"error": f"unhandled {self.path}"}, status=404)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _MultiEndpointMockHandler)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        srv_thread.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = pathlib.Path(tmp)
+                home = tmp_path / "ush_home"
+                ws = tmp_path / "ws"
+                ws.mkdir()
+                codex_dir = tmp_path / "codex_home"
+                codex_dir.mkdir()
+                claude_dir = tmp_path / "claude_home"
+                claude_dir.mkdir()
+                (codex_dir / "auth.json").write_text(
+                    json.dumps({"tokens": {"access_token": "eyJ_codex_oauth_tok", "account_id": "acct_99"}}),
+                    encoding="utf-8",
+                )
+                (claude_dir / ".credentials.json").write_text(
+                    json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-ambient-claude"}}),
+                    encoding="utf-8",
+                )
+
+                sleep_calls: list[float] = []
+                with patch.dict(os.environ, {"USH_DISABLE_KEYCHAIN": "1"}, clear=False):
+                    vault = CredentialVault(home, probe_ambient=False)
+                    transport = HttpProviderTransport(vault)
+                    client = UniversalModelClient(
+                        vault,
+                        transport,
+                        max_api_attempts=6,
+                        sleep_fn=lambda secs: sleep_calls.append(secs),
+                    )
+
+                    # --- 1. Gemini Enterprise: Express Mode, Multi-Region Vertex Failover, & Code Assist `v1internal` ---
+                    ent_express = vault.register_api_key_profile(
+                        name="ent-express",
+                        provider="gemini-enterprise",
+                        api_key="AQ.enterprise-express-key",
+                        base_url=base,
+                        default_model="gemini-2.5-pro",
+                        api_mode="express",
+                        service_tier="priority",
+                    )
+                    p_ent = resolve_model_profile("gemini-enterprise:gemini-2.5-pro", "gemini-enterprise")
+                    m_exp = client.generate(
+                        profile=p_ent,
+                        auth_profile=ent_express,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="ping")])],
+                        tools=[],
+                        session_id="sess_ent",
+                    )
+                    self.assertEqual(m_exp.plain_text(), "Enterprise Express OK")
+                    self.assertEqual(m_exp.thinking_text(), "Enterprise Express thought.")
+                    exp_req = next(r for r in recorded_reqs if "/v1/publishers/google/models/" in r["path"])
+                    self.assertEqual(exp_req["headers"].get("x-goog-api-key"), "AQ.enterprise-express-key")
+                    self.assertEqual(exp_req["body"].get("serviceTier"), "priority")
+
+                    ent_vertex = vault.register_api_key_profile(
+                        name="ent-vertex-global",
+                        provider="gemini-enterprise",
+                        api_key="ya29.mock-adc-token",
+                        base_url=base,
+                        auth_kind="bearer",
+                        project_id="ent-proj-1",
+                        region="global",
+                        default_model="gemini-2.5-pro",
+                        api_mode="vertex",
+                    )
+                    m_reg = client.generate(
+                        profile=p_ent,
+                        auth_profile=ent_vertex,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="cascade")])],
+                        tools=[],
+                        session_id="sess_ent",
+                    )
+                    self.assertEqual(m_reg.plain_text(), "Failover us-central1 OK")
+
+                    ent_ca = vault.register_api_key_profile(
+                        name="ent-code-assist",
+                        provider="code-assist",
+                        api_key="ya29.ca-token",
+                        base_url=base,
+                        auth_kind="bearer",
+                        project_id="ca-ent-proj",
+                        default_model="gemini-2.5-pro",
+                        api_mode="code_assist",
+                    )
+                    p_ca = resolve_model_profile("code-assist:gemini-2.5-pro", "code-assist")
+                    m_ca = client.generate(
+                        profile=p_ca,
+                        auth_profile=ent_ca,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="ca")])],
+                        tools=[],
+                        session_id="sess_ca",
+                    )
+                    self.assertEqual(m_ca.plain_text(), "CodeAssist project=ca-ent-proj OK")
+
+                    # --- 2. Antigravity Hosted Gemini (`priority`) & Local LiteRT OpenAI-Compatible Endpoint ---
+                    ag_hosted = vault.register_api_key_profile(
+                        name="ag-hosted",
+                        provider="antigravity",
+                        api_key="ag-secret-key",
+                        base_url=f"{base}/antigravity",
+                        default_model="gemini-2.5-pro",
+                        api_mode="gemini",
+                        service_tier="priority",
+                    )
+                    p_ag = resolve_model_profile("antigravity:gemini-2.5-pro", "antigravity")
+                    m_ag = client.generate(
+                        profile=p_ag,
+                        auth_profile=ag_hosted,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="ag")])],
+                        tools=[],
+                        session_id="sess_ag",
+                    )
+                    self.assertEqual(m_ag.plain_text(), "Antigravity tier=priority OK")
+
+                    ag_litert = vault.register_api_key_profile(
+                        name="ag-litert",
+                        provider="antigravity",
+                        api_key="",
+                        auth_kind="none",
+                        base_url=f"{base}/legacy-oai/v1",
+                        default_model="litert-gemma-3",
+                        api_mode="chat_completions",
+                    )
+                    p_ag_local = resolve_model_profile("antigravity:litert-gemma-3", "antigravity")
+                    m_ag_local = client.generate(
+                        profile=p_ag_local,
+                        auth_profile=ag_litert,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="local")])],
+                        tools=[],
+                        session_id="sess_ag",
+                    )
+                    self.assertEqual(m_ag_local.plain_text(), "Fallback ChatCompletions OK")
+
+                    # --- 3. Claude `/v1` Base-URL Normalization, Ambient Bearer Discovery & 529 Overloaded Recovery ---
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "USH_DISABLE_KEYCHAIN": "1",
+                            "HOME": str(tmp_path),
+                            "CODEX_HOME": str(codex_dir),
+                            "CLAUDE_CONFIG_DIR": str(claude_dir),
+                            "ANTHROPIC_BASE_URL": f"{base}/v1",
+                            "OPENAI_BASE_URL": f"{base}/openai/v1",
+                            "OPENAI_ORG_ID": "org_crux_test",
+                            "OPENAI_PROJECT": "proj_crux_test",
+                        },
+                        clear=True,
+                    ):
+                        amb_vault = CredentialVault(tmp_path / "amb_home", probe_ambient=False)
+                        amb_vault.discover_ambient_credentials()
+                        cli_claude = amb_vault._profiles["claude-oauth"]
+                        cli_codex = amb_vault._profiles["codex-oauth"]
+                        self.assertEqual(cli_claude.auth_kind, "oauth")
+                        self.assertEqual(cli_codex.extra_headers.get("ChatGPT-Account-Id"), "acct_99")
+                        self.assertEqual(cli_codex.extra_headers.get("OpenAI-Organization"), "org_crux_test")
+
+                        amb_client = UniversalModelClient(
+                            amb_vault,
+                            HttpProviderTransport(amb_vault),
+                            max_api_attempts=4,
+                            sleep_fn=lambda secs: sleep_calls.append(secs),
+                        )
+                        p_claude = resolve_model_profile("claude-sonnet-4-20250514", "anthropic")
+                        m_claude = amb_client.generate(
+                            profile=p_claude,
+                            auth_profile=cli_claude,
+                            system_prompt="sys",
+                            history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi claude")])],
+                            tools=[],
+                            session_id="sess_claude",
+                        )
+                        self.assertEqual(m_claude.plain_text(), "Claude Bearer OK")
+                        self.assertEqual(m_claude.thinking_text(), "Claude deep thought")
+                        claude_reqs = [r for r in recorded_reqs if r["path"] == "/v1/messages"]
+                        self.assertEqual(len(claude_reqs), 2)  # 1st hit mid-stream 529 overloaded_error, 2nd succeeded!
+                        self.assertEqual(claude_reqs[-1]["headers"].get("authorization"), "Bearer sk-ant-oat01-ambient-claude")
+
+                        # --- 4. OpenAI `/v1/responses` Streaming, ChatGPT OAuth Rules, `encrypted_content` Round-Trip & 404 Fallback ---
+                        p_gpt5 = resolve_model_profile("openai:gpt-5", "openai")
+                        m_resp = amb_client.generate(
+                            profile=p_gpt5,
+                            auth_profile=cli_codex,
+                            system_prompt="sys",
+                            history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi gpt5")])],
+                            tools=[],
+                            session_id="sess_oai_resp",
+                        )
+                        self.assertEqual(m_resp.plain_text(), "OpenAI Responses OK")
+                        self.assertEqual(m_resp.thinking_text(), "Responses CoT step")
+                        resp_req = next(r for r in recorded_reqs if r["path"] == "/openai/v1/responses")
+                        self.assertIs(resp_req["body"].get("store"), False)
+                        self.assertNotIn("max_output_tokens", resp_req["body"])  # Omitted for ChatGPT OAuth non-sk- token!
+                        self.assertEqual(resp_req["headers"].get("session_id"), "sess_oai_resp")
+                        self.assertEqual(resp_req["headers"].get("openai-organization"), "org_crux_test")
+
+                        # Verify Turn-2 `reasoning.encrypted_content` round-trip in `build_openai_responses_payload`
+                        turn2_pay = build_openai_responses_payload(
+                            "sys",
+                            [
+                                CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi gpt5")]),
+                                m_resp,
+                                CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="follow up")]),
+                            ],
+                            [],
+                            p_gpt5,
+                            session_id="sess_oai_resp",
+                        )
+                        enc_items = [it for it in turn2_pay["input"] if it.get("type") == "reasoning"]
+                        self.assertEqual(len(enc_items), 1)
+                        self.assertEqual(enc_items[0].get("encrypted_content"), "enc_blob_xyz")
+
+                    # Verify automatic `/v1/responses` -> `/v1/chat/completions` fallback on 404
+                    oai_legacy = vault.register_api_key_profile(
+                        name="oai-legacy",
+                        provider="openai",
+                        api_key="sk-proj-legacy123",
+                        base_url=f"{base}/legacy-oai/v1",
+                        default_model="gpt-5",
+                        api_mode="responses",
+                    )
+                    m_oai_fb = client.generate(
+                        profile=resolve_model_profile("openai:gpt-5", "openai"),
+                        auth_profile=oai_legacy,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="fallback")])],
+                        tools=[],
+                        session_id="sess_fb",
+                    )
+                    self.assertEqual(m_oai_fb.plain_text(), "Fallback ChatCompletions OK")
+
+                    # --- 5. LiteLLM Verbatim Model Prefix, Dual Headers, Live `/models`, & Context-Overflow Auto-Compaction ---
+                    litellm_prof = vault.register_api_key_profile(
+                        name="litellm-gw",
+                        provider="litellm",
+                        api_key="sk-litellm-master",
+                        base_url=f"{base}/litellm/v1",
+                        default_model="anthropic/claude-sonnet-4-20250514",
+                        api_mode="chat_completions",
+                    )
+                    live_models = fetch_openai_compat_models(litellm_prof.base_url, api_key="sk-litellm-master")
+                    self.assertIn("anthropic/claude-sonnet-4-20250514", live_models)
+
+                    p_lite = resolve_model_profile("litellm:anthropic/claude-sonnet-4-20250514", "litellm")
+                    self.assertEqual(p_lite.provider, "litellm")
+                    self.assertEqual(p_lite.model_id, "anthropic/claude-sonnet-4-20250514")
+
+                    lite_runner = SessionRunner(
+                        workspace_root=ws,
+                        client=client,
+                        auth_profile=litellm_prof,
+                        model_profile=p_lite,
+                        mode=PermissionMode.YOLO,
+                        ush_home=home,
+                    )
+                    try:
+                        # Seed prior messages with >1200 chars so the next turn triggers LiteLLM ContextWindowExceededError (400),
+                        # verifying `SessionRunner` emergency-compacts the DAG and completes without failing!
+                        lite_runner.dag.append(CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="u1 " + ("A" * 700))]))
+                        lite_runner.dag.append(CanonicalMessage(role="assistant", parts=[CanonicalPart(kind="text", text="a1 " + ("B" * 700))]))
+                        overflow_evts: list[str] = []
+                        out_lite = lite_runner.run_turn(
+                            "Summarize via LiteLLM",
+                            on_event=lambda e: overflow_evts.append(str(e.meta.get("event", ""))) if e.kind == "cognitive_event" else None,
+                        )
+                        self.assertEqual(out_lite.final_message.plain_text(), "LiteLLM OK")
+                        self.assertIn("context_overflow_recovery", overflow_evts)
+                        lite_reqs = [r for r in recorded_reqs if r["path"] == "/litellm/v1/chat/completions"]
+                        self.assertEqual(lite_reqs[-1]["body"]["model"], "anthropic/claude-sonnet-4-20250514")
+                        self.assertEqual(lite_reqs[-1]["headers"].get("x-litellm-api-key"), "sk-litellm-master")
+                    finally:
+                        lite_runner.close()
+
+                    # --- 6a. Persistent `429` Backoff Recovery + Multi-Profile `429` Failover + Instant Cancel ---
+                    rl_vault = CredentialVault(tmp_path / "rl_home", probe_ambient=False)
+                    rl_prof = rl_vault.register_api_key_profile(
+                        name="rl-single",
+                        provider="openai",
+                        api_key="sk-rl",
+                        base_url=f"{base}/ratelimit/v1",
+                        default_model="gpt-4.1",
+                        api_mode="chat_completions",
+                    )
+                    rl_client = UniversalModelClient(
+                        rl_vault,
+                        HttpProviderTransport(rl_vault),
+                        max_api_attempts=6,
+                        sleep_fn=lambda secs: sleep_calls.append(secs),
+                    )
+                    before_sleeps = len(sleep_calls)
+                    m_rl = rl_client.generate(
+                        profile=resolve_model_profile("gpt-4.1", "openai"),
+                        auth_profile=rl_prof,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="retry 429")])],
+                        tools=[],
+                        session_id="sess_rl",
+                    )
+                    self.assertEqual(m_rl.plain_text(), "Recovered after 3x 429")
+                    self.assertGreaterEqual(len(sleep_calls) - before_sleeps, 3)
+
+                    # Multi-profile 429 failover (`fo-primary` -> `fo-backup`)
+                    fo_vault = CredentialVault(tmp_path / "fo_home", probe_ambient=False)
+                    fo_prim = fo_vault.register_api_key_profile(
+                        name="fo-primary",
+                        provider="litellm",
+                        api_key="sk-1",
+                        base_url=f"{base}/failover-primary/v1",
+                        default_model="gpt-4.1",
+                        api_mode="chat_completions",
+                    )
+                    fo_vault.register_api_key_profile(
+                        name="fo-backup",
+                        provider="litellm",
+                        api_key="sk-2",
+                        base_url=f"{base}/failover-backup/v1",
+                        default_model="gpt-4.1",
+                        api_mode="chat_completions",
+                    )
+                    fo_client = UniversalModelClient(
+                        fo_vault,
+                        HttpProviderTransport(fo_vault),
+                        max_api_attempts=4,
+                        sleep_fn=lambda secs: sleep_calls.append(secs),
+                    )
+                    failover_events: list[str] = []
+                    m_fo = fo_client.generate(
+                        profile=resolve_model_profile("litellm:gpt-4.1", "litellm"),
+                        auth_profile=fo_prim,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="failover now")])],
+                        tools=[],
+                        session_id="sess_fo",
+                        on_event=lambda e: failover_events.append(str(e.meta.get("event", ""))) if e.kind == "cognitive_event" else None,
+                    )
+                    self.assertEqual(m_fo.plain_text(), "Backup profile rescued turn")
+                    self.assertIn("api_failover", failover_events)
+
+                    # Instant cancellation during 429 backoff
+                    pre_cancel = threading.Event()
+                    pre_cancel.set()
+                    m_can = fo_client.generate(
+                        profile=resolve_model_profile("litellm:gpt-4.1", "litellm"),
+                        auth_profile=fo_prim,
+                        system_prompt="sys",
+                        history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="cancel")])],
+                        tools=[],
+                        session_id="sess_can",
+                        cancel_event=pre_cancel,
+                    )
+                    self.assertEqual(m_can.stop_reason, StopReason.CANCELED)
+
+                # --- 6b. Dead-PTY `SIGKILL` Auto-Respawn + Shell `exit` + Crashed Tool/Hook Process Containment ---
+                pty_step = {"n": 0}
+
+                def _pty_resilience_script(
+                    _idx: int,
+                    prof: ModelCapabilityProfile,
+                    msgs: list[CanonicalMessage],
+                    _tools: list[dict[str, Any]],
+                ) -> CanonicalMessage:
+                    pty_step["n"] += 1
+                    step_n = pty_step["n"]
+                    if step_n == 1:
+                        return CanonicalMessage(
+                            role="assistant",
+                            producer_provider=prof.provider,
+                            producer_model_id=prof.model_id,
+                            parts=[
+                                CanonicalPart(
+                                    kind="tool_call",
+                                    tool_call_id="tc_pty_1",
+                                    tool_name="exec_pty",
+                                    tool_args={"command": "echo ALIVE_AFTER_RESPAWN"},
+                                ),
+                                CanonicalPart(
+                                    kind="tool_call",
+                                    tool_call_id="tc_crash_tool",
+                                    tool_name="flaky_subproc",
+                                    tool_args={},
+                                ),
+                            ],
+                        )
+                    if step_n == 2:
+                        # Subshell `exit 9` kills the persistent shell mid-command; PTY manager must report rc=9 & respawn!
+                        return CanonicalMessage(
+                            role="assistant",
+                            producer_provider=prof.provider,
+                            producer_model_id=prof.model_id,
+                            parts=[
+                                CanonicalPart(
+                                    kind="tool_call",
+                                    tool_call_id="tc_pty_exit",
+                                    tool_name="exec_pty",
+                                    tool_args={"command": "exit 9"},
+                                )
+                            ],
+                        )
+                    if step_n == 3:
+                        # Prove the persistent PTY still runs commands cleanly right after `exit 9`!
+                        return CanonicalMessage(
+                            role="assistant",
+                            producer_provider=prof.provider,
+                            producer_model_id=prof.model_id,
+                            parts=[
+                                CanonicalPart(
+                                    kind="tool_call",
+                                    tool_call_id="tc_pty_post_exit",
+                                    tool_name="exec_pty",
+                                    tool_args={"command": "echo RECOVERED_POST_EXIT"},
+                                )
+                            ],
+                        )
+                    tool_texts = "\n".join(p.text for m in msgs if m.role == "tool" for p in m.parts)
+                    return CanonicalMessage(
+                        role="assistant",
+                        producer_provider=prof.provider,
+                        producer_model_id=prof.model_id,
+                        parts=[CanonicalPart(kind="text", text=f"All recovered:\n{tool_texts}")],
+                    )
+
+                reg = build_default_tool_registry()
+
+                def _boom_handler(_args: dict[str, Any], _ctx: ToolExecutionContext) -> CanonicalPart:
+                    raise OSError(32, "Broken child pipe in external tool")
+
+                reg.register(
+                    ToolSpec(
+                        "flaky_subproc",
+                        "Simulates a crashing child process",
+                        {"type": "object", "properties": {}},
+                        False,
+                        _boom_handler,
+                    )
+                )
+                hooks = HookSystem(ws, is_workspace_trusted=True)
+                hooks_file = ws / "hooks.json"
+                hooks_file.write_text(
+                    json.dumps(
+                        {
+                            "hooks": {
+                                "BeforeTool": [{"matcher": "exec_pty", "hooks": [{"command": "echo 'hook err' >&2; exit 1"}]}]
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                hooks.load_hooks_json(hooks_file, source="workspace")
+
+                proc_runner = SessionRunner(
+                    workspace_root=ws,
+                    client=UniversalModelClient(vault, ScriptedTransport(_pty_resilience_script)),
+                    auth_profile=_dummy_auth("google"),
+                    model_profile=resolve_model_profile("gemini-2.5-pro", "google"),
+                    mode=PermissionMode.YOLO,
+                    tools=reg,
+                    hook_runner=hooks,
+                    ush_home=home,
+                )
+                try:
+                    # Spawn the primary PTY first, then externally `SIGKILL` its bash process behind `PersistentPtyManager`'s back!
+                    init_res = proc_runner.pty.execute("echo BOOT_OK")
+                    self.assertIn("BOOT_OK", init_res.output)
+                    prim_handle = proc_runner.pty._handles[proc_runner.pty.PRIMARY_ID]
+                    os.kill(prim_handle.pid, signal.SIGKILL)
+                    prim_handle.proc.wait(timeout=2.0)
+
+                    # Now run a full multi-step turn: must auto-respawn dead PTY, contain `flaky_subproc` OSError & failing hook,
+                    # survive `exit 9`, and complete!
+                    proc_outcome = proc_runner.run_turn("Run resilient PTY & tool sequence")
+                    final_txt = proc_outcome.final_message.plain_text()
+                    self.assertIn("ALIVE_AFTER_RESPAWN", final_txt)
+                    self.assertIn("BrokenPipeError", final_txt)
+                    self.assertIn("RECOVERED_POST_EXIT", final_txt)
+
+                    # Also verify `write_stdin` on an unknown/dead PTY returns structured `not_found` instead of raising KeyError
+                    dead_stdin = proc_runner.pty.write_stdin("pty_nonexistent_999", "y\n")
+                    self.assertEqual(dead_stdin.status, "not_found")
+                finally:
+                    proc_runner.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

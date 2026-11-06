@@ -111,16 +111,21 @@ class HookSystem:
         env = scrub_child_environment()
         stdin_str = json.dumps({"event": event, **payload})
 
+        cwd_dir = self.workspace_root if self.workspace_root.is_dir() else pathlib.Path.cwd()
         for hk in self.shell_hooks:
             if hk.event != event:
                 continue
-            if hk.matcher != "*" and not re.search(hk.matcher, target_name):
-                continue
+            if hk.matcher != "*":
+                try:
+                    if not re.search(hk.matcher, target_name):
+                        continue
+                except re.error:
+                    continue
             try:
                 res = subprocess.run(
                     ["/bin/sh", "-c", hk.command],
                     input=stdin_str,
-                    cwd=str(self.workspace_root),
+                    cwd=str(cwd_dir),
                     env=env,
                     capture_output=True,
                     text=True,
@@ -129,12 +134,18 @@ class HookSystem:
             except subprocess.TimeoutExpired:
                 notes.append(f"[Hook timeout: {hk.event}]")
                 continue
+            except (subprocess.SubprocessError, OSError) as exc:
+                notes.append(f"[Hook process error ({hk.event}): {exc}]")
+                continue
 
             out = res.stdout.strip()
             err = res.stderr.strip()
             # Exit code 2 = explicit deterministic VETO across Claude/Gemini/Codex hook conventions!
             if res.returncode == 2:
                 return 2, (err or out or f"Vetoed by {hk.event} hook"), merged_json
+            if res.returncode != 0 and err and not out:
+                notes.append(f"[Hook {hk.event} exited rc={res.returncode}: {err[:240]}]")
+                continue
             if out:
                 try:
                     parsed = json.loads(out)

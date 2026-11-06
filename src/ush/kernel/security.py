@@ -68,14 +68,23 @@ DEFAULT_DENIED_FILE_PATTERNS: tuple[str, ...] = (
     "*.key",
     "*.p12",
     "*.pfx",
+    "*.jks",
+    "*.keystore",
     "id_rsa",
     "id_rsa.*",
     "id_ed25519",
     "id_ed25519.*",
     "credentials.json",
+    ".credentials.json",
     "credentials.vault.json",
     "credentials.enc",
     "application_default_credentials.json",
+    "auth.json",
+    "auth_profiles.json",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "kubeconfig",
 )
 
 DEFAULT_ALLOWED_EXCEPTIONS: tuple[str, ...] = (
@@ -84,24 +93,110 @@ DEFAULT_ALLOWED_EXCEPTIONS: tuple[str, ...] = (
     ".env.template",
 )
 
+# Protected execution/hook control files inside a workspace that tools (`write_file`/`edit_file`) must never mutate directly
+PROTECTED_WORKSPACE_WRITE_PATHS: tuple[str, ...] = (
+    ".git/config",
+    ".git/hooks",
+    ".ush/hooks.json",
+    ".ush/policies.toml",
+    ".ush/mcp.json",
+    ".mcp.json",
+    ".gemini/settings.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+
 SECRET_TOKEN_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"sk-litellm-[A-Za-z0-9_-]{10,}"),
     re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
     re.compile(r"AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"AQ\.[0-9A-Za-z._-]{24,}"),
     re.compile(r"ya29\.[0-9A-Za-z._-]{24,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"hf_[A-Za-z0-9]{24,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{16,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]{24,}=*"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]{20,}=*"),
 )
 
-CATASTROPHIC_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:^|\s)rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/(?:\s|$|\*)"),
-    re.compile(r"(?:^|\s)mkfs(?:\.[a-z0-9]+)?\s+"),
-    re.compile(r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;"),
-)
+FORKBOMB_RE = re.compile(r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;")
+RAW_DISK_OF_RE = re.compile(r"^of=/dev/(?:disk|rdisk|sd|nvme|mmcblk|vd)")
 
-SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
-SHELL_WRAPPERS: frozenset[str] = frozenset({"sudo", "env", "command", "nohup", "nice", "time"})
+
+def _strip_quoted_literals(command: str) -> str:
+    """Strips quoted string bodies so unquoted structural checks never false-positive on commit messages or literals."""
+    out: list[str] = []
+    in_sq = False
+    in_dq = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and not in_sq and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if not in_sq and not in_dq:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_catastrophic_segment(seg: str) -> bool:
+    """Token-level detector for recursive `rm /`, `mkfs`, and `dd of=/dev/...` regardless of flag ordering or wrappers."""
+    if FORKBOMB_RE.search(_strip_quoted_literals(seg)):
+        return True
+    try:
+        tokens = shlex.split(seg)
+    except ValueError:
+        unq = _strip_quoted_literals(seg)
+        return bool(
+            re.search(r"(?:^|\s)mkfs(?:\.[a-z0-9]+)?\s+", unq)
+            or re.search(r"(?:^|\s)dd\s+[^\n;|&]*\bof=/dev/(?:disk|rdisk|sd|nvme|mmcblk|vd)", unq)
+        )
+    if not tokens:
+        return False
+    head = pathlib.PurePosixPath(tokens[0]).name
+    if head == "mkfs" or head.startswith("mkfs."):
+        return len(tokens) > 1
+    if head == "dd":
+        return any(RAW_DISK_OF_RE.search(tok) for tok in tokens[1:])
+    if head != "rm":
+        return False
+    has_recursive = False
+    targets: list[str] = []
+    after_ddash = False
+    for tok in tokens[1:]:
+        if not after_ddash and tok == "--":
+            after_ddash = True
+            continue
+        if not after_ddash and tok.startswith("--"):
+            if tok in ("--recursive", "--no-preserve-root"):
+                has_recursive = True
+            continue
+        if not after_ddash and tok.startswith("-") and len(tok) > 1:
+            if "r" in tok or "R" in tok:
+                has_recursive = True
+            continue
+        norm = re.sub(r"/+", "/", tok)
+        targets.append(norm)
+    if not has_recursive:
+        return False
+    return any(t in ("/", "/*") for t in targets)
+
+SHELL_WRAPPERS: frozenset[str] = frozenset(
+    {"sudo", "env", "command", "nohup", "nice", "time", "stdbuf", "timeout"}
+)
+SUBSHELL_LAUNCHERS: frozenset[str] = frozenset({"sh", "bash", "zsh", "dash", "ksh", "/bin/sh", "/bin/bash", "/bin/zsh"})
 
 
 def redact_secrets(text: str) -> str:
@@ -173,8 +268,8 @@ class SecurityFirewall:
         return resolved
 
     def _load_ignore_rules(self) -> tuple[list[str], list[str]]:
-        deny = list(DEFAULT_DENIED_FILE_PATTERNS)
-        negate = list(DEFAULT_ALLOWED_EXCEPTIONS)
+        repo_deny: list[str] = []
+        repo_negate: list[str] = []
         for fname in (".ushignore", ".clineignore", ".geminiignore"):
             fpath = self.workspace_root / fname
             if not fpath.is_file():
@@ -185,25 +280,16 @@ class SecurityFirewall:
                     if not line or line.startswith("#"):
                         continue
                     if line.startswith("!"):
-                        negate.append(line[1:].strip())
+                        repo_negate.append(line[1:].strip())
                     else:
-                        deny.append(line)
+                        repo_deny.append(line)
             except OSError:
                 continue
-        return deny, negate
+        return repo_deny, repo_negate
 
-    def is_ignored_secret_path(self, candidate: pathlib.Path) -> bool:
-        deny, negate = self._load_ignore_rules()
-        name = candidate.name
-        try:
-            rel = candidate.resolve().relative_to(self.workspace_root).as_posix()
-        except ValueError:
-            rel = name
-
-        for pat in negate:
-            if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat):
-                return False
-        for pat in deny:
+    @staticmethod
+    def _matches_any(name: str, rel: str, patterns: Iterable[str]) -> bool:
+        for pat in patterns:
             clean = pat.rstrip("/")
             if (
                 fnmatch.fnmatch(name, clean)
@@ -212,6 +298,25 @@ class SecurityFirewall:
             ):
                 return True
         return False
+
+    def is_ignored_secret_path(self, candidate: pathlib.Path) -> bool:
+        name = candidate.name
+        try:
+            rel = candidate.resolve().relative_to(self.workspace_root).as_posix()
+        except ValueError:
+            rel = name
+
+        # 1. System-level secret denylist CANNOT be negated by a workspace `.ushignore` (`!.env` escalation blocked!)
+        if self._matches_any(name, rel, DEFAULT_ALLOWED_EXCEPTIONS):
+            return False
+        if self._matches_any(name, rel, DEFAULT_DENIED_FILE_PATTERNS):
+            return True
+
+        # 2. Workspace-level `.ushignore`/`.clineignore`/`.geminiignore` rules
+        repo_deny, repo_negate = self._load_ignore_rules()
+        if self._matches_any(name, rel, repo_negate):
+            return False
+        return self._matches_any(name, rel, repo_deny)
 
     def resolve_and_validate(self, user_path: str | pathlib.Path, *, write: bool = False) -> pathlib.Path:
         raw = pathlib.Path(user_path).expanduser()
@@ -226,6 +331,15 @@ class SecurityFirewall:
             raise PermissionError(
                 f"Sandbox boundary violation: {mode_lbl} access to `{resolved}` is outside allowed workspace `{self.workspace_root}`."
             )
+        if write:
+            try:
+                rel_w = resolved.relative_to(self.workspace_root).as_posix()
+            except ValueError:
+                rel_w = ""
+            if rel_w and any(rel_w == p or rel_w.startswith(p + "/") for p in PROTECTED_WORKSPACE_WRITE_PATHS):
+                raise PermissionError(
+                    f"Context security firewall blocked autonomous write to protected control path `{rel_w}`."
+                )
         if self.is_ignored_secret_path(resolved):
             raise PermissionError(
                 f"Context security firewall blocked access to restricted path `{resolved.name}` (.ushignore policy)."
@@ -264,17 +378,41 @@ class RepoTrustStore:
     @staticmethod
     def fingerprint_workspace_configs(workspace_root: pathlib.Path) -> str:
         ws = workspace_root.resolve()
-        watched = [
+        watched_files = [
             ws / ".mcp.json",
             ws / ".ush" / "mcp.json",
             ws / ".ush" / "hooks.json",
             ws / ".gemini" / "settings.json",
+            ws / ".claude" / "settings.json",
+            ws / ".claude" / "settings.local.json",
             ws / ".ush" / "policies.toml",
         ]
+        watched_dirs = [
+            ws / ".ush" / "commands",
+            ws / ".gemini" / "commands",
+            ws / ".claude" / "commands",
+            ws / ".ush" / "skills",
+            ws / ".gemini" / "skills",
+            ws / ".claude" / "skills",
+            ws / ".agents" / "skills",
+        ]
+        all_targets: list[pathlib.Path] = [f for f in watched_files if f.is_file()]
+        for d in watched_dirs:
+            if d.is_dir():
+                for sub in sorted(d.rglob("*")):
+                    if sub.is_file():
+                        all_targets.append(sub)
+        seen_rels: set[str] = set()
         chunks: list[str] = []
-        for f in watched:
-            if f.is_file():
-                chunks.append(f"{f.relative_to(ws)}:{sha256_hex(f.read_bytes())}")
+        for f in sorted(all_targets, key=lambda p: p.relative_to(ws).as_posix()):
+            rel_s = f.relative_to(ws).as_posix()
+            if rel_s in seen_rels:
+                continue
+            seen_rels.add(rel_s)
+            try:
+                chunks.append(f"{rel_s}:{sha256_hex(f.read_bytes())}")
+            except OSError:
+                chunks.append(f"{rel_s}:unreadable")
         return sha256_hex("|".join(chunks))
 
     def is_trusted(self, workspace_root: pathlib.Path) -> bool:
@@ -324,10 +462,165 @@ class PolicyRule:
         return (TIER_WEIGHT.get(self.tier, 0), self.priority)
 
 
-def unwrap_shell_commands(command: str) -> list[str]:
-    """Splits chained commands (`&&`, `||`, `;`, `|`) and peels `sudo`/`env` wrappers to stop bypasses."""
-    segments = [seg.strip() for seg in SHELL_SPLIT_RE.split(command) if seg.strip()]
+def _extract_balanced_parens(text: str, open_idx: int) -> tuple[str, int]:
+    """Extracts content inside `(` at `open_idx` up to its matching `)`, respecting quotes & escapes."""
+    depth = 1
+    i = open_idx + 1
+    in_sq = False
+    in_dq = False
+    n = len(text)
+    while i < n and depth > 0:
+        ch = text[i]
+        if ch == "\\" and not in_sq and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[open_idx + 1 : i], i + 1
+        i += 1
+    return text[open_idx + 1 :], n
+
+
+def _scan_shell_structure(command: str) -> tuple[list[str], list[str], bool]:
+    """Quote-aware scanner returning `(top_segments, subshell_commands, has_file_redirect)`."""
+    segments: list[str] = []
+    subshells: list[str] = []
+    has_file_redirect = False
+    cur: list[str] = []
+    in_sq = False
+    in_dq = False
+    i = 0
+    n = len(command)
+
+    def _flush() -> None:
+        s = "".join(cur).strip()
+        cur.clear()
+        if s:
+            segments.append(s)
+
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and not in_sq and i + 1 < n:
+            cur.append(command[i : i + 2])
+            i += 2
+            continue
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            cur.append(ch)
+            i += 1
+            continue
+
+        # Command substitutions `$(...)` and `` `...` `` execute BOTH unquoted and inside double quotes!
+        if not in_sq:
+            if ch == "$" and i + 1 < n and command[i + 1] == "(":
+                if i + 2 < n and command[i + 2] == "(":
+                    # `$(( ... ))` arithmetic expansion — scan inside only if nested `$` or `` ` `` exists
+                    inner_arith, next_i = _extract_balanced_parens(command, i + 1)
+                    if "$(" in inner_arith or "`" in inner_arith:
+                        subshells.append(inner_arith)
+                    cur.append(command[i:next_i])
+                    i = next_i
+                    continue
+                inner_cmd, next_i = _extract_balanced_parens(command, i + 1)
+                if inner_cmd.strip():
+                    subshells.append(inner_cmd.strip())
+                cur.append(command[i:next_i])
+                i = next_i
+                continue
+            if ch == "`":
+                j = i + 1
+                bt_buf: list[str] = []
+                while j < n:
+                    if command[j] == "\\" and j + 1 < n:
+                        bt_buf.append(command[j + 1])
+                        j += 2
+                        continue
+                    if command[j] == "`":
+                        break
+                    bt_buf.append(command[j])
+                    j += 1
+                bt_cmd = "".join(bt_buf).strip()
+                if bt_cmd:
+                    subshells.append(bt_cmd)
+                cur.append(command[i : min(n, j + 1)])
+                i = min(n, j + 1)
+                continue
+
+        if not in_sq and not in_dq:
+            # Process substitution `<(...)` / `>(...)`
+            if ch in ("<", ">") and i + 1 < n and command[i + 1] == "(":
+                inner_proc, next_i = _extract_balanced_parens(command, i + 1)
+                if inner_proc.strip():
+                    subshells.append(inner_proc.strip())
+                cur.append(command[i:next_i])
+                i = next_i
+                continue
+
+            # Separators: `\n`, `\r`, `;`, `&&`, `||`, `|&`, `|`, and background `&`
+            if ch in ("\n", "\r", ";"):
+                _flush()
+                i += 1
+                continue
+            if command.startswith("&&", i) or command.startswith("||", i) or command.startswith("|&", i):
+                _flush()
+                i += 2
+                continue
+            if ch == "|":
+                _flush()
+                i += 1
+                continue
+            if ch == "&":
+                prev_ch = command[i - 1] if i > 0 else ""
+                next_ch = command[i + 1] if i + 1 < n else ""
+                if prev_ch != ">" and next_ch != ">":
+                    _flush()
+                    i += 1
+                    continue
+
+            # Output file redirection (`>`, `>>`, `>|`, `&>`, `&>>`)
+            if ch == ">":
+                op_end = i + 1
+                if op_end < n and command[op_end] in (">", "|"):
+                    op_end += 1
+                rest = command[op_end:].lstrip(" \t")
+                # Ignore fd duplication (`>&2`, `2>&1`) and `/dev/null`
+                if not rest.startswith("&"):
+                    target_m = re.match(r"([^\s;|&<>]+)", rest)
+                    target_tok = (target_m.group(1).strip("'\"") if target_m else "")
+                    if target_tok != "/dev/null":
+                        has_file_redirect = True
+                cur.append(command[i:op_end])
+                i = op_end
+                continue
+
+        cur.append(ch)
+        i += 1
+
+    _flush()
+    return segments, subshells, has_file_redirect
+
+
+def unwrap_shell_commands(command: str, *, _depth: int = 0) -> list[str]:
+    """Splits chained/multiline/background/subshell commands and peels wrappers (`sudo`, `env`, `bash -c`, `eval`)."""
+    if _depth > 6 or not command.strip():
+        return [command.strip()] if command.strip() else []
+
+    segments, subshells, has_file_redirect = _scan_shell_structure(command)
     normalized: list[str] = []
+
     for seg in segments:
         try:
             tokens = shlex.split(seg)
@@ -337,25 +630,47 @@ def unwrap_shell_commands(command: str) -> list[str]:
         idx = 0
         while idx < len(tokens):
             tok = tokens[idx]
-            # Strip leading VAR=val assignments and sudo/env flags
-            if "=" in tok and not tok.startswith("-") and idx == 0:
+            # Strip leading VAR=val assignments
+            if "=" in tok and not tok.startswith("-") and not tok.startswith("$"):
                 idx += 1
                 continue
             if tok in SHELL_WRAPPERS:
+                wrapper = tok
                 idx += 1
                 while idx < len(tokens) and tokens[idx].startswith("-"):
-                    # sudo -u root cmd -> skip option value for -u
                     flag = tokens[idx]
                     idx += 1
-                    if flag in ("-u", "-g", "-C") and idx < len(tokens):
+                    if flag in ("-u", "-g", "-C", "-n", "-k", "-s") and idx < len(tokens):
                         idx += 1
                 while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("-"):
                     idx += 1
+                if wrapper == "timeout" and idx < len(tokens):
+                    # Skip timeout duration positional token (e.g. `timeout 10s rm ...`)
+                    idx += 1
                 continue
             break
-        rem = " ".join(tokens[idx:]).strip()
+
+        rem_tokens = tokens[idx:]
+        rem = " ".join(rem_tokens).strip()
         if rem:
             normalized.append(rem)
+
+        # Unwrap `eval "..."` and `<sh|bash|zsh> ... -c "<script>"`
+        if rem_tokens:
+            head = rem_tokens[0]
+            if head == "eval" and len(rem_tokens) > 1:
+                normalized.extend(unwrap_shell_commands(" ".join(rem_tokens[1:]), _depth=_depth + 1))
+            elif head in SUBSHELL_LAUNCHERS and "-c" in rem_tokens[1:]:
+                c_pos = rem_tokens.index("-c", 1)
+                if c_pos + 1 < len(rem_tokens):
+                    normalized.extend(unwrap_shell_commands(rem_tokens[c_pos + 1], _depth=_depth + 1))
+
+    for sub in subshells:
+        normalized.extend(unwrap_shell_commands(sub, _depth=_depth + 1))
+
+    if has_file_redirect:
+        normalized.append("__shell_redirect__")
+
     return normalized or [command.strip()]
 
 
@@ -431,18 +746,21 @@ class PolicyEngine:
         command: str | None = None,
         mode: PermissionMode = PermissionMode.DEFAULT,
     ) -> tuple[PolicyDecision, str]:
-        # 1. Hard non-overridable catastrophic shell safety gate (blocks even in YOLO!)
+        # 1. Unwrap shell segments once so both catastrophic safety gates and TOML rules inspect inner commands
+        segments = unwrap_shell_commands(command) if command else [""]
+
+        # Hard non-overridable catastrophic shell safety gate (blocks even in YOLO!)
         if command:
-            for rx in CATASTROPHIC_SHELL_PATTERNS:
-                if rx.search(command):
-                    return PolicyDecision.DENY, "Blocked catastrophic destructive command."
+            if FORKBOMB_RE.search(_strip_quoted_literals(command)) or any(
+                _is_catastrophic_segment(seg) for seg in segments
+            ):
+                return PolicyDecision.DENY, "Blocked catastrophic destructive command."
 
         # 2. Plan Mode strictly blocks mutating tools before user leaves `/plan`
         if mode == PermissionMode.PLAN and tool_name not in self.READ_ONLY_TOOLS and tool_name != "ask_user":
             return PolicyDecision.DENY, "Blocked mutating tool while in read-only `/plan` mode."
 
         # 3. Evaluate explicit TOML rules across unwrapped shell segments (most restrictive segment wins)
-        segments = unwrap_shell_commands(command) if command else [""]
         segment_decisions: list[tuple[PolicyDecision, str]] = []
 
         for seg in segments:

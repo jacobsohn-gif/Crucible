@@ -17,7 +17,7 @@ from typing import Any, Callable
 from ush.auth.vault import AuthProfile
 from ush.brain.context_dag import PopperianLoopGuard, SessionDAG
 from ush.brain.model_tiers import build_adaptive_system_prompt, resolve_model_profile
-from ush.brain.providers import UniversalModelClient
+from ush.brain.providers import UniversalModelClient, WireError, is_context_overflow_error
 from ush.brain.trace import ThoughtTraceLedger
 from ush.brain.wire import ToolIdBijectionMap, wrap_dynamic_instructions
 from ush.core.types import (
@@ -136,7 +136,28 @@ class SessionRunner:
     def switch_model(self, model_id: str, auth_profile: AuthProfile | None = None) -> ModelCapabilityProfile:
         if auth_profile is not None:
             self.auth_profile = auth_profile
-        self.model_profile = resolve_model_profile(model_id, self.auth_profile.provider)
+            self.model_profile = resolve_model_profile(model_id, self.auth_profile.provider)
+            return self.model_profile
+
+        resolved = resolve_model_profile(model_id, self.auth_profile.provider)
+        if resolved.provider != self.auth_profile.provider and self.client.vault is not None:
+            now = time.time()
+            candidates = [
+                p
+                for p in self.client.vault.list_profiles()
+                if p.provider == resolved.provider and p.is_available(now)
+            ]
+            if not candidates and resolved.provider in ("google", "vertex", "gemini-enterprise", "antigravity", "code-assist"):
+                candidates = [
+                    p
+                    for p in self.client.vault.list_profiles()
+                    if p.provider in ("google", "vertex", "gemini-enterprise", "antigravity", "code-assist")
+                    and p.is_available(now)
+                ]
+            if candidates:
+                self.auth_profile = candidates[0]
+                resolved = resolve_model_profile(model_id, self.auth_profile.provider)
+        self.model_profile = resolved
         return self.model_profile
 
     def set_thinking_effort(self, effort: ThinkingEffort) -> ThinkingEffort:
@@ -221,6 +242,7 @@ class SessionRunner:
                 safe_to_raw=dict(self.id_map.safe_to_raw),
             ),
             on_event=on_event,
+            cancel_event=self.cancel_event,
         )
         if reply.usage:
             self.total_usage.add(reply.usage)
@@ -286,6 +308,7 @@ class SessionRunner:
         steps = 0
         output_retries = 0
         stop_vetoes = 0
+        context_overflow_recoveries = 0
         modified_in_step: list[str] = []
 
         def _emit(evt: StreamEvent) -> None:
@@ -467,7 +490,39 @@ class SessionRunner:
                             session_id=self.session_id,
                             id_map=self.id_map,
                             on_event=_step_evt,
+                            cancel_event=self.cancel_event,
                         )
+                    except WireError as exc:
+                        if (
+                            context_overflow_recoveries < 2
+                            and is_context_overflow_error(exc.status, exc.detail)
+                            and self.dag.maybe_compact(self.model_profile.context_window_tokens, ratio=0.0, force=True)
+                        ):
+                            context_overflow_recoveries += 1
+                            steps = max(0, steps - 1)
+                            _emit(
+                                StreamEvent(
+                                    kind="cognitive_event",
+                                    step=steps + 1,
+                                    text=(
+                                        f"Endpoint context limit reached (HTTP {exc.status}) — "
+                                        f"emergency-compacted session history and retrying step"
+                                    ),
+                                    meta={"event": "context_overflow_recovery", "status": exc.status},
+                                )
+                            )
+                            self.phase = LoopPhase.GENERATE
+                            continue
+                        if self.trace_ledger is not None:
+                            self.trace_ledger.record_stream_event(
+                                StreamEvent(
+                                    kind="cognitive_event",
+                                    step=steps,
+                                    text=str(exc),
+                                    meta={"event": "provider_error"},
+                                )
+                            )
+                        raise
                     except Exception as exc:
                         if self.trace_ledger is not None:
                             self.trace_ledger.record_stream_event(

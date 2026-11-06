@@ -252,13 +252,27 @@ def render_doctor_report(rt: HarnessRuntime) -> str:
 def render_auth_status(vault: CredentialVault) -> str:
     profs = vault.list_profiles()
     if not profs:
-        return "No authentication profiles configured or auto-discovered.\nRun `ush auth login` (or `gcloud auth application-default login`)."
+        return "No authentication profiles configured or auto-discovered.\nRun `crux auth login` (or `gcloud auth application-default login`)."
     active = vault.active_profile_name
+    now = time.time()
     lines = ["Configured & Auto-Discovered Authentication Profiles:"]
     for p in profs:
         star = "*" if p.name == active else " "
-        proj = f" [project={p.project_id} region={p.region}]" if p.project_id else ""
-        lines.append(f" {star} {p.name:22s} | provider={p.provider:16s} | kind={p.auth_kind:10s} | src={p.source}{proj}")
+        extras: list[str] = []
+        if p.project_id:
+            extras.append(f"project={p.project_id} region={p.region}")
+        if p.api_mode:
+            extras.append(f"mode={p.api_mode}")
+        if p.service_tier:
+            extras.append(f"tier={p.service_tier}")
+        if p.base_url:
+            extras.append(f"url={p.base_url}")
+        if p.cooldown_until > now:
+            extras.append(f"cooldown={int(p.cooldown_until - now)}s")
+        sfx = f" [{' · '.join(extras)}]" if extras else ""
+        lines.append(
+            f" {star} {p.name:26s} | provider={p.provider:18s} | kind={p.auth_kind:10s} | src={p.source}{sfx}"
+        )
     return "\n".join(lines)
 
 
@@ -1480,6 +1494,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     serve_p = sub.add_parser("serve", help="Run ACP / JSON-RPC 2.0 daemon for IDEs and Swarm Peers")
     serve_p.add_argument("--acp", action="store_true", help="Serve over stdio (ACP/IDE mode)")
     serve_p.add_argument("--port", type=int, default=0, help="Serve strictly on 127.0.0.1:<port> TCP loopback")
+    serve_p.add_argument(
+        "--token",
+        "--acp-token",
+        dest="acp_token",
+        default=None,
+        help="Bearer token required on TCP loopback (defaults to USH_ACP_TOKEN or ephemeral 256-bit random token)",
+    )
 
     ext_p = sub.add_parser("extensions", help="List or install USH / Gemini-CLI-compatible extensions")
     ext_p.add_argument("action", nargs="?", default="list", choices=["list", "install"])
@@ -1596,7 +1617,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.acp and not args.port:
                 return serve_stdio(rt.runner)
-            serve_loopback_tcp(rt.runner, port=args.port)
+            serve_loopback_tcp(rt.runner, port=args.port, auth_token=args.acp_token)
             return 0
         finally:
             rt.runner.close()

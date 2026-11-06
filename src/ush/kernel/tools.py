@@ -242,7 +242,10 @@ class ToolRegistry:
         part = self._run_single(call, ctx, before_hook, after_hook)
         ms = (time.monotonic() - t0) * 1000.0
         if on_tool_result is not None:
-            on_tool_result(part, ms)
+            try:
+                on_tool_result(part, ms)
+            except Exception:  # noqa: BLE001
+                pass
         return part, ms
 
     def _run_single(
@@ -256,86 +259,98 @@ class ToolRegistry:
         tname = str(call.tool_name or "")
         args = dict(call.tool_args or {})
 
-        if ctx.cancel_event and ctx.cancel_event.is_set():
-            return CanonicalPart(
-                kind="tool_result",
-                tool_call_id=cid,
-                tool_name=tname,
-                text="[ABORTED_BY_USER: tool cancelled before start]",
-                is_error=True,
-            )
-
-        spec = self._specs.get(tname)
-        if not spec:
-            return CanonicalPart(
-                kind="tool_result",
-                tool_call_id=cid,
-                tool_name=tname,
-                text=f"Unknown tool `{tname}`. Available tools: {', '.join(sorted(self._specs))}",
-                is_error=True,
-            )
-
-        # 1. Lifecycle BeforeTool hook (may veto or rewrite args)
-        if before_hook:
-            allow, args, reason = before_hook(tname, args)
-            if not allow:
-                return CanonicalPart(
-                    kind="tool_result",
-                    tool_call_id=cid,
-                    tool_name=tname,
-                    text=f"[BLOCKED_BY_HOOK]: {reason}",
-                    is_error=True,
-                )
-
-        # 2. PolicyEngine gating + interactive human approval
-        cmd_str = str(args.get("command", "")) if tname == "exec_pty" else None
-        decision, reason = ctx.policy_engine.check(tname, command=cmd_str, mode=ctx.mode)
-        if decision == PolicyDecision.DENY:
-            return CanonicalPart(
-                kind="tool_result",
-                tool_call_id=cid,
-                tool_name=tname,
-                text=f"[POLICY_DENIED]: {reason}",
-                is_error=True,
-            )
-        if decision == PolicyDecision.ASK_USER:
-            if ctx.approval_callback is None or not ctx.approval_callback(tname, args, reason):
-                return CanonicalPart(
-                    kind="tool_result",
-                    tool_call_id=cid,
-                    tool_name=tname,
-                    text=f"[APPROVAL_REQUIRED_DENIED]: {reason}",
-                    is_error=True,
-                )
-
-        # 3. Execute under RwLock (Read-Parallel / Write-Exclusive)
-        if spec.read_only:
-            self._rwlock.acquire_read()
-        else:
-            self._rwlock.acquire_write()
         try:
-            part = spec.handler(args, ctx)
-            part.tool_call_id = cid
-            part.tool_name = tname
+            if ctx.cancel_event and ctx.cancel_event.is_set():
+                return CanonicalPart(
+                    kind="tool_result",
+                    tool_call_id=cid,
+                    tool_name=tname,
+                    text="[ABORTED_BY_USER: tool cancelled before start]",
+                    is_error=True,
+                )
+
+            spec = self._specs.get(tname)
+            if not spec:
+                return CanonicalPart(
+                    kind="tool_result",
+                    tool_call_id=cid,
+                    tool_name=tname,
+                    text=f"Unknown tool `{tname}`. Available tools: {', '.join(sorted(self._specs))}",
+                    is_error=True,
+                )
+
+            # 1. Lifecycle BeforeTool hook (may veto or rewrite args)
+            if before_hook:
+                allow, args, reason = before_hook(tname, args)
+                if not allow:
+                    return CanonicalPart(
+                        kind="tool_result",
+                        tool_call_id=cid,
+                        tool_name=tname,
+                        text=f"[BLOCKED_BY_HOOK]: {reason}",
+                        is_error=True,
+                    )
+
+            # 2. PolicyEngine gating + interactive human approval
+            cmd_str = str(args.get("command", "")) if tname == "exec_pty" else None
+            decision, reason = ctx.policy_engine.check(tname, command=cmd_str, mode=ctx.mode)
+            if decision == PolicyDecision.DENY:
+                return CanonicalPart(
+                    kind="tool_result",
+                    tool_call_id=cid,
+                    tool_name=tname,
+                    text=f"[POLICY_DENIED]: {reason}",
+                    is_error=True,
+                )
+            if decision == PolicyDecision.ASK_USER:
+                if ctx.approval_callback is None or not ctx.approval_callback(tname, args, reason):
+                    return CanonicalPart(
+                        kind="tool_result",
+                        tool_call_id=cid,
+                        tool_name=tname,
+                        text=f"[APPROVAL_REQUIRED_DENIED]: {reason}",
+                        is_error=True,
+                    )
+
+            # 3. Execute under RwLock (Read-Parallel / Write-Exclusive)
+            if spec.read_only:
+                self._rwlock.acquire_read()
+            else:
+                self._rwlock.acquire_write()
+            try:
+                part = spec.handler(args, ctx)
+                part.tool_call_id = cid
+                part.tool_name = tname
+            except Exception as exc:  # noqa: BLE001
+                part = CanonicalPart(
+                    kind="tool_result",
+                    tool_call_id=cid,
+                    tool_name=tname,
+                    text=f"[{type(exc).__name__}]: {redact_secrets(str(exc))}",
+                    is_error=True,
+                )
+            finally:
+                if spec.read_only:
+                    self._rwlock.release_read()
+                else:
+                    self._rwlock.release_write()
+
+            if after_hook:
+                try:
+                    extra = after_hook(tname, part)
+                    if extra:
+                        part.text = f"{part.text}\n{extra}".strip()
+                except Exception as exc:  # noqa: BLE001
+                    part.text = f"{part.text}\n[AfterTool hook error: {redact_secrets(str(exc))}]".strip()
+            return part
         except Exception as exc:  # noqa: BLE001
-            part = CanonicalPart(
+            return CanonicalPart(
                 kind="tool_result",
                 tool_call_id=cid,
                 tool_name=tname,
-                text=f"[{type(exc).__name__}]: {redact_secrets(str(exc))}",
+                text=f"[TOOL_RUNTIME_ERROR ({type(exc).__name__})]: {redact_secrets(str(exc))}",
                 is_error=True,
             )
-        finally:
-            if spec.read_only:
-                self._rwlock.release_read()
-            else:
-                self._rwlock.release_write()
-
-        if after_hook:
-            extra = after_hook(tname, part)
-            if extra:
-                part.text = f"{part.text}\n{extra}".strip()
-        return part
 
 
 # ============================================================================
@@ -549,7 +564,7 @@ def build_default_tool_registry() -> ToolRegistry:
             cancel_event=ctx.cancel_event,
         )
         meta = f"[pty_id={res.pty_id} status={res.status} exit_code={res.exit_code} cwd={res.cwd}]"
-        is_err = res.status in ("timed_out", "killed") or (res.exit_code not in (None, 0))
+        is_err = res.status in ("timed_out", "killed", "crashed") or (res.exit_code not in (None, 0))
         return CanonicalPart(kind="tool_result", text=f"{meta}\n{res.output}".strip(), is_error=is_err)
 
     def _write_stdin(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
@@ -566,6 +581,7 @@ def build_default_tool_registry() -> ToolRegistry:
         return CanonicalPart(
             kind="tool_result",
             text=f"[pty_id={res.pty_id} status={res.status} exit_code={res.exit_code}]\n{res.output}".strip(),
+            is_error=res.status in ("not_found", "timed_out", "killed", "crashed"),
         )
 
     def _ask_user(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
