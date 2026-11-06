@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 import json
 import os
 import pathlib
+import re
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -461,3 +463,160 @@ class ElasticSwarmCoordinator:
             timeout=60,
         )
         return res.returncode, (res.stdout + "\n" + res.stderr).strip()
+
+    def dispatch_to_peer_cli(
+        self,
+        prompt: str,
+        *,
+        conversation_id: str | None = None,
+        metadata_only: bool = False,
+        agent_bin: str | None = None,
+        timeout: float = 120.0,
+    ) -> PeerCliResult:
+        """Delegates a task or follow-up message to a local peer agent CLI (`USH_PEER_AGENT_BIN` / `agentapi`)."""
+        adapter = ExternalAgentCliAdapter(agent_bin=agent_bin, default_cwd=self.repo_root)
+        if metadata_only:
+            if not conversation_id:
+                return PeerCliResult(returncode=2, output="`--peer-conversation` is required with `--peer-metadata`.")
+            return adapter.get_metadata(conversation_id, timeout=min(timeout, 30.0))
+        if conversation_id:
+            return adapter.send_message(conversation_id, prompt, timeout=timeout)
+        return adapter.new_conversation(prompt, timeout=timeout)
+
+
+_SAFE_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_UUID_RE = re.compile(
+    r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+)
+
+
+@dataclass(frozen=True)
+class PeerCliResult:
+    returncode: int
+    output: str
+    conversation_id: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class ExternalAgentCliAdapter:
+    """Zero-shell-interpolation (`shell=False`) adapter for delegating tasks to a peer agent CLI (`agentapi`)."""
+
+    def __init__(
+        self,
+        agent_bin: str | None = None,
+        default_cwd: pathlib.Path | None = None,
+    ) -> None:
+        self.agent_bin_spec = (agent_bin or os.environ.get("USH_PEER_AGENT_BIN") or "agentapi").strip()
+        self.default_cwd = default_cwd
+
+    def resolve_binary(self) -> str | None:
+        if not self.agent_bin_spec:
+            return None
+        if os.sep in self.agent_bin_spec or (os.altsep and os.altsep in self.agent_bin_spec):
+            cand = pathlib.Path(self.agent_bin_spec).expanduser()
+            return str(cand) if cand.is_file() and os.access(cand, os.X_OK) else None
+        return shutil.which(self.agent_bin_spec)
+
+    def is_available(self) -> bool:
+        return self.resolve_binary() is not None
+
+    @staticmethod
+    def _build_clean_env() -> dict[str, str]:
+        env = scrub_child_environment()
+        for cfg_key in ("XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"):
+            if cfg_key in os.environ:
+                env[cfg_key] = os.environ[cfg_key]
+        # Explicitly unset cross-project source metadata variable per `agentapi` specification
+        env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
+        return env
+
+    @staticmethod
+    def _validate_conversation_id(conversation_id: str) -> str:
+        cid = (conversation_id or "").strip()
+        if not _SAFE_CONVERSATION_ID_RE.match(cid):
+            raise ValueError(f"Invalid peer conversation ID: {conversation_id!r}")
+        return cid
+
+    def _run_subcommand(
+        self, args: list[str], *, timeout: float, cwd: pathlib.Path | None = None
+    ) -> subprocess.CompletedProcess[str] | PeerCliResult:
+        exe = self.resolve_binary()
+        if not exe:
+            return PeerCliResult(
+                returncode=127,
+                output=f"Peer agent CLI `{self.agent_bin_spec}` not found on PATH (set `USH_PEER_AGENT_BIN` if installed elsewhere).",
+            )
+        run_cwd = str(cwd or self.default_cwd) if (cwd or self.default_cwd) else None
+        return subprocess.run(
+            [exe, *args],
+            cwd=run_cwd,
+            env=self._build_clean_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    @staticmethod
+    def _extract_conversation_id(stdout_text: str) -> str | None:
+        stripped = (stdout_text or "").strip()
+        if not stripped:
+            return None
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict):
+                    for k in ("conversationId", "conversation_id", "id"):
+                        if obj.get(k) and _SAFE_CONVERSATION_ID_RE.match(str(obj[k]).strip()):
+                            return str(obj[k]).strip()
+            except json.JSONDecodeError:
+                pass
+        m = _UUID_RE.search(stripped)
+        if m:
+            return m.group(1)
+        first_line = stripped.splitlines()[0].strip()
+        if " " not in first_line and _SAFE_CONVERSATION_ID_RE.match(first_line):
+            return first_line
+        return None
+
+    def new_conversation(
+        self, prompt: str, *, timeout: float = 120.0, cwd: pathlib.Path | None = None
+    ) -> PeerCliResult:
+        res = self._run_subcommand(["new-conversation", prompt], timeout=timeout, cwd=cwd)
+        if isinstance(res, PeerCliResult):
+            return res
+        combined = (res.stdout + ("\n" + res.stderr if res.stderr else "")).strip()
+        cid = self._extract_conversation_id(res.stdout) if res.returncode == 0 else None
+        return PeerCliResult(returncode=res.returncode, output=combined, conversation_id=cid)
+
+    def send_message(
+        self,
+        conversation_id: str,
+        message: str,
+        *,
+        timeout: float = 120.0,
+        cwd: pathlib.Path | None = None,
+    ) -> PeerCliResult:
+        cid = self._validate_conversation_id(conversation_id)
+        res = self._run_subcommand(["send-message", cid, message], timeout=timeout, cwd=cwd)
+        if isinstance(res, PeerCliResult):
+            return res
+        combined = (res.stdout + ("\n" + res.stderr if res.stderr else "")).strip()
+        return PeerCliResult(returncode=res.returncode, output=combined, conversation_id=cid)
+
+    def get_metadata(
+        self, conversation_id: str, *, timeout: float = 30.0, cwd: pathlib.Path | None = None
+    ) -> PeerCliResult:
+        cid = self._validate_conversation_id(conversation_id)
+        res = self._run_subcommand(["get-conversation-metadata", cid], timeout=timeout, cwd=cwd)
+        if isinstance(res, PeerCliResult):
+            return res
+        combined = (res.stdout + ("\n" + res.stderr if res.stderr else "")).strip()
+        meta: dict[str, Any] | None = None
+        if res.returncode == 0 and res.stdout.strip().startswith("{"):
+            try:
+                parsed = json.loads(res.stdout.strip())
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except json.JSONDecodeError:
+                meta = None
+        return PeerCliResult(returncode=res.returncode, output=combined, conversation_id=cid, metadata=meta)

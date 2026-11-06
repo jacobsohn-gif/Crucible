@@ -53,6 +53,7 @@ from ush.brain.providers import (
     build_gemini_payload,
     build_openai_chat_payload,
     build_openai_responses_payload,
+    load_local_transport_plugin,
     transform_messages,
 )
 from ush.cli.acp_server import MAX_RPC_LINE_BYTES, serve_loopback_tcp, serve_stdio
@@ -1146,6 +1147,385 @@ class SecurityAndInvariantsSuite(unittest.TestCase):
                     parsed_err = json.loads(err_out.getvalue())
                     self.assertNotIn("sk-proj-", parsed_err["error"])
                     self.assertIn("[REDACTED_SECRET]", parsed_err["error"])
+
+    # =========================================================================
+    # 7. Code Assist (`v1internal:loadCodeAssist` + `session_id` Cache Affinity)
+    # =========================================================================
+
+    def test_code_assist_load_project_and_session_affinity(self) -> None:
+        load_calls: list[dict[str, Any]] = []
+        stream_calls: list[dict[str, Any]] = []
+
+        class _CodeAssistHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.assert_ua = self.headers.get("User-Agent", "")
+                if self.path == "/v1internal:loadCodeAssist":
+                    load_calls.append({"headers": dict(self.headers.items()), "body": body})
+                    resp = json.dumps({"cloudaicompanionProject": "companion-proj-42"}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers()
+                    self.wfile.write(resp)
+                    return
+                if self.path == "/v1internal:streamGenerateContent?alt=sse":
+                    stream_calls.append({"headers": dict(self.headers.items()), "body": body})
+                    sse_chunk = (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "response": {
+                                    "candidates": [
+                                        {
+                                            "content": {"role": "model", "parts": [{"text": "CODE_ASSIST_OK"}]},
+                                            "finishReason": "STOP",
+                                        }
+                                    ],
+                                    "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 4},
+                                }
+                            }
+                        )
+                        + "\n\n"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(sse_chunk)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _CodeAssistHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"USH_DISABLE_KEYCHAIN": "1"}, clear=False
+            ):
+                vault = CredentialVault(pathlib.Path(tmp) / "ush", probe_ambient=False)
+                prof = vault.register_api_key_profile(
+                    name="ca-test",
+                    provider="gemini-enterprise",
+                    api_key="ya29.mock_ca_bearer_token",
+                    base_url=f"http://127.0.0.1:{port}",
+                    auth_kind="bearer",
+                    api_mode="code_assist",
+                    project_id=None,
+                )
+                mprof = resolve_model_profile("gemini-2.5-pro", "gemini-enterprise")
+                transport = HttpProviderTransport(vault)
+                user_msg = CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="ping")])
+
+                msg1 = transport.stream_turn(
+                    profile=mprof,
+                    auth_profile=prof,
+                    system_prompt="sys",
+                    messages=[user_msg],
+                    tools=[],
+                    session_id="sess_ca_affinity_01",
+                )
+                msg2 = transport.stream_turn(
+                    profile=mprof,
+                    auth_profile=prof,
+                    system_prompt="sys",
+                    messages=[user_msg],
+                    tools=[],
+                    session_id="sess_ca_affinity_01",
+                )
+                self.assertEqual(msg1.plain_text(), "CODE_ASSIST_OK")
+                self.assertEqual(msg2.plain_text(), "CODE_ASSIST_OK")
+                # `:loadCodeAssist` runs once and caches companion project for subsequent turns
+                self.assertEqual(len(load_calls), 1)
+                self.assertEqual(load_calls[0]["body"]["metadata"]["ideType"], "IDE_UNSPECIFIED")
+                self.assertEqual(load_calls[0]["body"]["metadata"]["pluginType"], "GEMINI")
+                self.assertEqual(load_calls[0]["headers"].get("User-Agent"), "crux-cli/0.1")
+                self.assertEqual(len(stream_calls), 2)
+                for sc in stream_calls:
+                    self.assertEqual(sc["body"].get("project"), "companion-proj-42")
+                    self.assertEqual(sc["body"]["request"].get("session_id"), "sess_ca_affinity_01")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
+
+    # =========================================================================
+    # 8. External Peer Agent CLI Adapter (`agentapi` / `USH_PEER_AGENT_BIN`)
+    # =========================================================================
+
+    def test_external_peer_cli_adapter_and_env_hygiene(self) -> None:
+        from ush.swarm.engine import ExternalAgentCliAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            ws = root / "ws"
+            home = root / "home"
+            ws.mkdir()
+            pwn_marker = ws / "pwned.txt"
+            mock_bin = root / "mock_agentapi.py"
+            mock_bin.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "if 'ANTIGRAVITY_SOURCE_METADATA' in os.environ or 'OPENAI_API_KEY' in os.environ:\n"
+                "    sys.stderr.write('LEAKED_ENV')\n"
+                "    sys.exit(9)\n"
+                "cmd = sys.argv[1]\n"
+                "if cmd == 'new-conversation':\n"
+                "    print('12345678-1234-4321-8765-123456789abc')\n"
+                "elif cmd == 'send-message':\n"
+                "    print(f'SENT:{sys.argv[2]}:{sys.argv[3]}')\n"
+                "elif cmd == 'get-conversation-metadata':\n"
+                "    print(json.dumps({'id': sys.argv[2], 'status': 'DONE'}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(mock_bin, 0o700)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USH_HOME": str(home),
+                    "USH_DISABLE_KEYCHAIN": "1",
+                    "USH_PEER_AGENT_BIN": str(mock_bin),
+                    "ANTIGRAVITY_SOURCE_METADATA": "cross-project-blob",
+                    "OPENAI_API_KEY": "sk-proj-SHOULD_NEVER_LEAK_TO_PEER_CLI",
+                    "GEMINI_API_KEY": "AIzaMockKey123456789012345678901234",
+                },
+                clear=False,
+            ):
+                adapter = ExternalAgentCliAdapter(default_cwd=ws)
+                self.assertTrue(adapter.is_available())
+
+                # Shell metacharacters are passed literally via `shell=False`
+                r_new = adapter.new_conversation(f"Audit $(touch {pwn_marker}); echo literal")
+                self.assertEqual(r_new.returncode, 0)
+                self.assertEqual(r_new.conversation_id, "12345678-1234-4321-8765-123456789abc")
+                self.assertFalse(pwn_marker.exists())
+
+                r_send = adapter.send_message(r_new.conversation_id, "Follow-up task")
+                self.assertEqual(r_send.returncode, 0)
+                self.assertIn("SENT:12345678-1234-4321-8765-123456789abc:Follow-up task", r_send.output)
+
+                r_meta = adapter.get_metadata(r_new.conversation_id)
+                self.assertEqual(r_meta.returncode, 0)
+                self.assertEqual(r_meta.metadata, {"id": "12345678-1234-4321-8765-123456789abc", "status": "DONE"})
+
+                # Reject option-injection conversation IDs
+                with self.assertRaises(ValueError):
+                    adapter.send_message("--malicious-flag", "hi")
+
+                # End-to-end CLI `crux swarm --peer-cli ... --output-format json`
+                buf = io.StringIO()
+                with mock.patch("sys.stdout", buf):
+                    rc = cli_main(["-C", str(ws), "swarm", "--peer-cli", "Delegate check", "--output-format", "json"])
+                self.assertEqual(rc, 0)
+                cli_payload = json.loads(buf.getvalue())
+                self.assertEqual(cli_payload["conversation_id"], "12345678-1234-4321-8765-123456789abc")
+
+    # =========================================================================
+    # 9. Host-Local Workstation Adapter (`auth_kind="command"`, Gate & Plugins)
+    # =========================================================================
+
+    def test_workstation_command_auth_host_gate_and_local_plugin_permissions(self) -> None:
+        seen_auth_headers: list[str] = []
+
+        class _TokenGateHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                auth_h = self.headers.get("Authorization", "")
+                seen_auth_headers.append(auth_h)
+                if auth_h == "Bearer tok_stale_1":
+                    self.send_response(401)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "token expired"}')
+                    return
+                sse = (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "choices": [{"delta": {"content": "WORKSTATION_OK"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+                        }
+                    )
+                    + "\n\n"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(sse)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _TokenGateHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"USH_DISABLE_KEYCHAIN": "1"}, clear=False
+            ):
+                root = pathlib.Path(tmp)
+                ush_home = root / "ush_home"
+                ws = root / "repo"
+                ws.mkdir()
+
+                # 1. `workstation.json` is blocked inside workspace by `SecurityFirewall`
+                (ws / "workstation.json").write_text('{"profiles": []}', encoding="utf-8")
+                fw = SecurityFirewall(ws)
+                with self.assertRaises(PermissionError):
+                    fw.resolve_and_validate("workstation.json")
+
+                # 2. Token helper script rotating from `tok_stale_1` -> `tok_fresh_2`
+                counter_file = root / "tok_counter.txt"
+                helper_py = root / "token_helper.py"
+                helper_py.write_text(
+                    "import json, pathlib\n"
+                    f"p = pathlib.Path({str(counter_file)!r})\n"
+                    "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+                    "p.write_text(str(n))\n"
+                    "tok = 'tok_stale_1' if n == 1 else f'tok_fresh_{n}'\n"
+                    "print(json.dumps({'access_token': tok, 'expires_in': 3600}))\n",
+                    encoding="utf-8",
+                )
+
+                marker_path = root / "workstation_marker"
+                vault = CredentialVault(ush_home, probe_ambient=False)
+                vault.register_api_key_profile(
+                    name="public-fallback",
+                    provider="openai",
+                    api_key="sk-public-fallback-key",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    api_mode="chat_completions",
+                )
+                ws_prof = vault.register_command_profile(
+                    name="corp-workstation",
+                    provider="openai",
+                    credential_command=f"{os.sys.executable} {helper_py}",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    api_mode="chat_completions",
+                    require_host_path=str(marker_path),
+                    persist_to_workstation_overlay=True,
+                )
+
+                # Workstation profile stays strictly in `workstation.json` (0600), NOT in `auth_profiles.json`
+                saved_main = json.loads((ush_home / "auth_profiles.json").read_text(encoding="utf-8"))
+                self.assertEqual([p["name"] for p in saved_main["profiles"]], ["public-fallback"])
+                self.assertEqual((ush_home / "workstation.json").stat().st_mode & 0o777, 0o600)
+
+                # Host gate inactive (`marker_path` missing) -> automatically falls back to `public-fallback`!
+                self.assertFalse(ws_prof.is_available())
+                self.assertEqual(vault.get_active_profile().name, "public-fallback")
+
+                # Create host marker -> `corp-workstation` becomes eligible & active!
+                marker_path.write_text("1", encoding="utf-8")
+                vault_reloaded = CredentialVault(ush_home, probe_ambient=False)
+                active_ws = vault_reloaded.get_active_profile()
+                self.assertIsNotNone(active_ws)
+                self.assertEqual(active_ws.name, "corp-workstation")
+
+                # Cached token is reused before 401, then invalidated & refreshed automatically on HTTP 401!
+                self.assertEqual(vault_reloaded.resolve_bearer_or_key(active_ws), "tok_stale_1")
+                self.assertEqual(vault_reloaded.resolve_bearer_or_key(active_ws), "tok_stale_1")
+                client = UniversalModelClient(
+                    vault=vault_reloaded,
+                    transport=HttpProviderTransport(vault_reloaded),
+                    sleep_fn=lambda _: None,
+                )
+                mprof = resolve_model_profile("gpt-4.1", "openai")
+                reply = client.generate(
+                    profile=mprof,
+                    auth_profile=active_ws,
+                    system_prompt="sys",
+                    history=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi")])],
+                    tools=[],
+                    session_id="sess_ws_01",
+                )
+                self.assertEqual(reply.plain_text(), "WORKSTATION_OK")
+                self.assertEqual(seen_auth_headers, ["Bearer tok_stale_1", "Bearer tok_fresh_2"])
+
+                # 3. World-writable `workstation.json` (`0666`) is refused with security warning
+                os.chmod(ush_home / "workstation.json", 0o666)
+                vault_bad = CredentialVault(ush_home, probe_ambient=False)
+                self.assertNotIn("corp-workstation", [p.name for p in vault_bad.list_profiles()])
+                self.assertTrue(any("workstation.json" in w for w in vault_bad.security_warnings))
+                os.chmod(ush_home / "workstation.json", 0o600)
+
+                # 4. Host-local `~/.ush/providers/<plugin>.py` loader & permission enforcement
+                prov_dir = ush_home / "providers"
+                prov_dir.mkdir(mode=0o700)
+                plugin_file = prov_dir / "custom_gw.py"
+                plugin_file.write_text(
+                    "from ush.core.types import CanonicalMessage, CanonicalPart, StopReason\n"
+                    "def stream_turn(*, profile, auth_profile, token, session_id, **kwargs):\n"
+                    "    return CanonicalMessage(\n"
+                    "        role='assistant',\n"
+                    "        producer_provider=auth_profile.provider,\n"
+                    "        producer_model_id=profile.model_id,\n"
+                    "        parts=[CanonicalPart(kind='text', text=f'PLUGIN:{token}:{session_id}')],\n"
+                    "        stop_reason=StopReason.STOP,\n"
+                    "    )\n",
+                    encoding="utf-8",
+                )
+                # Group/world-writable plugin (`0666`) MUST raise PermissionError
+                os.chmod(plugin_file, 0o666)
+                with self.assertRaises(PermissionError):
+                    load_local_transport_plugin(ush_home, "custom_gw")
+
+                # Path traversal name MUST raise ValueError
+                with self.assertRaises(ValueError):
+                    load_local_transport_plugin(ush_home, "../evil")
+
+                # Proper `0600` plugin executes cleanly through `HttpProviderTransport`
+                os.chmod(plugin_file, 0o600)
+                plug_prof = AuthProfile(
+                    name="custom-gw-prof",
+                    provider="custom_gw",
+                    auth_kind="bearer",
+                    base_url="https://localhost",
+                    source="workstation",
+                    transport_plugin="custom_gw",
+                )
+                vault_reloaded.store_secret("custom-gw-prof", mock.MagicMock(to_json=lambda: '{"access_token": "plug_tok"}'))
+                plug_msg = HttpProviderTransport(vault_reloaded).stream_turn(
+                    profile=mprof,
+                    auth_profile=plug_prof,
+                    system_prompt="sys",
+                    messages=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi")])],
+                    tools=[],
+                    session_id="sess_plug_99",
+                )
+                self.assertEqual(plug_msg.plain_text(), "PLUGIN:plug_tok:sess_plug_99")
+
+                # Non-local (`env:*`) profile attempting `transport_plugin` is refused
+                env_evil = AuthProfile(
+                    name="env-evil",
+                    provider="openai",
+                    auth_kind="none",
+                    base_url="https://localhost",
+                    source="env:OPENAI_API_KEY",
+                    transport_plugin="custom_gw",
+                )
+                with self.assertRaises(PermissionError):
+                    HttpProviderTransport(vault_reloaded).stream_turn(
+                        profile=mprof,
+                        auth_profile=env_evil,
+                        system_prompt="sys",
+                        messages=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hi")])],
+                        tools=[],
+                        session_id="sess_evil",
+                    )
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
 
 
 if __name__ == "__main__":

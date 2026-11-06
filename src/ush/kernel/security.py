@@ -81,6 +81,7 @@ DEFAULT_DENIED_FILE_PATTERNS: tuple[str, ...] = (
     "application_default_credentials.json",
     "auth.json",
     "auth_profiles.json",
+    "workstation.json",
     ".netrc",
     ".npmrc",
     ".pypirc",
