@@ -99,6 +99,8 @@ def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> Mo
     if ":" in clean_id and clean_id.split(":", 1)[0] in KNOWN_PROVIDER_PREFIXES:
         pfx, clean_id = clean_id.split(":", 1)
         provider = "gemini-enterprise" if pfx == "code-assist" else pfx
+    if " " in clean_id and clean_id.lower().startswith("gemini "):
+        clean_id = "-".join(clean_id.lower().split())
 
     is_proxy_gateway = provider in ("litellm", "openrouter")
 
@@ -224,6 +226,22 @@ def resolve_model_profile(model_id: str, default_provider: str = "vertex") -> Mo
             compaction_ratio=0.80 if tier == ModelTier.A else 0.70,
             tool_preview_bytes=10_240 if tier == ModelTier.A else 4_096,
             skill_catalog_budget_tokens=1_500 if tier == ModelTier.A else 600,
+        )
+
+    # Custom/preview alias on Google / Vertex / Gemini Enterprise / Antigravity -> Tier-S Gemini-wire profile
+    if provider in ("google", "vertex", "gemini-enterprise", "antigravity"):
+        return ModelCapabilityProfile(
+            model_id=clean_id,
+            provider=provider,
+            family="gemini",
+            tier=ModelTier.S,
+            context_window_tokens=1_048_576,
+            max_output_tokens=65_536,
+            supports_vision=True,
+            reasoning_wire_mode="gemini_thought_sig",
+            max_parallel_read_tools=8,
+            compaction_ratio=0.85,
+            skill_catalog_budget_tokens=3_000,
         )
 
     # Custom alias on LiteLLM / OpenRouter gateway -> Tier-A native OpenAI-compat profile

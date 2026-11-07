@@ -232,12 +232,12 @@ def render_doctor_report(rt: HarnessRuntime) -> str:
     )
     has_gcloud = pathlib.Path(gcloud_ok).is_file()
     lines = [
-        f"USH v{__version__} Health Check ({platform.system()} {platform.machine()} | Python {platform.python_version()})",
+        f"Crucible (crux v{__version__}) Health Check ({platform.system()} {platform.machine()} | Python {platform.python_version()})",
         f"  Workspace         : {rt.workspace} ({'TRUSTED' if rt.is_trusted else 'untrusted quarantine — run `/trust grant` to load repo hooks/skills'})",
         f"  Active Auth       : {rt.runner.auth_profile.name} ({rt.runner.auth_profile.provider} via {rt.runner.auth_profile.source}"
         + (f", project={rt.runner.auth_profile.project_id}" if rt.runner.auth_profile.project_id else "")
         + ")",
-        f"  All Auth Profiles : {', '.join(p.name for p in profs) if profs else 'NONE — run `ush auth login`'}",
+        f"  All Auth Profiles : {', '.join(p.name for p in profs) if profs else 'NONE — run `crux auth login`'}",
         f"  Active Model      : {rt.runner.model_profile.model_id} (Tier {rt.runner.model_profile.tier.value}, ctx={rt.runner.model_profile.context_window_tokens:,}, max_parallel_reads={rt.runner.model_profile.max_parallel_read_tools})",
         f"  Git / Shadow Git  : {'OK' if git_ok else 'MISSING'} -> {rt.runner.shadow_git.git_dir}",
         f"  gcloud SDK        : {'OK (' + str(gcloud_ok) + ')' if has_gcloud else 'not installed'}",
@@ -439,16 +439,19 @@ def handle_slash_command(
         return False, None, []
 
     if cmd_name == "model":
+        from ush.auth.vault import discover_model_options, format_model_display_name
+
         if not arg_str:
-            p = rt.runner.model_profile
-            print(f"Active model: `{p.model_id}` (family={p.family}, provider={p.provider}, tier={p.tier.value})")
+            cur_m = rt.runner.model_profile.model_id
+            avail = discover_model_options(rt.vault, rt.runner.auth_profile, timeout=1.2)
+            for opt in avail:
+                is_cur = opt.model_id == cur_m or cur_m in (f"{opt.model_id}-high", f"{opt.model_id}-medium", f"{opt.model_id}-low")
+                mark = ">" if is_cur else " "
+                cur_sfx = c_dim("   (current)") if is_cur else ""
+                print(f"{mark} {opt.display_name}{cur_sfx}")
         else:
             np = rt.runner.switch_model(arg_str)
-            print(
-                c_green(
-                    f"Hot-swapped model -> `{np.model_id}` (Tier {np.tier.value}, family={np.family}; foreign signatures auto-scrubbed via transform_messages)."
-                )
-            )
+            print(c_green(f"Model -> {format_model_display_name(np.model_id)}"))
         return False, None, []
 
     if cmd_name == "thinking":
@@ -1312,8 +1315,8 @@ def run_headless(
     except Exception as exc:
         err_msg = redact_secrets(str(exc))
         hint = (
-            "Check `ush auth status`, switch GCP project (`GOOGLE_CLOUD_PROJECT=<project> ush ...`), "
-            "or run `ush auth login --provider google --api-key`."
+            "Check `crux auth status`, switch models with `/model` (or `-m gemini-3.1-pro-preview`), "
+            "or run `crux auth login`."
         )
         if output_format in ("json", "stream-json"):
             print(
@@ -1329,13 +1332,19 @@ def run_headless(
                 )
             )
         else:
-            print(f"[ush error] {err_msg}\nHint: {hint}", file=sys.stderr)
+            print(f"[crux error] {err_msg}\nHint: {hint}", file=sys.stderr)
         return 1
     finally:
         rt.runner.close()
 
     if output_format == "text" and not live_text_trace:
-        print(outcome.final_message.plain_text())
+        raw_reply = outcome.final_message.plain_text()
+        if USE_COLOR and raw_reply:
+            from ush.cli.markdown import render_markdown_ansi
+
+            print(render_markdown_ansi(raw_reply, use_color=True))
+        else:
+            print(raw_reply)
     elif output_format == "json":
         ledger = rt.runner.trace_ledger
         t_blocks = ledger.thought_blocks(turn=ledger.turn_index) if ledger else []
@@ -1408,7 +1417,7 @@ def _run_trace_cli(ush_home: pathlib.Path, workspace: pathlib.Path, args: argpar
         print(ledger.format_trace_view(args.target or "all"))
     elif action == "search":
         if not args.target:
-            print("Usage: `ush trace search <query> [--session <id>]`", file=sys.stderr)
+            print("Usage: `crux trace search <query> [--session <id>]`", file=sys.stderr)
             return 2
         hits = ledger.search(args.target)
         for h in hits:
@@ -1435,7 +1444,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"crux {__version__} (Crucible)")
     p.add_argument("-C", "--cwd", default=".", help="Target workspace directory (default: current directory)")
     p.add_argument("-m", "--model", default=None, help="Model ID override (e.g. gemini-3.1-pro-preview, claude-opus-4-20250514, gpt-5, qwen3-coder)")
-    p.add_argument("--profile", default=None, help="Named auth profile from `ush auth status`")
+    p.add_argument("--profile", default=None, help="Named auth profile from `crux auth status`")
     p.add_argument(
         "--thinking",
         choices=["off", "low", "medium", "high", "max"],
@@ -1493,7 +1502,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     auth_p = sub.add_parser("auth", help="Manage multi-provider authentication & Keychain profiles")
     auth_p.add_argument("action", nargs="?", default="status", choices=["status", "login", "switch", "logout"])
-    auth_p.add_argument("target", nargs="?", default=None, help="Provider slug (for login) or profile name")
+    auth_p.add_argument("target", nargs="?", default=None, help="Provider slug (e.g. google-oauth, gemini-enterprise, anthropic, openai) or profile name")
+    auth_p.add_argument("--no-browser", dest="no_browser", action="store_true", help="Print OAuth URL and accept manual copy-paste code instead of opening a browser")
 
     tr_p = sub.add_parser("trace", help="Inspect, search, or export durable long-form `.trace.jsonl` chains of thought")
     tr_p.add_argument("action", nargs="?", default="list", choices=["list", "show", "search", "stats", "export", "path"])
@@ -1574,7 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
             print(render_auth_status(vault))
             return 0
         if args.action == "login":
-            prof = interactive_login_wizard(vault, args.target)
+            prof = interactive_login_wizard(vault, args.target, no_browser=args.no_browser)
             print(c_green(f"Logged in & activated `{prof.name}` ({prof.provider} via {prof.source})."))
             return 0
         if args.action == "switch":

@@ -1200,11 +1200,16 @@ class ConformanceSuiteCT01ToCT20(unittest.TestCase):
                 ctrl.handle_key(decode_key_buffer("\r")[0][0])
                 self.assertIsNotNone(ctrl.menu)
                 self.assertEqual(ctrl.menu.kind, "picker")
-                # Filter to `gemini-4-argon` & select with Enter
-                for ke in decode_key_buffer("4-argon\r")[0]:
+                # Strictly verify zero provider labels (`antigravity`, `vertex`, `openai`, etc.) on `/model` items!
+                for m_item in ctrl.menu.items:
+                    if not m_item.active:
+                        self.assertEqual(m_item.badge, "")
+                    self.assertNotIn(":", m_item.label)
+                # Filter to `gemini-3.8-flash` & select with Enter
+                for ke in decode_key_buffer("3.8-flash\r")[0]:
                     ctrl.handle_key(ke)
                 self.assertIsNone(ctrl.menu)
-                self.assertEqual(rt.runner.model_profile.model_id, "gemini-4-argon")
+                self.assertEqual(rt.runner.model_profile.model_id, "gemini-3.8-flash")
 
                 # B. `@` file auto-popup menu completes `@alpha.py `
                 for ke in decode_key_buffer("Inspect @alp\t")[0]:
@@ -2633,6 +2638,149 @@ class ConformanceSuiteCT01ToCT20(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    # ------------------------------------------------------------------
+    # CT-28: Zero Approval-Prompt Spam on Multi-Line Commands, 10-FPS Spinner & Parallel Calls
+    # ------------------------------------------------------------------
+    def test_ct28_approval_menu_zero_spam_and_parallel_serialization(self) -> None:
+        from io import StringIO
+
+        from ush.cli.main import HarnessRuntime, handle_slash_command
+        from ush.cli.tui import VisualTuiController, clip_to_cols, decode_key_buffer, strip_ansi
+
+        # 1. `clip_to_cols` fast-path (`vis_width <= max_cols`) MUST strip `\n`, `\r`, `\t`, `\v`, `\f`
+        short_multiline = "cd /tmp &&\necho hello\t\tworld\r\ndone\x0bnext"
+        clipped_short = clip_to_cols(short_multiline, 120)
+        for bad_ch in ("\n", "\r", "\t", "\x0b", "\x0c"):
+            self.assertNotIn(bad_ch, clipped_short)
+        self.assertIn("cd /tmp && echo hello world done next", clipped_short)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = pathlib.Path(tmp) / "ws"
+            home = pathlib.Path(tmp) / "home"
+            ws.mkdir()
+            home.mkdir()
+            old_home = os.environ.get("USH_HOME")
+            os.environ["USH_HOME"] = str(home)
+            try:
+                rt = HarnessRuntime(ws, mode=PermissionMode.DEFAULT)
+                scr = StringIO()
+                ctrl = VisualTuiController(
+                    rt,
+                    slash_handler=lambda r, ln: handle_slash_command(r, ln, headless=False),
+                    out=scr,
+                    use_color=True,
+                    cols_fn=lambda: 92,
+                )
+                ctrl.turn_busy.set()
+                ctrl.tracker.on_event(
+                    StreamEvent(
+                        kind="step_start",
+                        step=1,
+                        meta={"model": "gemini-4-argon", "thinking_effort": "high", "max_steps": 80, "context_tokens": 1200},
+                    )
+                )
+                ctrl.tracker.on_event(
+                    StreamEvent(
+                        kind="tool_call",
+                        step=1,
+                        part=CanonicalPart(
+                            kind="tool_call",
+                            tool_call_id="call_ml_1",
+                            tool_name="exec_pty",
+                            tool_args={"command": "cd /tmp &&\necho line2\t\tok"},
+                        ),
+                    )
+                )
+                ctrl.comp.render()
+
+                # 2. Trigger interactive approval on a multi-line `exec_pty` command from worker thread
+                approved_box: list[bool] = []
+                worker_done = threading.Event()
+
+                def _ask_worker() -> None:
+                    res = ctrl._request_tool_approval_menu(
+                        "exec_pty",
+                        {"command": "cd /tmp &&\necho line2\t\tok"},
+                        "shell execution\nrequires acceptance",
+                    )
+                    approved_box.append(res)
+                    worker_done.set()
+
+                t = threading.Thread(target=_ask_worker, daemon=True)
+                t.start()
+
+                deadline = time.monotonic() + 2.0
+                while not ctrl.is_awaiting_user and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ctrl.is_awaiting_user)
+
+                # Snapshot exact output buffer right after initial approval box render
+                initial_buf = scr.getvalue()
+                self.assertEqual(strip_ansi(initial_buf).count("Approve `exec_pty`"), 1)
+
+                # Simulate 25 timer ticks + redundant `comp.render()` calls while waiting for user acceptance:
+                # MUST write 0 extra bytes and NEVER repeat or scroll the approval prompt!
+                for _ in range(25):
+                    if ctrl.turn_busy.is_set() and not ctrl.is_awaiting_user:
+                        ctrl._spin_tick += 1
+                    ctrl.comp.render()
+                    time.sleep(0.004)
+
+                self.assertEqual(
+                    len(scr.getvalue()),
+                    len(initial_buf),
+                    "Approval prompt wrote extra bytes / spammed redraws while awaiting acceptance!",
+                )
+                self.assertEqual(strip_ansi(scr.getvalue()).count("Approve `exec_pty`"), 1)
+
+                # Press `y` to accept once
+                ctrl.handle_key(decode_key_buffer("y")[0][0])
+                self.assertTrue(worker_done.wait(timeout=2.0))
+                self.assertEqual(approved_box, [True])
+                self.assertFalse(ctrl.is_awaiting_user)
+
+                # 3. Concurrent `write_file` approvals serialize cleanly, and `e` (`auto_edit`) auto-approves #2!
+                scr_parallel = StringIO()
+                ctrl.comp.out = scr_parallel
+                ctrl.comp._last_frame_sig = None
+                results_par: list[bool] = []
+                par_lock = threading.Lock()
+
+                def _write_approval(idx: int) -> None:
+                    ok = ctrl._request_tool_approval_menu(
+                        "write_file",
+                        {"path": f"src/mod_{idx}.py"},
+                        "workspace write",
+                    )
+                    with par_lock:
+                        results_par.append(ok)
+
+                t1 = threading.Thread(target=_write_approval, args=(1,), daemon=True)
+                t2 = threading.Thread(target=_write_approval, args=(2,), daemon=True)
+                t1.start()
+                t2.start()
+
+                deadline = time.monotonic() + 2.0
+                while not ctrl.is_awaiting_user and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ctrl.is_awaiting_user)
+
+                # Choose `e` ("Allow & enable auto-edit") -> approves #1 AND auto-approves queued #2 without a second menu!
+                ctrl.handle_key(decode_key_buffer("e")[0][0])
+                t1.join(timeout=2.0)
+                t2.join(timeout=2.0)
+                self.assertEqual(results_par, [True, True])
+                self.assertEqual(rt.runner.mode, PermissionMode.AUTO_EDIT)
+                self.assertEqual(strip_ansi(scr_parallel.getvalue()).count("Approve `write_file`"), 1)
+            finally:
+                ctrl.should_exit = True
+                rt.runner.cancel_event.set()
+                rt.runner.close()
+                if old_home is None:
+                    os.environ.pop("USH_HOME", None)
+                else:
+                    os.environ["USH_HOME"] = old_home
 
 
 if __name__ == "__main__":
