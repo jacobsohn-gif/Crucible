@@ -354,12 +354,18 @@ def build_deterministic_epistemic_summary(messages: list[CanonicalMessage]) -> s
             if txt:
                 key_notes.append(txt.splitlines()[0][:200])
 
+    selected_obj: list[str] = []
+    if len(objectives) <= 8:
+        selected_obj = objectives
+    else:
+        selected_obj = [objectives[0], f"... ({len(objectives) - 8} intermediate turns) ...", *objectives[-7:]]
+
     return "\n".join(
         [
-            "1. OBJECTIVE & USER REQUESTS: " + (" -> ".join(objectives[:4]) or "Continue active task"),
+            "1. OBJECTIVE & USER REQUESTS (INITIAL -> LATEST): " + (" -> ".join(selected_obj) or "Continue active task"),
             "2. VERIFIED TOUCHED/READ FILES: " + (", ".join(files_seen[-20:]) or "none yet"),
             "3. FALSIFIED PATHS / OBSERVED ERRORS (DO NOT REPEAT): " + (" | ".join(errors_seen[-5:]) or "none"),
-            "4. RECENT PROGRESS NOTES: " + (" | ".join(key_notes[-4:]) or "in progress"),
+            "4. RECENT PROGRESS NOTES: " + (" | ".join(key_notes[-6:]) or "in progress"),
         ]
     )
 

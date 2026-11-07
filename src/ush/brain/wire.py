@@ -29,8 +29,11 @@ from ush.core.types import (
 
 SAFE_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 DYNAMIC_TAG_RE = re.compile(r"<dynamic_instructions>.*?</dynamic_instructions>\s*", re.DOTALL)
-XML_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-FENCED_JSON_RE = re.compile(r"```(?:json|tool_call)\s*(\{.*?\})\s*```", re.DOTALL)
+XML_TOOL_CALL_RE = re.compile(
+    r"<(?P<tag>crux_tool_call|tool_call)>\s*(?P<body>\{.*?\})\s*</(?P=tag)>",
+    re.DOTALL,
+)
+FENCED_JSON_RE = re.compile(r"```(?:json|tool_call)\s*(?P<body>\{.*?\})\s*```", re.DOTALL)
 TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
 
@@ -75,6 +78,7 @@ def _normalize_non_tool_part(
     is_final_user_frame: bool,
     same_model: bool,
     target_profile: ModelCapabilityProfile,
+    is_assistant: bool = False,
 ) -> CanonicalPart | None:
     if p.kind == "thinking":
         if same_model:
@@ -82,9 +86,9 @@ def _normalize_non_tool_part(
         # Foreign thinking/signatures are strictly dropped (never converted to assistant text!)
         return None
     if p.kind == "text":
-        if p.is_dynamic_instruction and not is_final_user_frame:
+        if not is_assistant and p.is_dynamic_instruction and not is_final_user_frame:
             return None
-        txt = p.text if is_final_user_frame else DYNAMIC_TAG_RE.sub("", p.text)
+        txt = p.text if (is_final_user_frame or is_assistant) else DYNAMIC_TAG_RE.sub("", p.text)
         sig = p.signature if same_model else None
         if not txt.strip() and not sig:
             return None
@@ -271,6 +275,7 @@ def transform_messages(
                     is_final_user_frame=False,
                     same_model=same_model,
                     target_profile=target_profile,
+                    is_assistant=True,
                 )
                 if np is not None:
                     out_parts.append(np)
@@ -455,7 +460,8 @@ def extract_fallback_tool_calls(
 
     for regex in (XML_TOOL_CALL_RE, FENCED_JSON_RE):
         for m in regex.finditer(text):
-            obj = parse_lenient_json_object(m.group(1))
+            raw_json = m.groupdict().get("body") or m.group(1)
+            obj = parse_lenient_json_object(raw_json)
             if not obj:
                 continue
             name = obj.get("name") or obj.get("tool") or obj.get("function")
