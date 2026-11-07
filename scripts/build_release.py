@@ -42,14 +42,12 @@ def build_source_tarball(out_dir: pathlib.Path) -> pathlib.Path:
     include_items = [
         "pyproject.toml",
         "README.md",
-        "MASTER_IMPLEMENTATION_PLAN.md",
         "Makefile",
         ".gitignore",
         ".ushignore",
         "bin",
         "src",
         "tests",
-        "docs",
         "scripts",
     ]
 
@@ -79,20 +77,29 @@ def build_compiled_pyz(out_dir: pathlib.Path) -> pathlib.Path:
         stage_dir = tmp_path / "stage"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        # Compile every `src/ush/**/*.py` into stage_dir as `.pyc` (plus `.py` for cross-version zipimport fallback)
-        for py_file in sorted(src_root.rglob("*.py")):
-            rel = py_file.relative_to(src_root)
-            py_dest = stage_dir / rel
-            pyc_dest = stage_dir / rel.with_suffix(".pyc")
-            pyc_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(py_file, py_dest)
-            py_compile.compile(
-                str(py_file),
-                cfile=str(pyc_dest),
-                dfile=str(rel),
-                doraise=True,
-                optimize=2,
-            )
+        # Compile every `src/**/*.py` into stage_dir as `.pyc` (plus `.py` and package data assets)
+        for src_item in sorted(src_root.rglob("*")):
+            if not src_item.is_file():
+                continue
+            rel = src_item.relative_to(src_root)
+            if any(part in ("__pycache__", ".DS_Store", ".pytest_cache") for part in rel.parts):
+                continue
+            if src_item.suffix == ".py":
+                py_dest = stage_dir / rel
+                pyc_dest = stage_dir / rel.with_suffix(".pyc")
+                pyc_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_item, py_dest)
+                py_compile.compile(
+                    str(src_item),
+                    cfile=str(pyc_dest),
+                    dfile=str(rel),
+                    doraise=True,
+                    optimize=2,
+                )
+            elif src_item.suffix in (".yaml", ".yml", ".json", ".md", ".toml"):
+                asset_dest = stage_dir / rel
+                asset_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_item, asset_dest)
 
         # Create entrypoint `__main__.py` and compile to `__main__.pyc`
         main_py = stage_dir / "__main__.py"
@@ -116,7 +123,7 @@ def build_compiled_pyz(out_dir: pathlib.Path) -> pathlib.Path:
         zip_buf_path = tmp_path / "payload.zip"
         with zipfile.ZipFile(zip_buf_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             for item in sorted(stage_dir.rglob("*")):
-                if item.is_file() and item.suffix in (".pyc", ".py"):
+                if item.is_file() and item.suffix in (".pyc", ".py", ".yaml", ".yml", ".json", ".md", ".toml"):
                     arcname = str(item.relative_to(stage_dir))
                     zf.write(item, arcname)
 

@@ -14,9 +14,10 @@ dependencies = []
 [project.scripts]
 crux = "ush.cli.main:main"
 ush = "ush.cli.main:main"
+crux-evals = "crux_evals.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ush"]
+packages = ["src/ush", "src/crux_evals"]
 
 [tool.uv]
 managed = true
