@@ -32,7 +32,9 @@ import time
 from typing import Any
 import unittest
 from unittest import mock
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from ush.auth.vault import (
     AuthProfile,
@@ -1526,6 +1528,727 @@ class SecurityAndInvariantsSuite(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
             th.join(timeout=2)
+
+    # =========================================================================
+    # 10. Zero-Project Google OAuth (Ultra / Pro / Code Assist `:onboardUser` LRO)
+    # =========================================================================
+
+    def test_google_oauth_pkce_loopback_and_projectless_ultra_onboarding(self) -> None:
+        from ush.auth.vault import resolve_google_oauth_client_credentials, setup_code_assist_user
+
+        ca_state = {"mode": "ultra_existing", "lro_polls": 0, "onboard_bodies": []}
+
+        class _ZeroProjectCAHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/v1internal/operations/onboard-op-99":
+                    ca_state["lro_polls"] += 1
+                    done = ca_state["lro_polls"] >= 2
+                    payload: dict[str, Any] = {"name": "operations/onboard-op-99", "done": done}
+                    if done:
+                        payload["response"] = {"cloudaicompanionProject": {"id": "managed-ultra-proj-777"}}
+                    raw = json.dumps(payload).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_in = self.rfile.read(length).decode("utf-8")
+                if self.path == "/oauth2/token":
+                    form = urllib.parse.parse_qs(raw_in)
+                    if (form.get("client_secret") or [""])[0] != "installed_app_csec":
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    tok_resp = json.dumps(
+                        {
+                            "access_token": "ya29.ultra_oauth_access",
+                            "refresh_token": "1//ultra_oauth_refresh",
+                            "expires_in": 3600,
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(tok_resp)))
+                    self.end_headers()
+                    self.wfile.write(tok_resp)
+                    return
+
+                body = json.loads(raw_in) if raw_in else {}
+                if self.path == "/v1internal:loadCodeAssist":
+                    if ca_state["mode"] == "ultra_existing":
+                        resp_obj: dict[str, Any] = {
+                            "currentTier": {"id": "standard-tier", "name": "Gemini Code Assist"},
+                            "paidTier": {
+                                "id": "ultra-tier",
+                                "name": "Google AI Ultra",
+                                "availableCredits": [{"creditType": "GOOGLE_ONE_AI", "creditAmount": "2500"}],
+                            },
+                            "cloudaicompanionProject": "managed-ultra-proj-001",
+                        }
+                    elif ca_state["mode"] == "first_time_onboard":
+                        resp_obj = {
+                            "allowedTiers": [{"id": "free-tier", "name": "Individual", "isDefault": True}],
+                            "paidTier": {
+                                "id": "ultra-tier",
+                                "name": "Google AI Ultra",
+                                "availableCredits": [{"creditType": "GOOGLE_ONE_AI", "creditAmount": "5000"}],
+                            },
+                        }
+                    elif ca_state["mode"] == "managed_org_needs_onboard":
+                        resp_obj = {
+                            "allowedTiers": [
+                                {
+                                    "id": "standard-tier",
+                                    "name": "Standard",
+                                    "isDefault": True,
+                                    "userDefinedCloudaicompanionProject": True,
+                                }
+                            ],
+                            "cloudaicompanionProject": "managed-org-proj-55",
+                        }
+                    else:  # dasher_corp_requires_project
+                        resp_obj = {
+                            "currentTier": {"id": "standard-tier", "userDefinedCloudaicompanionProject": True},
+                            "ineligibleTiers": [
+                                {
+                                    "tierId": "free-tier",
+                                    "reasonCode": "DASHER_USER",
+                                    "reasonMessage": "Workspace accounts require a project",
+                                }
+                            ],
+                        }
+                    raw = json.dumps(resp_obj).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                if self.path == "/v1internal:onboardUser":
+                    ca_state["onboard_bodies"].append(body)
+                    if ca_state["mode"] == "managed_org_needs_onboard":
+                        raw = json.dumps(
+                            {
+                                "done": True,
+                                "response": {"cloudaicompanionProject": {"id": "managed-org-proj-55"}},
+                            }
+                        ).encode("utf-8")
+                    else:
+                        raw = json.dumps({"name": "operations/onboard-op-99", "done": False}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                if self.path == "/v1internal:retrieveUserQuota":
+                    raw = json.dumps(
+                        {
+                            "buckets": [
+                                {"modelId": "gemini-3.1-pro-preview", "remainingFraction": 0.99, "resetTime": "2026-12-01T00:00:00Z"},
+                                {"modelId": "gemini-3.8-flash", "remainingFraction": 1.0, "resetTime": "2026-12-01T00:00:00Z"},
+                                {"modelId": "unreset_placeholder", "remainingFraction": 1.0},
+                            ]
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                if self.path == "/v1internal:streamGenerateContent?alt=sse":
+                    if body.get("model") == "vertex-only-404-model":
+                        err_raw = json.dumps(
+                            {"error": {"code": 404, "message": "Requested entity was not found.", "status": "NOT_FOUND"}}
+                        ).encode("utf-8")
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(err_raw)))
+                        self.end_headers()
+                        self.wfile.write(err_raw)
+                        return
+                    sse = (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "response": {
+                                    "candidates": [
+                                        {
+                                            "content": {"role": "model", "parts": [{"text": f"ULTRA_OK:{body.get('project')}"}]},
+                                            "finishReason": "STOP",
+                                        }
+                                    ]
+                                }
+                            }
+                        )
+                        + "\n\n"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(sse)
+                    return
+
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _ZeroProjectCAHandler)
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"USH_DISABLE_KEYCHAIN": "1"}, clear=False
+            ):
+                root = pathlib.Path(tmp)
+                vault = CredentialVault(root / "ush", probe_ambient=False)
+
+                # 10a. Already-onboarded Google AI Ultra account (zero GCP project!)
+                s_ultra = setup_code_assist_user("ya29.ultra", base_url=base)
+                self.assertEqual(s_ultra.project_id, "managed-ultra-proj-001")
+                self.assertEqual(s_ultra.tier_name, "Google AI Ultra")
+                self.assertTrue(s_ultra.has_paid_tier)
+                self.assertEqual(s_ultra.google_one_credits, 2500)
+                self.assertFalse(s_ultra.project_id_required)
+
+                # 10b. First-time onboarding via `:onboardUser` + LRO polling (`GET /v1internal/operations/...`)
+                ca_state["mode"] = "first_time_onboard"
+                s_onb = setup_code_assist_user(
+                    "ya29.ultra",
+                    base_url=base,
+                    poll_interval_seconds=0.0,
+                    sleep_fn=lambda _: None,
+                )
+                self.assertEqual(s_onb.project_id, "managed-ultra-proj-777")
+                self.assertEqual(ca_state["lro_polls"], 2)
+                # Free/managed tier onboarding MUST NOT send `cloudaicompanionProject`
+                self.assertNotIn("cloudaicompanionProject", ca_state["onboard_bodies"][0])
+
+                # 10c. Path traversal operation name in LRO polling is strictly rejected
+                with mock.patch.object(urllib.request, "urlopen") as m_open:
+                    resp_load = mock.MagicMock()
+                    resp_load.__enter__.return_value.read.return_value = b'{"allowedTiers":[{"id":"free-tier","isDefault":true}]}'
+                    resp_onb = mock.MagicMock()
+                    resp_onb.__enter__.return_value.read.return_value = b'{"name":"operations/../../evil","done":false}'
+                    m_open.side_effect = [resp_load, resp_onb]
+                    with self.assertRaises(ValueError):
+                        setup_code_assist_user("ya29.x", base_url="http://127.0.0.1:9", sleep_fn=lambda _: None)
+
+                # 10d. Corporate `DASHER_USER` without companion project surfaces `project_id_required=True`
+                ca_state["mode"] = "dasher_corp"
+                s_corp = setup_code_assist_user("ya29.corp", base_url=base)
+                self.assertTrue(s_corp.project_id_required)
+                self.assertEqual(s_corp.project_id, "")
+                self.assertTrue(any("DASHER_USER" in r for r in s_corp.ineligible_reasons))
+
+                # 10e. Managed-org account with `cloudaicompanionProject` + `allowedTiers` + `currentTier=None`
+                # MUST still call `:onboardUser` with `cloudaicompanionProject` + `metadata.duetProject`
+                ca_state["mode"] = "managed_org_needs_onboard"
+                s_morg = setup_code_assist_user("ya29.morg", base_url=base, sleep_fn=lambda _: None)
+                self.assertEqual(s_morg.project_id, "managed-org-proj-55")
+                self.assertFalse(s_morg.project_id_required)
+                last_onb = ca_state["onboard_bodies"][-1]
+                self.assertEqual(last_onb.get("tierId"), "standard-tier")
+                self.assertEqual(last_onb.get("cloudaicompanionProject"), "managed-org-proj-55")
+                self.assertEqual(last_onb.get("metadata", {}).get("duetProject"), "managed-org-proj-55")
+
+                # 10f. Full loopback browser PKCE callback (ignoring stray `/favicon.ico`) + native `antigravity` stream_turn
+                ca_state["mode"] = "first_time_onboard"
+                ca_state["lro_polls"] = 0
+
+                def _simulate_browser(auth_url: str) -> bool:
+                    parsed_u = urllib.parse.urlparse(auth_url)
+                    qs = urllib.parse.parse_qs(parsed_u.query)
+                    redir = (qs.get("redirect_uri") or [""])[0]
+                    st = (qs.get("state") or [""])[0]
+                    cb_base = redir.rsplit("/", 1)[0]
+
+                    def _fire() -> None:
+                        # Hit `/favicon.ico` first to verify callback server ignores non-callback paths
+                        try:
+                            urllib.request.urlopen(f"{cb_base}/favicon.ico", timeout=2).close()
+                        except urllib.error.HTTPError as he:
+                            he.close()
+                        with urllib.request.urlopen(
+                            f"{redir}?code=loopback_code_777&state={urllib.parse.quote(st)}", timeout=5
+                        ) as r_cb:
+                            assert r_cb.headers.get("Content-Security-Policy") == "default-src 'none'"
+                            _ = r_cb.read()
+
+                    threading.Thread(target=_fire, daemon=True).start()
+                    return True
+
+                # Store Desktop OAuth client credentials in `0600` vault and verify resolver
+                vault.store_secret(
+                    "__google_oauth_client__",
+                    mock.MagicMock(
+                        to_json=lambda: json.dumps(
+                            {"client_id": "installed_app_cid.apps.googleusercontent.com", "client_secret": "installed_app_csec"}
+                        )
+                    ),
+                )
+                self.assertEqual(
+                    resolve_google_oauth_client_credentials(vault),
+                    ("installed_app_cid.apps.googleusercontent.com", "installed_app_csec"),
+                )
+
+                # Patch `secure_ssl_context` -> `None` ONLY for local HTTP test token endpoint
+                with contextlib.redirect_stdout(io.StringIO()), mock.patch(
+                    "ush.auth.vault.webbrowser.open", side_effect=_simulate_browser
+                ), mock.patch("ush.auth.vault.secure_ssl_context", return_value=None):
+                    oauth_prof = run_oauth_pkce_login(
+                        vault,
+                        profile_name="antigravity",
+                        provider="antigravity",
+                        authorize_url=f"{base}/oauth2/auth",
+                        token_url=f"{base}/oauth2/token",
+                        client_id="installed_app_cid.apps.googleusercontent.com",
+                        client_secret="installed_app_csec",
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                        base_url=base,
+                        redirect_path="/oauth2callback",
+                        api_mode="code_assist",
+                        project_id=None,
+                    )
+
+                # Stream a turn with `provider="antigravity"` & `project_id=None` -> auto-onboards via LRO & streams!
+                oauth_prof.default_model = "gemini-3.1-pro-preview"
+                mprof = resolve_model_profile("gemini-3.1-pro-preview", "antigravity")
+                reply = HttpProviderTransport(vault).stream_turn(
+                    profile=mprof,
+                    auth_profile=oauth_prof,
+                    system_prompt="sys",
+                    messages=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hello ultra")])],
+                    tools=[],
+                    session_id="sess_ultra_01",
+                )
+                self.assertEqual(reply.plain_text(), "ULTRA_OK:managed-ultra-proj-777")
+
+                # 10g. Live `retrieveUserQuota` model discovery + automatic 404 fallback on `cloudcode-pa`
+                from ush.auth.vault import fetch_code_assist_quota_models
+
+                q_models = fetch_code_assist_quota_models(
+                    base, project_id="managed-ultra-proj-777", token="ya29.ultra_oauth_access"
+                )
+                self.assertEqual([m for m, _ in q_models], ["gemini-3.1-pro-preview", "gemini-3.8-flash"])
+                events: list[Any] = []
+                fb_reply = HttpProviderTransport(vault).stream_turn(
+                    profile=resolve_model_profile("vertex-only-404-model", "antigravity"),
+                    auth_profile=oauth_prof,
+                    system_prompt="sys",
+                    messages=[CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text="hello fallback")])],
+                    tools=[],
+                    session_id="sess_ultra_02",
+                    on_event=events.append,
+                )
+                self.assertEqual(fb_reply.plain_text(), "ULTRA_OK:managed-ultra-proj-777")
+                self.assertEqual(fb_reply.producer_model_id, "gemini-3.1-pro-preview")
+                self.assertTrue(any(e.meta and e.meta.get("event") == "model_fallback" for e in events))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
+
+    # =========================================================================
+    # 11. Antigravity ACP Dynamic Models (`Gemini 4 Argon`), Streaming & Tools
+    # =========================================================================
+
+    def test_agy_acp_dynamic_models_streaming_and_tool_bridge(self) -> None:
+        from ush.auth.vault import (
+            discover_model_options,
+            fetch_vertex_publisher_models,
+            login_antigravity_acp,
+        )
+        from ush.brain.agy_acp import (
+            AgyAcpBridge,
+            ToolCallTagStreamSplitter,
+            close_all_agy_bridges,
+            parse_agy_models_cli_output,
+            resolve_acp_variant_id,
+        )
+        from ush.core.types import ThinkingEffort
+        from ush.kernel.tools import build_default_tool_registry
+
+        # 11a. 1-byte streaming `<tool_call>` splitter never leaks raw XML into visible prose
+        sp = ToolCallTagStreamSplitter()
+        raw_stream = 'Checking file.\n<tool_call>{"name": "read_file", "arguments": {"path": "x.txt"}}</tool_call>Done!'
+        emitted = "".join(sp.feed(ch) for ch in raw_stream) + sp.flush()
+        self.assertEqual(emitted, "Checking file.\nDone!")
+
+        # 11b. `agy models` CLI parser strips ANSI spinners & groups effort variants into clean display names
+        sample_cli = (
+            "\r⠋ Fetching available models...\r"
+            "gemini-4-argon-high      Gemini 4 Argon (High)\n"
+            "gemini-4-argon-medium    Gemini 4 Argon (Medium)\n"
+            "gemini-4-argon-low       Gemini 4 Argon (Low)\n"
+            "gemini-3.8-flash-high    Gemini 3.8 Flash (High)\n"
+            "gemini-3.7-flash-high    Gemini 3.7 Flash (High)\n"
+            "gemini-3.6-flash-high    Gemini 3.6 Flash (High)\n"
+            "gemini-3.1-pro-low       Gemini 3.1 Pro (Low)\n"
+            "gemini-3.1-pro-high      Gemini 3.1 Pro (High)\n"
+        )
+        parsed_opts = parse_agy_models_cli_output(sample_cli)
+        self.assertEqual(
+            [(o.model_id, o.display_name) for o in parsed_opts],
+            [
+                ("gemini-4-argon", "Gemini 4 Argon"),
+                ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+                ("gemini-3.7-flash", "Gemini 3.7 Flash"),
+                ("gemini-3.6-flash", "Gemini 3.6 Flash"),
+                ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+            ],
+        )
+        v_set = {vid for o in parsed_opts for vid in o.variant_ids}
+        self.assertEqual(resolve_acp_variant_id("gemini-4-argon", ThinkingEffort.HIGH, v_set, parsed_opts), "gemini-4-argon-high")
+        self.assertEqual(resolve_acp_variant_id("Gemini 4 Argon", ThinkingEffort.LOW, v_set, parsed_opts), "gemini-4-argon-low")
+        # `gemini-3.1-pro` only has low/high -> MEDIUM gracefully selects `gemini-3.1-pro-high`
+        self.assertEqual(resolve_acp_variant_id("gemini-3.1-pro-preview", ThinkingEffort.MEDIUM, v_set, parsed_opts), "gemini-3.1-pro-high")
+
+        # 11c. Full end-to-end mock `agy acp` stdio server + `SessionRunner` 2-step ReAct tool execution
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            ws = root / "ws"
+            home = root / "home"
+            ws.mkdir()
+            (ws / "secret_num.txt").write_text("ARGON_MAGIC_7331\n", encoding="utf-8")
+
+            mock_agy = root / "mock_agy.py"
+            mock_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "if len(sys.argv) > 1 and sys.argv[1] == 'models':\n"
+                "    print('gemini-4-argon-high  Gemini 4 Argon (High)')\n"
+                "    sys.exit(0)\n"
+                "step = 0\n"
+                "cur_model = 'gemini-4-argon-high'\n"
+                "for line in sys.stdin:\n"
+                "    obj = json.loads(line)\n"
+                "    rid = obj.get('id')\n"
+                "    m = obj.get('method')\n"
+                "    if m == 'initialize':\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': 1}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/new':\n"
+                "        res = {\n"
+                "            'sessionId': 'acp_sess_1',\n"
+                "            'models': {\n"
+                "                'currentModelId': cur_model,\n"
+                "                'availableModels': [\n"
+                "                    {'modelId': 'gemini-4-argon-high', 'name': 'Gemini 4 Argon (High)'},\n"
+                "                    {'modelId': 'gemini-3.8-flash-high', 'name': 'Gemini 3.8 Flash (High)'},\n"
+                "                ],\n"
+                "            },\n"
+                "            'configOptions': [{\n"
+                "                'id': 'model',\n"
+                "                'currentValue': 'gemini-4-argon',\n"
+                "                'options': [\n"
+                "                    {'value': 'gemini-4-argon', 'name': 'Gemini 4 Argon'},\n"
+                "                    {'value': 'gemini-3.8-flash', 'name': 'Gemini 3.8 Flash'},\n"
+                "                ],\n"
+                "            }],\n"
+                "        }\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': res}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/set_model':\n"
+                "        cur_model = obj['params']['modelId']\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/prompt':\n"
+                "        step += 1\n"
+                "        sid = obj['params']['sessionId']\n"
+                "        # Verify unexpected permission request from server is auto-cancelled by bridge\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': 999, 'method': 'session/request_permission', 'params': {}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "        perm_reply = json.loads(sys.stdin.readline())\n"
+                "        assert perm_reply['result']['outcome']['outcome'] == 'cancelled'\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+                "            'sessionId': sid,\n"
+                "            'update': {'sessionUpdate': 'agent_thought_chunk', 'content': {'type': 'text', 'text': f'Thinking step {step}'}}\n"
+                "        }}) + '\\n')\n"
+                "        if step == 1:\n"
+                "            txt = 'Let me check.<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"secret_num.txt\"}}</tool_call>'\n"
+                "        else:\n"
+                "            p_txt = json.dumps(obj['params']['prompt'])\n"
+                "            assert 'ARGON_MAGIC_7331' in p_txt and '<crux_system_instructions>' not in p_txt\n"
+                "            txt = f'Found secret via {cur_model}: ARGON_MAGIC_7331'\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+                "            'sessionId': sid,\n"
+                "            'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': txt}}\n"
+                "        }}) + '\\n')\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {\n"
+                "            'stopReason': 'end_turn',\n"
+                "            'usage': {'inputTokens': 120, 'outputTokens': 30, 'cachedReadTokens': 80, 'thoughtTokens': 15}\n"
+                "        }}) + '\\n')\n"
+                "        sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            os.chmod(mock_agy, 0o700)
+
+            with mock.patch.dict(
+                os.environ,
+                {"USH_HOME": str(home), "USH_DISABLE_KEYCHAIN": "1", "CRUX_AGY_BIN": str(mock_agy)},
+                clear=False,
+            ):
+                try:
+                    vault = CredentialVault(home, probe_ambient=False)
+                    prof = login_antigravity_acp(vault, profile_name="antigravity", run_login_if_needed=False)
+                    self.assertEqual(prof.default_model, "gemini-4-argon")
+                    self.assertEqual(prof.api_mode, "agy_acp")
+
+                    opts = discover_model_options(vault, prof)
+                    self.assertEqual(
+                        [(o.model_id, o.display_name) for o in opts],
+                        [("gemini-4-argon", "Gemini 4 Argon"), ("gemini-3.8-flash", "Gemini 3.8 Flash")],
+                    )
+
+                    streamed_visible: list[str] = []
+                    streamed_thoughts: list[str] = []
+
+                    def _collect(ev: Any) -> None:
+                        if ev.kind == "text_delta":
+                            streamed_visible.append(ev.text)
+                        elif ev.kind == "thinking_delta":
+                            streamed_thoughts.append(ev.text)
+
+                    runner = SessionRunner(
+                        workspace_root=ws,
+                        client=UniversalModelClient(vault, HttpProviderTransport(vault)),
+                        auth_profile=prof,
+                        model_profile=resolve_model_profile("gemini-4-argon", "antigravity"),
+                        mode=PermissionMode.AUTO_EDIT,
+                        tools=build_default_tool_registry(),
+                        ush_home=home,
+                    )
+                    try:
+                        outcome = runner.run_turn("Read secret_num.txt and report it", on_event=_collect)
+                        self.assertEqual(outcome.steps_executed, 2)
+                        self.assertIn("ARGON_MAGIC_7331", outcome.final_message.plain_text())
+                        self.assertNotIn("<tool_call>", "".join(streamed_visible))
+                        self.assertIn("Thinking step 1", "".join(streamed_thoughts))
+                    finally:
+                        runner.close()
+                finally:
+                    close_all_agy_bridges()
+
+        # 11d. Live `v1beta1/publishers/google/models` parser orders Gemini 4 Argon first & filters non-chat models
+        vtx_srv = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            type(
+                "_VtxPubHandler",
+                (BaseHTTPRequestHandler,),
+                {
+                    "log_message": lambda *a: None,
+                    "do_GET": lambda h: (
+                        h.send_response(200),
+                        h.send_header("Content-Type", "application/json"),
+                        h.end_headers(),
+                        h.wfile.write(
+                            json.dumps(
+                                {
+                                    "publisherModels": [
+                                        {"name": "publishers/google/models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash"},
+                                        {"name": "publishers/google/models/gemini-3.8-flash-tts", "displayName": "TTS"},
+                                        {"name": "publishers/google/models/gemini-4-argon", "displayName": "Gemini 4 Argon"},
+                                        {"name": "publishers/google/models/gemini-3.8-flash", "displayName": "Gemini 3.8 Flash"},
+                                    ]
+                                }
+                            ).encode("utf-8")
+                        ),
+                    ),
+                },
+            ),
+        )
+        vtx_th = threading.Thread(target=vtx_srv.serve_forever, daemon=True)
+        vtx_th.start()
+        try:
+            v_host = f"http://127.0.0.1:{vtx_srv.server_address[1]}"
+            v_models = fetch_vertex_publisher_models(v_host, token="ya29.test")
+            self.assertEqual(
+                v_models,
+                [
+                    ("gemini-4-argon", "Gemini 4 Argon"),
+                    ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+                    ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+                ],
+            )
+        finally:
+            vtx_srv.shutdown()
+            vtx_srv.server_close()
+            vtx_th.join(timeout=2)
+
+    # =========================================================================
+    # 12. Readable Terminal Markdown Renderer (Streaming, Tables, Code & Links)
+    # =========================================================================
+
+    def test_terminal_markdown_streaming_tables_links_and_code_blocks(self) -> None:
+        from ush.cli.markdown import MarkdownStreamRenderer, render_markdown_ansi
+        from ush.cli.tui import strip_ansi, vis_width
+
+        doc = (
+            "# Architecture Overview\n\n"
+            "## Dynamic Runtime Discovery\n\n"
+            "Updated [`AgyAcpBridge`](file:///Users/alice/Universal_Swarm_Harness/src/ush/brain/agy_acp.py#L401-L497) "
+            "and [tui.py](file:///Users/alice/Universal_Swarm_Harness/src/ush/cli/tui.py#L1317) "
+            "while preserving `snake_case_vars`, `__init__`, and math `2 * 3 * 4`.\n\n"
+            "- [x] **Streaming Markdown** with `inline_code` inside bold\n"
+            "- [ ] Pending follow-up check\n"
+            "  - Nested bullet item\n\n"
+            "| Model | Pipe Rule | Tokens |\n"
+            "| :--- | :---: | ---: |\n"
+            "| `Gemini 4 Argon` | `a | b` | 1,000,000 |\n"
+            "| Gemini 3.8 Flash | fast | 1,000,000 |\n\n"
+            "> [!TIP]\n"
+            "> Press `/model` to switch models cleanly.\n\n"
+            "```python\n"
+            "def greet(user_name: str) -> str:\n"
+            "    # Keep exact indentation\n"
+            "    return f\"hello {user_name}\"\n"
+            "```\n"
+        )
+
+        # 12a. Full render vs 1-character streaming MUST be byte-for-byte identical!
+        full_ansi = render_markdown_ansi(doc, use_color=True, width=84)
+        stream_md = MarkdownStreamRenderer(use_color=True, cols_fn=lambda: 84)
+        chunks: list[str] = []
+        for ch in doc:
+            committed, preview = stream_md.feed(ch)
+            if committed:
+                chunks.append(committed)
+            for pl in preview:
+                # Every live preview line must have self-contained ANSI and bounded width
+                self.assertLessEqual(vis_width(pl), 84)
+        tail = stream_md.flush()
+        if tail:
+            chunks.append(tail)
+        streamed_ansi = "".join(chunks).rstrip("\n")
+        self.assertEqual(streamed_ansi, full_ansi)
+
+        plain = strip_ansi(full_ansi)
+        # Raw Markdown noise stripped
+        self.assertNotIn("## Dynamic", plain)
+        self.assertNotIn("```python", plain)
+        self.assertNotIn("file:///Users/alice", plain)
+        self.assertNotIn("[!TIP]", plain)
+        # Readable formatted elements present
+        self.assertIn("Architecture Overview", plain)
+        self.assertIn("◆ Dynamic Runtime Discovery", plain)
+        self.assertIn("AgyAcpBridge (agy_acp.py:401-497)", plain)
+        self.assertIn("tui.py:1317", plain)
+        self.assertIn("snake_case_vars", plain)
+        self.assertIn("__init__", plain)
+        self.assertIn("2 * 3 * 4", plain)
+        self.assertIn("✓ Streaming Markdown", plain)
+        self.assertIn("○ Pending follow-up check", plain)
+        self.assertIn("╭─", plain)
+        self.assertIn("│ Gemini 4 Argon   │", plain)
+        self.assertIn("a | b", plain)  # Pipe inside inline code did NOT split the table cell!
+        self.assertIn("◆ Tip", plain)
+        self.assertIn("╭─ python", plain)
+        self.assertIn("│ def greet(user_name: str) -> str:", plain)
+
+    def test_latex_math_special_chars_entities_and_font_safety(self) -> None:
+        from ush.cli.markdown import (
+            MarkdownStreamRenderer,
+            normalize_terminal_math_glyphs,
+            render_latex_math,
+            render_markdown_ansi,
+        )
+        from ush.cli.tui import strip_ansi
+
+        doc = (
+            "Inline math: $\\alpha + \\beta \\leq \\gamma$, $x_{i+1} = x_i - \\eta \\nabla f(x_i)$, "
+            "$w^\\top x + b \\neq 0$, $\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$, and $\\frac{1}{2} mv^2$.\n\n"
+            "Paren & bracket delimiters: \\( \\theta \\in \\mathbb{R}^d \\) and \\[ \\sum_{i=1}^{n} x_i^2 \\approx \\int_0^\\infty e^{-t}\\,dt \\].\n\n"
+            "Prose LaTeX & HTML entities: Let \\lambda \\rightarrow 0 &mdash; then A &le; B &rarr; C &ne; D.\n\n"
+            "Plane-1 SMP & Menlo-missing normalization: 𝒪(N log N), 𝑥 ∈ ℝ, xₙ, ‖w‖₂, ℏ, A ⟶ B.\n\n"
+            "Currency, env vars & code stay untouched: It costs $10 and $25 ($USH_HOME/$PATH), "
+            "path C:\\alpha\\to\\file, and code `$\\alpha + \\beta$`.\n\n"
+            "| Norm | Bound |\n"
+            "| :--- | :--- |\n"
+            "| $|x|$ | $\\|w\\|_2 \\le 1$ |\n\n"
+            "$$\n"
+            "\\begin{aligned}\n"
+            "\\mathcal{L}(\\theta) &= \\frac{1}{N} \\sum_{i=1}^{N} (y_i - \\hat{y}_i)^2 \\\\\n"
+            "f(x) &= \\begin{cases} x^2 & \\text{if } x \\ge 0 \\\\ -x & \\text{otherwise} \\end{cases}\n"
+            "\\end{aligned}\n"
+            "$$\n\n"
+            "```latex\n"
+            "\\frac{\\alpha}{\\beta}\n"
+            "```\n"
+        )
+
+        # Full render vs 1-char streaming MUST match identically even across multi-line `$$...$$` blocks!
+        full_ansi = render_markdown_ansi(doc, use_color=True, width=108)
+        stream_md = MarkdownStreamRenderer(use_color=True, cols_fn=lambda: 108)
+        streamed_parts: list[str] = []
+        for ch in doc:
+            c, _ = stream_md.feed(ch)
+            if c:
+                streamed_parts.append(c)
+        tail = stream_md.flush()
+        if tail:
+            streamed_parts.append(tail)
+        self.assertEqual("".join(streamed_parts).rstrip("\n"), full_ansi)
+
+        plain = strip_ansi(full_ansi)
+        # 1. Inline & delimiter math rendered into clean Unicode
+        self.assertIn("α + β ≤ γ", plain)
+        self.assertIn("xᵢ₊₁ = xᵢ - η ∇ f(xᵢ)", plain)
+        self.assertIn("wᵀ x + b ≠ 0", plain)
+        self.assertIn("(-b ± √(b² - 4ac))/(2a)", plain)
+        self.assertIn("½ mv²", plain)
+        self.assertIn("θ ∈ ℝᵈ", plain)
+        self.assertIn("∑ᵢ₌₁ⁿ xᵢ² ≈ ∫₀^∞ e⁻ᵗ dt", plain)
+
+        # 2. Un-delimited prose LaTeX + HTML entities
+        self.assertIn("λ → 0 — then A ≤ B → C ≠ D", plain)
+
+        # 3. Plane-1 SMP (`0x1D400..0x1D7FF`) & Menlo-missing subscripts (`xₙ`, `‖w‖₂`) normalized
+        self.assertIn("O(N log N)", plain)
+        self.assertIn("x ∈ ℝ", plain)
+        self.assertIn("x_n", plain)
+        self.assertIn("||w||₂", plain)
+        self.assertIn("ħ", plain)
+        self.assertIn("A → B", plain)
+        for ch in plain:
+            self.assertFalse(0x1D400 <= ord(ch) <= 0x1D7FF, f"Leaked Plane-1 tofu char {ch!r} ({hex(ord(ch))})")
+            self.assertNotIn(ch, "ₕₖₗₘₙₚₛₜ‖⟶⟵⟷")
+
+        # 4. Currency, shell vars, Windows paths & code fences/spans untouched!
+        self.assertIn("It costs $10 and $25 ($USH_HOME/$PATH)", plain)
+        self.assertIn("C:\\alpha\\to\\file", plain)
+        self.assertIn("$\\alpha + \\beta$", plain)  # Inside inline backticks!
+        self.assertIn("│ \\frac{\\alpha}{\\beta}", plain)  # Inside ```latex code fence!
+
+        # 5. Table cell with `$|x|$` and `$\|w\|_2 \le 1$` did NOT split on `|`!
+        self.assertIn("|x|", plain)
+        self.assertIn("||w||₂ ≤ 1", plain)
+
+        # 6. Multi-line `$$ \begin{aligned} ... $$` block rendered cleanly without raw `$$` or `\begin`
+        self.assertNotIn("$$", plain)
+        self.assertNotIn("\\begin{aligned}", plain)
+        self.assertIn("1/N ∑ᵢ₌₁ᴺ", plain)
+        self.assertIn("ŷᵢ", plain)
+
+        # 7. Matrix rendering in display mode
+        mat = render_latex_math(r"\begin{bmatrix} 1 & 0 \\ 0 & \lambda \end{bmatrix}", display=True, use_color=False)
+        self.assertIn("⎡ 1  0 ⎤", mat)
+        self.assertIn("⎣ 0  λ ⎦", mat)
+        self.assertEqual(normalize_terminal_math_glyphs("𝑥ₙ", use_color=False), "x_n")
 
 
 if __name__ == "__main__":

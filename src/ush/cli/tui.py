@@ -40,6 +40,7 @@ from ush.brain.trace import extract_thought_landmarks, format_relative_age, list
 from ush.core.types import (
     CanonicalPart,
     PermissionMode,
+    PolicyDecision,
     StreamEvent,
     ThinkingEffort,
     TraceMode,
@@ -51,27 +52,6 @@ if TYPE_CHECKING:
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-
-# Curated frontier & local models surfaced in `/model` visual menu (plus live LiteLLM/local `/models` probe)
-RECOMMENDED_MODELS: tuple[tuple[str, str, str], ...] = (
-    ("gemini-4-argon", "antigravity/enterprise", "Tier S · Frontier Gemini 4 Argon (1M ctx, deep native thinking)"),
-    ("gemini-3.1-pro-preview", "antigravity/enterprise", "Tier S · Gemini 3.1 Pro Preview (1M ctx, LOW/MEDIUM/HIGH thinking)"),
-    ("gemini-3.8-flash", "antigravity", "Tier A · Antigravity SDK default fast reasoning model (`gemini-3.8-flash`)"),
-    ("gemini-3-flash-preview", "antigravity/enterprise", "Tier A · Gemini 3 Flash Preview (ultra-fast multi-step agentic loop)"),
-    ("gemini-2.5-pro", "antigravity/enterprise", "Tier S · Gemini 2.5 Pro GA (Antigravity / Enterprise / AI Studio)"),
-    ("gemini-2.5-flash", "antigravity/enterprise", "Tier A · Gemini 2.5 Flash GA (low-latency high throughput)"),
-    ("antigravity:gemini-3.1-pro-preview", "antigravity", "Tier S · Pin explicitly to Antigravity Hosted Endpoint"),
-    ("claude-opus-4-20250514", "anthropic/vertex", "Tier S · Claude Opus 4 (interleaved thinking between tool calls)"),
-    ("claude-sonnet-4@20250514", "vertex-anthropic", "Tier A · Claude Sonnet 4 on Vertex Model Garden"),
-    ("claude-sonnet-4-20250514", "anthropic", "Tier A · Claude Sonnet 4 (`api.anthropic.com` API Key / Bearer)"),
-    ("gpt-5", "openai", "Tier S · OpenAI GPT-5 (`/v1/responses` + `encrypted_content` CoT)"),
-    ("o3", "openai", "Tier S · OpenAI o3 native reasoner (`/v1/responses`)"),
-    ("litellm:anthropic/claude-sonnet-4-20250514", "litellm", "Tier A · LiteLLM Proxy -> Claude Sonnet 4"),
-    ("litellm:vertex_ai/gemini-2.5-pro", "litellm", "Tier S · LiteLLM Proxy -> Vertex Gemini 2.5 Pro"),
-    ("deepseek-reasoner", "openrouter/litellm", "Tier A · DeepSeek R1 (`reasoning_content` full CoT)"),
-    ("qwen3-coder", "openrouter/local", "Tier A · Qwen3-Coder agentic coder"),
-    ("__custom__", "custom", "Type any custom provider:model-id (LiteLLM, Antigravity, Enterprise, Ollama)..."),
-)
 
 
 # ============================================================================
@@ -109,10 +89,23 @@ def vis_width(text: str) -> int:
     return sum(char_width(ch) for ch in plain)
 
 
+_CTRL_SINGLE_LINE_RE = re.compile(r"\r\n|[\x00-\x1a\x1c-\x1f\x7f]+")
+
+
+def _sanitize_single_line(text: str) -> str:
+    """Replaces `\r`, `\n`, `\t`, and C0/DEL control chars (except ESC) with spaces (`INV-TUI-1`)."""
+    if not text:
+        return ""
+    if _CTRL_SINGLE_LINE_RE.search(text) is None:
+        return text
+    return _CTRL_SINGLE_LINE_RE.sub(" ", text)
+
+
 def clip_to_cols(text: str, max_cols: int, ellipsis: str = "…") -> str:
-    """ANSI-preserving truncation guaranteeing `vis_width(result) <= max_cols` (`INV-TUI-1`)."""
+    """ANSI-preserving truncation guaranteeing `vis_width(result) <= max_cols` and 0 newlines (`INV-TUI-1`)."""
     if max_cols <= 0:
         return ""
+    text = _sanitize_single_line(text)
     if vis_width(text) <= max_cols:
         return text
 
@@ -758,6 +751,30 @@ class WorkspaceFileIndex:
 # ============================================================================
 
 
+def _query_pty_size(out: TextIO | None = None) -> os.terminal_size:
+    """Queries live kernel PTY dimensions via `TIOCGWINSZ`, ignoring stale `$COLUMNS`/`$LINES` env vars."""
+    candidates: list[int] = []
+    if out is not None and hasattr(out, "fileno"):
+        try:
+            candidates.append(out.fileno())
+        except (OSError, ValueError):
+            pass
+    for stream in (sys.__stdout__, sys.__stdin__, sys.__stderr__):
+        if stream is not None and hasattr(stream, "fileno"):
+            try:
+                candidates.append(stream.fileno())
+            except (OSError, ValueError):
+                pass
+    for fd in candidates:
+        try:
+            sz = os.get_terminal_size(fd)
+            if sz.columns > 0 and sz.lines > 0:
+                return sz
+        except OSError:
+            continue
+    return shutil.get_terminal_size((100, 30))
+
+
 class InlineDockCompositor:
     """Renders streaming permanent scrollback ABOVE a flicker-free, wrap-safe pinned bottom dock."""
 
@@ -771,21 +788,23 @@ class InlineDockCompositor:
     ) -> None:
         self.out = out or sys.stdout
         self.style = style or Styler(True)
-        self._cols_fn = cols_fn or (lambda: shutil.get_terminal_size((100, 30)).columns)
+        self._cols_fn = cols_fn or (lambda: _query_pty_size(self.out).columns)
         self.use_sync_output = use_sync_output
         self.lock = threading.RLock()
         self._dock_rows_drawn: int = 0
         self._cursor_row_from_top: int = 0
         self._pending_scroll_lines: list[str] = []
         self._live_partial_line: str = ""
+        self._live_preview_lines: list[str] = []
         self._dock_builder: Callable[[int], tuple[list[str], int, int]] | None = None
+        self._last_frame_sig: tuple[int, tuple[str, ...], int, int] | None = None
         self._closed = False
 
     def cols(self) -> int:
-        return max(48, self._cols_fn())
+        return max(24, self._cols_fn())
 
     def rows(self) -> int:
-        return max(12, shutil.get_terminal_size((100, 30)).lines)
+        return max(6, _query_pty_size(self.out).lines)
 
     def set_dock_builder(self, fn: Callable[[int], tuple[list[str], int, int]]) -> None:
         """`fn(cols)` returns `(dock_lines_each_le_cols_minus_1, cursor_row_idx, cursor_col_1based)`."""
@@ -812,8 +831,14 @@ class InlineDockCompositor:
                 self._pending_scroll_lines.append(sub)
         self.render()
 
+    def set_live_preview(self, lines: list[str]) -> None:
+        """Updates the erasable live-formatted Markdown preview lines above the dock."""
+        with self.lock:
+            self._live_preview_lines = list(lines)
+
     def clear_dock(self) -> None:
         with self.lock:
+            self._last_frame_sig = None
             buf: list[str] = []
             if self._dock_rows_drawn > 0:
                 if self._cursor_row_from_top > 0:
@@ -821,6 +846,10 @@ class InlineDockCompositor:
                 buf.append("\r\x1b[J")
                 self._dock_rows_drawn = 0
                 self._cursor_row_from_top = 0
+            if self._live_preview_lines:
+                for pl in self._live_preview_lines:
+                    buf.append(pl + "\n")
+                self._live_preview_lines.clear()
             if self._live_partial_line:
                 buf.append(self._live_partial_line + "\n")
                 self._live_partial_line = ""
@@ -832,7 +861,7 @@ class InlineDockCompositor:
                 self.out.write("".join(buf))
                 self.out.flush()
 
-    def render(self) -> None:
+    def render(self, *, force: bool = False) -> None:
         with self.lock:
             if self._closed or self._dock_builder is None:
                 return
@@ -840,14 +869,18 @@ class InlineDockCompositor:
             max_line_w = max(20, width - 1)
             dock_raw, cur_row, cur_col = self._dock_builder(width)
 
-            # Prepend in-progress partial stream line (clamped safely) at row 0 of erasable zone
+            # Prepend in-progress partial stream line(s) (clamped safely) at top of erasable zone
             erasable: list[str] = []
             row_offset = 0
-            if self._live_partial_line:
+            if self._live_preview_lines:
+                for pl in self._live_preview_lines[-6:]:
+                    erasable.append(clip_to_cols(pl, max_line_w))
+                    row_offset += 1
+            elif self._live_partial_line:
                 erasable.append(clip_to_cols(self._live_partial_line, max_line_w))
                 row_offset = 1
             for dl in dock_raw:
-                # Strict `INV-TUI-1`: NEVER allow a dock line to exceed `width - 1` physical columns!
+                # Strict `INV-TUI-1`: NEVER allow a dock line to exceed `width - 1` physical columns or contain `\n`!
                 erasable.append(clip_to_cols(dl, max_line_w))
 
             if not erasable:
@@ -856,11 +889,21 @@ class InlineDockCompositor:
             target_col = max(1, min(max_line_w, cur_col))
 
             # Vertical viewport guard (`INV-TUI-1`): never exceed `rows - 2` so `\x1b[nA` never hits top margin!
-            max_dock_h = max(7, self.rows() - 2)
+            max_dock_h = max(3, self.rows() - 2)
             if len(erasable) > max_dock_h:
                 drop = len(erasable) - max_dock_h
                 erasable = erasable[drop:]
                 target_row = max(0, target_row - drop)
+
+            frame_sig = (width, tuple(erasable), target_row, target_col)
+            if (
+                not force
+                and not self._pending_scroll_lines
+                and self._dock_rows_drawn > 0
+                and frame_sig == self._last_frame_sig
+            ):
+                return
+            self._last_frame_sig = frame_sig
 
             buf: list[str] = []
             if self.use_sync_output:
@@ -917,6 +960,8 @@ class VisualStreamRenderer:
         mode_fn: Callable[[], TraceMode],
         on_dirty: Callable[[], None],
     ) -> None:
+        from ush.cli.markdown import MarkdownStreamRenderer
+
         self.comp = compositor
         self.s = compositor.style
         self.tracker = tracker
@@ -924,26 +969,53 @@ class VisualStreamRenderer:
         self.on_dirty = on_dirty
         self._in_think = False
         self._think_bol = True
+        self._think_line_buf = ""
         self._in_text = False
         self._last_flush = 0.0
+        self._md_stream = MarkdownStreamRenderer(use_color=self.s.enabled, cols_fn=compositor.cols)
 
-    def _style_thought_chunk(self, chunk: str) -> str:
-        # Highlight **Landmark Titles** cleanly inside dim thought cards
-        def _repl(m: re.Match[str]) -> str:
+    def _style_thought_chunk(self, chunk: str, *, live_preview: bool = False) -> str:
+        from ush.cli.markdown import render_inline_markdown
+
+        # Preserve **Landmark Titles** while rendering LaTeX math & special symbols inside dim thought cards
+        landmarks: list[str] = []
+
+        def _stash_lm(m: re.Match[str]) -> str:
+            idx = len(landmarks)
+            landmarks.append(render_inline_markdown(m.group(1), use_color=False, live_preview=live_preview))
+            return f"\x02LM{idx}\x02"
+
+        stashed = self.BOLD_MD_RE.sub(_stash_lm, chunk)
+        rendered = render_inline_markdown(stashed, use_color=False, live_preview=live_preview)
+
+        def _restore_lm(m: re.Match[str]) -> str:
+            lm_txt = landmarks[int(m.group(1))]
             if not self.s.enabled:
-                return f"**{m.group(1)}**"
-            return f"\x1b[0;1;36m{m.group(1)}\x1b[0;2m"
+                return f"**{lm_txt}**"
+            return f"\x1b[0;1;36m{lm_txt}\x1b[0;2m"
 
-        styled = self.BOLD_MD_RE.sub(_repl, chunk)
-        return f"\x1b[2m{styled}\x1b[0m" if self.s.enabled else chunk
+        styled = re.sub(r"\x02LM(\d+)\x02", _restore_lm, rendered)
+        return f"\x1b[2m{styled}\x1b[0m" if self.s.enabled else styled
 
-    def _close_open_blocks(self) -> None:
+    def _flush_open_thought(self) -> None:
         if self._in_think:
-            self.comp.write_scroll("\n")
+            self.comp.set_live_preview([])
+            if self._think_line_buf:
+                gutter = self.s.cyan("│ ")
+                self.comp.write_scroll(f"{gutter}{self._style_thought_chunk(self._think_line_buf)}\n")
+                self._think_line_buf = ""
+            elif not self._think_bol:
+                self.comp.write_scroll("\n")
             self._in_think = False
             self._think_bol = True
+
+    def _close_open_blocks(self) -> None:
+        self._flush_open_thought()
         if self._in_text:
-            self.comp.write_scroll("\n")
+            self.comp.set_live_preview([])
+            tail = self._md_stream.flush()
+            if tail:
+                self.comp.write_scroll(tail)
             self._in_text = False
 
     def _maybe_flush(self, force: bool = False) -> None:
@@ -983,20 +1055,21 @@ class VisualStreamRenderer:
             if mode == TraceMode.FULL:
                 self._in_think = True
                 gutter = self.s.cyan("│ ")
-                pieces = evt.text.splitlines(keepends=True)
+                combined = self._think_line_buf + evt.text.replace("\r\n", "\n")
+                parts = combined.split("\n")
+                self._think_line_buf = parts[-1]
                 out: list[str] = []
-                for pc in pieces:
-                    if self._think_bol:
-                        out.append(gutter)
-                    body = pc[:-1] if pc.endswith("\n") else pc
-                    if body:
-                        out.append(self._style_thought_chunk(body))
-                    if pc.endswith("\n"):
-                        out.append("\n")
-                        self._think_bol = True
-                    else:
-                        self._think_bol = False
-                self.comp.write_scroll("".join(out))
+                for complete in parts[:-1]:
+                    body = self._style_thought_chunk(complete) if complete else ""
+                    out.append(f"{gutter}{body}\n")
+                if out:
+                    self.comp.write_scroll("".join(out))
+                if self._think_line_buf:
+                    self._think_bol = False
+                    self.comp.set_live_preview([f"{gutter}{self._style_thought_chunk(self._think_line_buf, live_preview=True)}"])
+                else:
+                    self._think_bol = True
+                    self.comp.set_live_preview([])
             self._maybe_flush(force=False)
             return
 
@@ -1006,10 +1079,7 @@ class VisualStreamRenderer:
             rtok = int(m.get("reasoning_tokens") or 0)
             sig = "sig ✓" if m.get("has_signature") else "unsigned"
             if mode == TraceMode.FULL:
-                if self._in_think and not self._think_bol:
-                    self.comp.write_scroll("\n")
-                self._in_think = False
-                self._think_bol = True
+                self._flush_open_thought()
                 self.comp.write_scroll(
                     self.s.dim(f"╰─ ◇ reasoned {secs:.2f}s · ~{rtok:,} tok · {sig}  (^O threads)\n")
                 )
@@ -1061,8 +1131,12 @@ class VisualStreamRenderer:
                 self._close_open_blocks()
             if not self._in_text:
                 self.comp.write_scroll("\n")
+                self._md_stream.reset()
                 self._in_text = True
-            self.comp.write_scroll(evt.text)
+            committed, preview_lines = self._md_stream.feed(evt.text)
+            if committed:
+                self.comp.write_scroll(committed)
+            self.comp.set_live_preview(preview_lines)
             self._maybe_flush(force=False)
             return
 
@@ -1124,6 +1198,7 @@ class VisualTuiController:
         self.menu: MenuOverlay | None = None
         self._custom_input_cb: Callable[[str], None] | None = None
         self._custom_input_label: str = ""
+        self._interaction_lock = threading.Lock()
 
         # Background worker synchronization
         self.turn_busy = threading.Event()
@@ -1142,6 +1217,12 @@ class VisualTuiController:
         self.rt.runner.approval_callback = self._request_tool_approval_menu
         self.rt.runner.ask_user_callback = self._request_ask_user_menu
 
+    @property
+    def is_awaiting_user(self) -> bool:
+        """True whenever a modal approval, `ask_user` menu, or free-form answer prompt is awaiting user input."""
+        m = self.menu
+        return (m is not None and m.kind in ("approval", "ask_user")) or (self._custom_input_cb is not None)
+
     def flash(self, msg: str, duration: float = 4.5) -> None:
         self._flash_msg = (msg, time.monotonic() + duration)
         self.comp.render()
@@ -1149,40 +1230,49 @@ class VisualTuiController:
     # ---- Interactive Approval & Ask-User Overlays (Never clobber `self.input_buf`!) ----
 
     def _request_tool_approval_menu(self, tool_name: str, args: dict[str, Any], reason: str) -> bool:
-        if self.rt.runner.mode == PermissionMode.YOLO:
-            return True
-        done = threading.Event()
-        decision = [False]
-        target = str(args.get("command") or args.get("path") or args)[:72]
+        with self._interaction_lock:
+            if self.rt.runner.mode == PermissionMode.YOLO:
+                return True
+            cmd_check = str(args.get("command", "")) if tool_name == "exec_pty" else None
+            cur_dec, _ = self.rt.policy_engine.check(tool_name, command=cmd_check, mode=self.rt.runner.mode)
+            if cur_dec == PolicyDecision.ALLOW:
+                return True
+            if cur_dec == PolicyDecision.DENY:
+                return False
 
-        def _pick(item: MenuItem) -> None:
-            if item.key == "allow":
-                decision[0] = True
-            elif item.key == "auto_edit":
-                self.rt.runner.mode = PermissionMode.AUTO_EDIT
-                decision[0] = True
-                self.flash("Mode -> auto_edit (workspace edits auto-approved)")
-            elif item.key == "turbo":
-                self.rt.runner.mode = PermissionMode.YOLO
-                self.rt.max_steps = max(self.rt.max_steps, 160)
-                decision[0] = True
-                self.flash("▸▸ Turbo (autonomous) enabled for session")
-            else:
+            done = threading.Event()
+            decision = [False]
+            raw_target = str(args.get("command") or args.get("path") or args)
+            target = " ".join(raw_target.split())[:72]
+            clean_reason = " ".join(str(reason).split())[:48]
+
+            def _pick(item: MenuItem) -> None:
+                self.menu = None
+                if item.key == "allow":
+                    decision[0] = True
+                elif item.key == "auto_edit":
+                    self.rt.runner.mode = PermissionMode.AUTO_EDIT
+                    decision[0] = True
+                    self.flash("Mode -> auto_edit (workspace edits auto-approved)")
+                elif item.key == "turbo":
+                    self.rt.runner.mode = PermissionMode.YOLO
+                    self.rt.max_steps = max(self.rt.max_steps, 160)
+                    decision[0] = True
+                    self.flash("▸▸ Turbo (autonomous) enabled for session")
+                else:
+                    decision[0] = False
+                done.set()
+                self.comp.render()
+
+            def _cancel() -> None:
                 decision[0] = False
-            self.menu = None
-            done.set()
-            self.comp.render()
+                self.menu = None
+                done.set()
+                self.comp.render()
 
-        def _cancel() -> None:
-            decision[0] = False
-            self.menu = None
-            done.set()
-            self.comp.render()
-
-        with self.comp.lock:
-            self.menu = MenuOverlay(
+            overlay = MenuOverlay(
                 kind="approval",
-                title=f"? Approve `{tool_name}`: {target}  ({reason[:48]})",
+                title=f"? Approve `{tool_name}`: {target}  ({clean_reason})",
                 items=[
                     MenuItem("allow", "Allow once", "Execute this tool call and continue", badge="y"),
                     MenuItem("auto_edit", "Allow & enable auto-edit", "Auto-apply workspace edits this session", badge="e"),
@@ -1193,62 +1283,78 @@ class VisualTuiController:
                 on_select=_pick,
                 on_cancel=_cancel,
             )
-        self.comp.render()
-        while not done.wait(timeout=0.1):
-            if self.rt.runner.cancel_event.is_set() or self.should_exit:
-                self.menu = None
-                return False
-        return decision[0]
+            with self.comp.lock:
+                self.menu = overlay
+            self.comp.render()
+            try:
+                while not done.wait(timeout=0.1):
+                    if self.rt.runner.cancel_event.is_set() or self.should_exit:
+                        return False
+                return decision[0]
+            finally:
+                with self.comp.lock:
+                    if self.menu is overlay:
+                        self.menu = None
 
     def _request_ask_user_menu(self, question: str, options: list[str]) -> str:
-        done = threading.Event()
-        answer = [""]
+        with self._interaction_lock:
+            done = threading.Event()
+            answer = [""]
+            clean_q = " ".join(str(question).split())
 
-        items = [MenuItem(opt, opt, "Select option") for opt in options]
-        items.append(MenuItem("__custom__", "Type custom response...", "Enter free-form answer in composer"))
+            items = [MenuItem(opt, " ".join(str(opt).split()), "Select option") for opt in options]
+            items.append(MenuItem("__custom__", "Type custom response...", "Enter free-form answer in composer"))
 
-        def _pick(item: MenuItem) -> None:
-            self.menu = None
-            if item.key == "__custom__":
-                saved_draft = (self.input_buf, self.cursor)
-                self.input_buf = ""
-                self.cursor = 0
-                self._custom_input_label = f"Answer `{question[:54]}`"
+            def _pick(item: MenuItem) -> None:
+                self.menu = None
+                if item.key == "__custom__":
+                    saved_draft = (self.input_buf, self.cursor)
+                    self.input_buf = ""
+                    self.cursor = 0
+                    self._custom_input_label = f"Answer `{clean_q[:54]}`"
 
-                def _finish_custom(val: str) -> None:
-                    answer[0] = val
-                    self._custom_input_label = ""
-                    self.input_buf, self.cursor = saved_draft
-                    done.set()
+                    def _finish_custom(val: str) -> None:
+                        answer[0] = val
+                        self._custom_input_label = ""
+                        self.input_buf, self.cursor = saved_draft
+                        done.set()
+                        self.comp.render()
+
+                    self._custom_input_cb = _finish_custom
                     self.comp.render()
-
-                self._custom_input_cb = _finish_custom
+                    return
+                answer[0] = item.key
+                done.set()
                 self.comp.render()
-                return
-            answer[0] = item.key
-            done.set()
-            self.comp.render()
 
-        def _cancel() -> None:
-            self.menu = None
-            done.set()
-            self.comp.render()
+            def _cancel() -> None:
+                self.menu = None
+                done.set()
+                self.comp.render()
 
-        with self.comp.lock:
-            self.menu = MenuOverlay(
+            overlay = MenuOverlay(
                 kind="ask_user",
-                title=f"? Agent asks: {question}",
+                title=f"? Agent asks: {clean_q}",
                 items=items,
                 allow_filter=False,
                 on_select=_pick,
                 on_cancel=_cancel,
             )
-        self.comp.render()
-        while not done.wait(timeout=0.1):
-            if self.rt.runner.cancel_event.is_set() or self.should_exit:
-                self.menu = None
-                return ""
-        return answer[0]
+            with self.comp.lock:
+                self.menu = overlay
+            self.comp.render()
+            try:
+                while not done.wait(timeout=0.1):
+                    if self.rt.runner.cancel_event.is_set() or self.should_exit:
+                        return ""
+                return answer[0]
+            finally:
+                with self.comp.lock:
+                    if self.menu is overlay:
+                        self.menu = None
+                if (self.rt.runner.cancel_event.is_set() or self.should_exit) and self._custom_input_cb is not None:
+                    self._custom_input_cb = None
+                    self._custom_input_label = ""
 
     # ---- Auto-Completion Popup Menus (`/`, `@`, `$`) ----
 
@@ -1336,94 +1442,78 @@ class VisualTuiController:
     # ---- Rich Interactive Modal Pickers (`/model`, `/thinking`, `/turbo`, `/sessions`, `/threads`, etc.) ----
 
     def open_model_menu(self) -> None:
+        from ush.auth.vault import describe_model, discover_model_options, format_model_display_name
+
         cur_m = self.rt.runner.model_profile.model_id
-        cur_p = self.rt.runner.auth_profile.name
+        prof = self.rt.runner.auth_profile
+        discovered = discover_model_options(self.rt.vault, prof, timeout=1.2)
+
         items: list[MenuItem] = []
         seen: set[str] = set()
-
-        # Include defaults & live `/models` discovery from configured auth profiles, prioritizing the active profile first!
-        ordered_profs = sorted(
-            self.rt.vault.list_profiles(),
-            key=lambda p: (0 if p.name == cur_p else 1, 0 if p.provider == "antigravity" else 1),
-        )
-        for prof in ordered_profs:
-            if prof.default_model and prof.default_model not in seen:
-                act = prof.default_model == cur_m and prof.name == cur_p
-                items.append(
-                    MenuItem(
-                        key=f"{prof.name}::{prof.default_model}",
-                        label=prof.default_model,
-                        detail=f"via profile `{prof.name}` ({prof.provider})",
-                        badge="● active" if act else prof.provider,
-                        active=act,
-                        payload=(prof, prof.default_model),
-                    )
-                )
-                seen.add(prof.default_model)
-            if prof.provider in ("litellm", "local") or (prof.provider == "antigravity" and prof.api_mode == "chat_completions"):
-                from ush.auth.vault import fetch_openai_compat_models
-
-                try:
-                    tok = self.rt.vault.resolve_bearer_or_key(prof) if prof.auth_kind != "none" else ""
-                except Exception:  # noqa: BLE001
-                    tok = ""
-                for live_mid in fetch_openai_compat_models(prof.base_url, token=tok, timeout=0.45)[:12]:
-                    if live_mid not in seen:
-                        act = live_mid == cur_m and prof.name == cur_p
-                        items.append(
-                            MenuItem(
-                                key=f"{prof.name}::{live_mid}",
-                                label=live_mid,
-                                detail=f"live `/models` on `{prof.name}` ({prof.base_url})",
-                                badge="● active" if act else f"{prof.provider}:live",
-                                active=act,
-                                payload=(prof, live_mid),
-                            )
-                        )
-                        seen.add(live_mid)
-
-        for mid, prov_lbl, desc in RECOMMENDED_MODELS:
-            if mid in seen and mid != "__custom__":
+        for opt in discovered:
+            mid = opt.model_id
+            if mid in seen:
                 continue
-            act = mid == cur_m
+            act = mid == cur_m or cur_m in (f"{mid}-high", f"{mid}-medium", f"{mid}-low")
             items.append(
                 MenuItem(
                     key=mid,
-                    label="+ Custom model ID..." if mid == "__custom__" else mid,
-                    detail=desc,
-                    badge="● active" if act else prov_lbl,
+                    label=opt.display_name,
+                    detail=opt.description,
+                    badge="current" if act else "",
                     active=act,
-                    payload=(None, mid),
+                    payload=mid,
                 )
             )
+            seen.add(mid)
+
+        if cur_m and not any(it.active for it in items):
+            items.insert(
+                0,
+                MenuItem(
+                    key=cur_m,
+                    label=format_model_display_name(cur_m),
+                    detail=describe_model(cur_m),
+                    badge="current",
+                    active=True,
+                    payload=cur_m,
+                ),
+            )
+
+        items.append(
+            MenuItem(
+                key="__custom__",
+                label="+ Custom model ID...",
+                detail="Enter a specific model ID",
+                badge="",
+                active=False,
+                payload="__custom__",
+            )
+        )
 
         sel_idx = next((i for i, it in enumerate(items) if it.active), 0)
 
         def _pick(it: MenuItem) -> None:
-            prof_obj, mid = it.payload
+            mid = str(it.payload)
             self.menu = None
             if mid == "__custom__":
                 saved = (self.input_buf, self.cursor)
                 self.input_buf = ""
                 self.cursor = 0
-                self._custom_input_label = "Enter model ID (e.g. gemini-4-argon, openrouter:deepseek/deepseek-r1)"
+                self._custom_input_label = "Enter model ID"
 
                 def _apply_custom(val: str) -> None:
                     self._custom_input_label = ""
                     self.input_buf, self.cursor = saved
                     if val.strip():
                         np = self.rt.runner.switch_model(val.strip())
-                        self.flash(f"Model -> {np.model_id} (Tier {np.tier.value}, {np.family})")
+                        self.flash(f"Model -> {format_model_display_name(np.model_id)}")
 
                 self._custom_input_cb = _apply_custom
                 self.comp.render()
                 return
-            if prof_obj is not None and prof_obj.name != self.rt.runner.auth_profile.name:
-                self.rt.vault.switch_profile(prof_obj.name)
-                np = self.rt.runner.switch_model(mid, prof_obj)
-            else:
-                np = self.rt.runner.switch_model(mid)
-            self.flash(f"Switched model -> {np.model_id} (Tier {np.tier.value} · {np.provider})")
+            np = self.rt.runner.switch_model(mid)
+            self.flash(f"Model -> {format_model_display_name(np.model_id)}")
 
         self.menu = MenuOverlay(
             kind="picker",
@@ -1752,13 +1842,15 @@ class VisualTuiController:
                 node: ThinkingThreadNode = cur_it.payload
                 lines.append(self.s.cyan("├─ ") + self.s.bold(f"Thread {node.thread_id} ({node.model} · effort={node.effort} · {node.live_tokens_est():,} thought tok)"))
                 body_lines: list[str] = []
+                from ush.cli.markdown import render_inline_markdown
+
                 raw_t = node.thought_text.strip() or "(no explicit thought text emitted on this step)"
                 wrap_w = max(24, width - 6)
                 for para in raw_t.splitlines():
                     if not para.strip():
                         body_lines.append("")
                         continue
-                    rem = para
+                    rem = render_inline_markdown(para, use_color=False)
                     while vis_width(rem) > wrap_w:
                         chunk = clip_to_cols(rem, wrap_w, ellipsis="")
                         body_lines.append(chunk)
@@ -1794,13 +1886,42 @@ class VisualTuiController:
         lines: list[str] = []
         r = self.rt.runner
 
-        # 1. Live Active Thinking Thread Ticker (visible whenever a turn is running!)
-        live_status = self.tracker.snapshot_live_status(self._spin_tick)
-        if live_status:
-            lines.append(self.s.bold_cyan("  ") + self.s.cyan(clip_to_cols(live_status, width - 4)))
-        elif self.turn_busy.is_set():
-            spin = SPINNER_FRAMES[self._spin_tick % len(SPINNER_FRAMES)]
-            lines.append(self.s.cyan(f"  {spin} Running turn on {r.model_profile.model_id}... (Ctrl+C cancel · Enter queues next · Alt+S steers live)"))
+        # 1. Live Active Thinking Thread Ticker (static & motionless whenever paused awaiting user approval!)
+        if self.is_awaiting_user:
+            if self.menu is not None and self.menu.kind == "approval":
+                lines.append(
+                    "  "
+                    + self.s.yellow(
+                        clip_to_cols(
+                            f"◈ Paused — awaiting approval on {r.model_profile.model_id} (y allow · e auto-edit · t turbo · n deny)",
+                            width - 4,
+                        )
+                    )
+                )
+            else:
+                lines.append(
+                    "  "
+                    + self.s.cyan(
+                        clip_to_cols(
+                            "◈ Paused — awaiting your response below (↑↓ navigate · Enter confirm · Esc skip)",
+                            width - 4,
+                        )
+                    )
+                )
+        else:
+            live_status = self.tracker.snapshot_live_status(self._spin_tick)
+            if live_status:
+                lines.append(self.s.bold_cyan("  ") + self.s.cyan(clip_to_cols(live_status, width - 4)))
+            elif self.turn_busy.is_set():
+                spin = SPINNER_FRAMES[self._spin_tick % len(SPINNER_FRAMES)]
+                lines.append(
+                    self.s.cyan(
+                        clip_to_cols(
+                            f"  {spin} Running turn on {r.model_profile.model_id}... (Ctrl+C cancel · Enter queues next · Alt+S steers live)",
+                            width - 2,
+                        )
+                    )
+                )
 
         # 2. Queued Follow-Up Prompts & Pending Mid-Turn Steers Strip!
         with self._q_lock:
@@ -1918,8 +2039,11 @@ class VisualTuiController:
             r.total_usage.reasoning_tokens,
             sum(t.live_tokens_est() for t in self.tracker.list_threads()),
         )
+        from ush.auth.vault import format_model_display_name
+
+        disp_model = format_model_display_name(r.model_profile.model_id)
         stat = (
-            f" {self.s.bold(r.model_profile.model_id)} · {self.s.cyan(f'{think_glyph} {r.thinking_effort.value}')}(^T) "
+            f" {self.s.bold(disp_model)} · {self.s.cyan(f'{think_glyph} {r.thinking_effort.value}')}(^T) "
             f"· {mode_styled}(⇧Tab) · threads:{n_threads}(^O) "
             f"· {thought_tok:,} tok · ctx:{ctx_pct:.1f}% · `/` menu"
         )
@@ -2273,7 +2397,7 @@ class VisualTuiController:
                 self.menu = None
                 self.comp.render()
                 return
-            self.flash("Press Ctrl+D or type `/quit` to exit `ush`")
+            self.flash("Press Ctrl+D or type `/quit` to exit `crux`")
             return
 
         if k == "CTRL_D":
@@ -2594,9 +2718,18 @@ def run_visual_tui(
     prev_winch = signal.getsignal(signal.SIGWINCH)
 
     def _on_winch(_sig: int, _frm: Any) -> None:
-        ctrl.comp.render()
+        ctrl.comp.render(force=True)
 
     rt.hook_system.fire("SessionStart", {"workspace": str(rt.workspace)})
+    if rt.runner.auth_profile.api_mode == "agy_acp" or (rt.runner.auth_profile.base_url or "").startswith("agy://"):
+        from ush.auth.vault import fetch_agy_models
+
+        threading.Thread(
+            target=fetch_agy_models,
+            args=(rt.ush_home,),
+            kwargs={"timeout": 5.0},
+            daemon=True,
+        ).start()
 
     try:
         tty.setcbreak(fd)
@@ -2666,8 +2799,13 @@ def run_visual_tui(
                 for ev in evs:
                     _dispatch_safe(ev)
 
-            # Animate live thinking spinner & thread timer at ~10 FPS ONLY while turn is active!
-            if (ctrl.turn_busy.is_set() or (ctrl._flash_msg and now >= ctrl._flash_msg[1])) and (now - last_spin) >= 0.10:
+            if ctrl._flash_msg and now >= ctrl._flash_msg[1]:
+                ctrl._flash_msg = None
+                ctrl.comp.render()
+
+            # Animate live thinking spinner & thread timer at ~10 FPS ONLY while turn is actively running
+            # and NOT paused waiting on user approval / `ask_user` acceptance!
+            if ctrl.turn_busy.is_set() and not ctrl.is_awaiting_user and (now - last_spin) >= 0.10:
                 last_spin = now
                 ctrl._spin_tick += 1
                 ctrl.comp.render()

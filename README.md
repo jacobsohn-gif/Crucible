@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-v0.1-00b4d8?style=flat-square)](https://github.com/jacobsohn-gif/Crucible/releases/tag/v0.1)
 [![Dependencies](https://img.shields.io/badge/PyPI_dependencies-0_(stdlib_only)-2ec4b6?style=flat-square)](pyproject.toml)
 [![Distributions](https://img.shields.io/badge/distributions-Source_%2B_Compiled_(Mach--O_%26_.pyz)-ff9f1c?style=flat-square)](releases/v0.1/)
-[![Conformance](https://img.shields.io/badge/conformance_gates-23%2F23_passing_(CT--01..CT--23)-38b000?style=flat-square)](tests/test_conformance_ct01_to_ct20.py)
+[![Conformance](https://img.shields.io/badge/conformance_gates-28%2F28_passing_(CT--01..CT--28)-38b000?style=flat-square)](tests/test_conformance_ct01_to_ct20.py)
 [![License](https://img.shields.io/badge/license-Apache--2.0-6c757d?style=flat-square)](pyproject.toml)
 
 **Crucible (`crux`)** is a standalone, zero-third-party-dependency **interactive coding & 4-Gear Elastic Swarm CLI** with **uncompacted long-form thought tracing**, distilled from empirical architectural teardowns of **24 global coding-agent codebases**.
@@ -113,7 +113,8 @@ cd releases/v0.1 && shasum -a 256 -c SHA256SUMS.txt
 ## 4. Quickstart & Common Workflows
 
 ```bash
-# 1. Authenticate (auto-discovers ambient Vertex AI gcloud ADC, API keys, or local Ollama/vLLM)
+# 1. Authenticate (Native Antigravity Google Sign-In with zero GCP project, Vertex ADC, API keys, or local Ollama/vLLM)
+crux auth login antigravity          # Browser Google Sign-In (`cloudcode-pa` — zero GCP/Argolis project required)
 gcloud auth application-default login
 crux auth status
 crux doctor
@@ -221,7 +222,7 @@ Crucible normalizes streaming SSE wire protocols, native extended thinking block
 
 | Provider Family | Native Thinking Wire Control | Reliability & Failover Safeguards |
 | :--- | :--- | :--- |
-| **Google Vertex AI & Gemini API** (`gemini-3.1-pro-preview`, `gemini-4-argon`, `gemini-2.5-pro/flash`) | `thinkingConfig.thinkingLevel` (`LOW`/`MEDIUM`/`HIGH`) or `thinkingBudget` + `includeThoughts=true` | Automatic Vertex `global` $\leftrightarrow$ `us-central1` failover; preserves parallel tool-call `thoughtSignature` bytes (`CT-22`) |
+| **Google Antigravity, Vertex AI & Gemini API** (`gemini-3.1-pro-preview`, `gemini-3.8-flash`, `gemini-2.5-pro/flash`) | `thinkingConfig.thinkingLevel` (`LOW`/`MEDIUM`/`HIGH`) or `thinkingBudget` + `includeThoughts=true` | Automatic `cloudcode-pa` 404 model fallback & Vertex `global` $\leftrightarrow$ `us-central1` failover; preserves parallel tool-call `thoughtSignature` bytes (`CT-22`) |
 | **Anthropic Claude (Direct & Vertex)** (`claude-opus-4`, `claude-sonnet-4`) | `thinking: {type: "enabled", budget_tokens: N}` + beta header `interleaved-thinking-2025-05-14` | Preserves cryptographic thinking `signature` blocks on same-provider turns; strips cleanly on cross-provider handoff |
 | **OpenAI & Reasoning Models** (`gpt-5`, `o3`, `o4-mini`, `gpt-4.1`) | `reasoning_effort` (`low`/`medium`/`high`) + `reasoning_content` delta extraction | Automatic fallback if an endpoint rejects reasoning parameters (`HTTP 400` retry) |
 | **OpenRouter / DeepSeek / Qwen / Kimi** (`deepseek-r1`, `qwen3-coder`, `kimi-k2`) | `include_reasoning: true` + chunk-safe `<think>...</think>` `InlineThinkStreamSplitter` | Repairs malformed Tier-B XML/JSON tool calls (`CT-04`) & enforces strict single-step scratchpad protocol on 7B–32B models |
@@ -294,19 +295,26 @@ Run the complete zero-dependency test suite in `<3 seconds`:
 | **`CT-21`** | Uncompacted `.trace.jsonl` thought ledger, `<think>` chunk splitter, full-text search & Markdown export | ✅ Pass |
 | **`CT-22`** | Gemini parallel tool-call `thoughtSignature` preservation & trailing user-turn enforcement | ✅ Pass |
 | **`CT-23`** | Visual Inline-Dock TUI menus (`/`, `@`, `$`), `Ctrl+O` Thinking Threads Explorer & concurrent prompt queue | ✅ Pass |
+| **`CT-24`** | Deadlock-free live `/steer`, geometric single-cell TUI glyphs & workspace-scoped `/resume` | ✅ Pass |
+| **`CT-25`** | Strict `functionCall` $\leftrightarrow$ `functionResponse` bijection across mid-history orphan repairs | ✅ Pass |
+| **`CT-26`** | Turn FSM rollback safety, strict role alternation, compaction & streaming loop guards | ✅ Pass |
+| **`CT-27`** | Antigravity ACP dynamic models, Gemini Enterprise, Claude, OpenAI `/v1/responses`, LiteLLM & 429 recovery | ✅ Pass |
+| **`CT-28`** | Zero-spam interactive tool approval dock deduplication & parallel `RwLock` prompt serialization | ✅ Pass |
 
 ---
 
 ## 11. Codebase Map & Architecture Specifications
 
-### Source Modules (`29` Files, `0` External Dependencies)
-- **CLI, Visual Inline-Dock TUI & ACP Server (`src/ush/cli/`)**
+### Source Modules (`31` Files, `0` External Dependencies)
+- **CLI, Visual Inline-Dock TUI, Markdown/LaTeX Renderer & ACP Server (`src/ush/cli/`)**
   - [`bin/crux`](bin/crux) & [`pyproject.toml`](pyproject.toml) — Symlink-safe source launcher & PEP 621 package config.
   - [`src/ush/cli/tui.py`](src/ush/cli/tui.py) — Visual Inline-Dock TUI (`InlineDockCompositor`, `VisualTuiController`, `ThinkingThreadTracker`, `MenuOverlay`, DEC `?2026h` sync output, `Ctrl+O` Threads Explorer, Concurrent Prompt Queue).
+  - [`src/ush/cli/markdown.py`](src/ush/cli/markdown.py) — Zero-dependency streaming & block Terminal Markdown, GFM box-table, syntax-highlighting, and font-verified LaTeX/Unicode math renderer.
   - [`src/ush/cli/main.py`](src/ush/cli/main.py) — CLI entrypoint, slash command handlers, headless `-p` runner, `crux trace`, `crux auth`, `crux swarm`, and `crux doctor`.
   - [`src/ush/cli/acp_server.py`](src/ush/cli/acp_server.py) — Loopback-guarded (`127.0.0.1`) & `stdio` JSON-RPC 2.0 Agent Client Protocol (ACP) server.
 - **Universal Model Brain & Long-Form Thought Ledger (`src/ush/brain/`)**
-  - [`src/ush/brain/providers.py`](src/ush/brain/providers.py) — Native extended/interleaved thinking SSE clients for Vertex/Gemini, Claude, OpenAI, OpenRouter, and local endpoints.
+  - [`src/ush/brain/providers.py`](src/ush/brain/providers.py) — Native extended/interleaved thinking SSE clients for Antigravity, Vertex/Gemini, Claude, OpenAI, OpenRouter, and local endpoints.
+  - [`src/ush/brain/agy_acp.py`](src/ush/brain/agy_acp.py) — Native Antigravity ACP (`agy acp`) JSON-RPC 2.0 runtime model discovery & bidirectional tool-bridged inference transport.
   - [`src/ush/brain/wire.py`](src/ush/brain/wire.py) — 8-rule `transform_messages` cross-provider normalizer & `ToolIdBijectionMap`.
   - [`src/ush/brain/trace.py`](src/ush/brain/trace.py) — Append-only `0600` secret-redacted `ThoughtTraceLedger` (`.trace.jsonl`), landmark extractor, full-text search, and Markdown notebook exporter.
   - [`src/ush/brain/context_dag.py`](src/ush/brain/context_dag.py) — Branching `SessionDAG`, `LCA` rewind, observation masking, `0.85` compaction, and `PopperianLoopGuard`.

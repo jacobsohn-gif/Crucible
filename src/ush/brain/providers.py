@@ -27,7 +27,7 @@ from types import ModuleType
 from typing import Any, Callable, Iterator, Protocol
 import urllib.parse
 
-from ush.auth.vault import AuthProfile, CredentialVault, secure_ssl_context
+from ush.auth.vault import AuthProfile, CredentialVault, secure_ssl_context, setup_code_assist_user
 from ush.brain.wire import (
     ToolIdBijectionMap,
     extract_fallback_tool_calls,
@@ -297,7 +297,12 @@ def build_gemini_thinking_config(
         return None
 
     is_gen3_plus = any(low.startswith(p) for p in ("gemini-3", "gemini-4")) or "argon" in low
+    is_gen25 = low.startswith("gemini-2.5")
     is_flash_or_lite = "flash" in low or "lite" in low
+
+    # Custom non-`gemini-*` aliases on Gemini / Code Assist use `chat-base` (`includeThoughts` only)
+    if not is_gen3_plus and not is_gen25:
+        return {"includeThoughts": effort != ThinkingEffort.OFF}
 
     if effort == ThinkingEffort.OFF:
         if is_gen3_plus:
@@ -1278,7 +1283,7 @@ class HttpProviderTransport:
     def _resolve_code_assist_project(
         self, auth: AuthProfile, base_clean: str, api_ver: str, token: str
     ) -> str:
-        """Resolves `cloudaicompanionProject` via `v1internal:loadCodeAssist` when `project_id` is unset."""
+        """Resolves or provisions `cloudaicompanionProject` via `:loadCodeAssist` / `:onboardUser` when `project_id` is unset."""
         if auth.project_id:
             return auth.project_id
         cache_key = (auth.name, base_clean)
@@ -1286,59 +1291,25 @@ class HttpProviderTransport:
             if cache_key in self._code_assist_projects:
                 return self._code_assist_projects[cache_key]
 
-        url = f"{base_clean}/{api_ver}:loadCodeAssist"
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port
-        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        body = canonical_json(
-            {
-                "metadata": {
-                    "ideType": "IDE_UNSPECIFIED",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                }
-            }
-        ).encode("utf-8")
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "crux-cli/0.1",
-            **dict(auth.extra_headers or {}),
-        }
-        if auth.auth_kind == "api_key":
-            headers["x-goog-api-key"] = token
-        elif token:
-            headers["Authorization"] = f"Bearer {token}"
+        extra_hdrs = dict(auth.extra_headers or {})
+        bearer_tok = token
+        if auth.auth_kind == "api_key" and token:
+            extra_hdrs["x-goog-api-key"] = token
+            bearer_tok = ""
 
         resolved_proj = ""
-        conn: http.client.HTTPConnection | None = None
-        resp: http.client.HTTPResponse | None = None
         try:
-            if parsed.scheme == "https":
-                conn = http.client.HTTPSConnection(
-                    host, port or 443, context=secure_ssl_context(), timeout=min(15.0, self.timeout_seconds)
-                )
-            else:
-                conn = http.client.HTTPConnection(host, port or 80, timeout=min(15.0, self.timeout_seconds))
-            conn.request("POST", path, body=body, headers=headers)
-            resp = conn.getresponse()
-            raw_bytes = resp.read(65_536)
-            if 200 <= resp.status < 300 and raw_bytes:
-                data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-                if isinstance(data, dict):
-                    cp = data.get("cloudaicompanionProject")
-                    if isinstance(cp, str):
-                        resolved_proj = cp.strip()
-                    elif isinstance(cp, dict):
-                        resolved_proj = str(cp.get("id") or "").strip()
-        except (http.client.HTTPException, OSError, json.JSONDecodeError, ValueError):
+            setup_res = setup_code_assist_user(
+                bearer_tok,
+                base_url=base_clean,
+                api_version=api_ver,
+                explicit_project_id=None,
+                extra_headers=extra_hdrs,
+                timeout=min(15.0, self.timeout_seconds),
+            )
+            resolved_proj = setup_res.project_id
+        except (OSError, ValueError):
             resolved_proj = ""
-        finally:
-            if resp is not None:
-                resp.close()
-            if conn is not None:
-                conn.close()
 
         with self._ca_lock:
             self._code_assist_projects[cache_key] = resolved_proj
@@ -1393,7 +1364,25 @@ class HttpProviderTransport:
         tools: list[dict[str, Any]],
         session_id: str,
         on_event: Callable[[StreamEvent], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> CanonicalMessage:
+        if auth_profile.api_mode == "agy_acp" or (auth_profile.base_url or "").startswith("agy://"):
+            from ush.brain.agy_acp import get_shared_agy_bridge
+
+            bridge = get_shared_agy_bridge(self.vault.ush_home)
+            return bridge.stream_turn(
+                profile=profile,
+                provider_name=auth_profile.provider,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tools,
+                session_id=session_id,
+                thinking_effort=self.thinking_effort,
+                on_event=on_event,
+                cancel_event=cancel_event,
+                timeout=self.timeout_seconds,
+            )
+
         token = self.vault.resolve_bearer_or_key(auth_profile)
         prov = auth_profile.provider
 
@@ -1504,10 +1493,12 @@ class HttpProviderTransport:
             service_tier=svc_tier if not is_code_assist else "",
         )
 
+        active_profile = profile
+
         def _open_gemini_req(body_payload: dict[str, Any]) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
             headers: dict[str, str] = dict(auth.extra_headers or {})
 
-            # 1. Gemini Enterprise Code Assist (`cloudcode-pa` `v1internal:streamGenerateContent?alt=sse`)
+            # 1. Gemini Enterprise / Antigravity Code Assist (`cloudcode-pa` `v1internal:streamGenerateContent?alt=sse`)
             if is_code_assist:
                 api_ver = os.environ.get("CODE_ASSIST_API_VERSION", "v1internal").strip("/")
                 ca_proj = auth.project_id or self._resolve_code_assist_project(auth, base_clean, api_ver, token)
@@ -1518,12 +1509,14 @@ class HttpProviderTransport:
                     headers["Authorization"] = f"Bearer {token}"
                 req_inner = {**body_payload, "session_id": session_id} if session_id else body_payload
                 ca_envelope: dict[str, Any] = {
-                    "model": profile.model_id,
+                    "model": active_profile.model_id,
                     "user_prompt_id": new_id("prompt"),
                     "request": req_inner,
                 }
                 if ca_proj:
                     ca_envelope["project"] = ca_proj
+                if auth.service_tier == "google_one_credits" or os.environ.get("USH_ENABLE_GOOGLE_ONE_CREDITS") == "1":
+                    ca_envelope["enabled_credit_types"] = ["GOOGLE_ONE_AI"]
                 return self._open_sse(url, headers, ca_envelope)
 
             # 2. Gemini Enterprise / Vertex Express Mode (API key without project/location)
@@ -1602,12 +1595,35 @@ class HttpProviderTransport:
             conn, resp = _open_gemini_req(payload)
         except WireError as exc:
             low_d = exc.detail.lower()
-            if exc.status == 400 and ("thinking" in low_d or "servicetier" in low_d or "service_tier" in low_d):
+            fb_mid = (auth.default_model or "gemini-3.1-pro-preview").strip()
+            if is_code_assist and exc.status == 404 and fb_mid and fb_mid != active_profile.model_id:
+                from ush.brain.model_tiers import resolve_model_profile
+
+                active_profile = resolve_model_profile(fb_mid, auth.provider)
+                if on_event:
+                    on_event(
+                        StreamEvent(
+                            kind="cognitive_event",
+                            text=f"Model `{profile.model_id}` is not available on `{base_clean}` (HTTP 404) — falling back to `{fb_mid}`",
+                            meta={"event": "model_fallback", "from": profile.model_id, "to": fb_mid},
+                        )
+                    )
+                fb_payload = build_gemini_payload(
+                    system_prompt,
+                    messages,
+                    tools,
+                    active_profile,
+                    thinking_effort=self.thinking_effort,
+                    is_vertex=is_vertex_wire,
+                    service_tier="",
+                )
+                conn, resp = _open_gemini_req(fb_payload)
+            elif exc.status == 400 and ("thinking" in low_d or "servicetier" in low_d or "service_tier" in low_d):
                 fallback_payload = build_gemini_payload(
                     system_prompt,
                     messages,
                     tools,
-                    profile,
+                    active_profile,
                     enable_thinking_config=("thinking" not in low_d),
                     is_vertex=is_vertex_wire,
                     service_tier="",
@@ -1747,7 +1763,7 @@ class HttpProviderTransport:
             role="assistant",
             parts=assembled,
             producer_provider=auth.provider,
-            producer_model_id=profile.model_id,
+            producer_model_id=active_profile.model_id,
             stop_reason=stop_reason,
             usage=usage,
         )
@@ -2497,15 +2513,18 @@ class UniversalModelClient:
                 history, eff_profile, id_map=id_map, strip_all_signatures=strip_sigs
             )
             try:
-                msg = self.transport.stream_turn(
-                    profile=eff_profile,
-                    auth_profile=cur_auth,
-                    system_prompt=system_prompt,
-                    messages=wire_msgs,
-                    tools=tools,
-                    session_id=session_id,
-                    on_event=on_event,
-                )
+                turn_kwargs: dict[str, Any] = {
+                    "profile": eff_profile,
+                    "auth_profile": cur_auth,
+                    "system_prompt": system_prompt,
+                    "messages": wire_msgs,
+                    "tools": tools,
+                    "session_id": session_id,
+                    "on_event": on_event,
+                }
+                if "cancel_event" in inspect.signature(self.transport.stream_turn).parameters:
+                    turn_kwargs["cancel_event"] = cancel_event
+                msg = self.transport.stream_turn(**turn_kwargs)
             except WireError as exc:
                 last_exc = exc
                 low_err = exc.detail.lower()

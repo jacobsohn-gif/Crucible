@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import secrets
 import shlex
 import shutil
@@ -148,6 +149,11 @@ class AuthProfile:
     cooldown_until: float = 0.0
 
     def is_available_on_host(self) -> bool:
+        if self.api_mode == "agy_acp" or (self.base_url or "").startswith("agy://"):
+            from ush.brain.agy_acp import resolve_agy_binary
+
+            if not resolve_agy_binary():
+                return False
         if not self.require_host_path:
             return True
         try:
@@ -566,6 +572,23 @@ class CredentialVault:
                     auth_kind="none",
                     base_url=self._resolve_env_base_url("litellm", "http://127.0.0.1:4000/v1"),
                     source="env:LITELLM_BASE_URL",
+                ),
+            )
+
+        # 1b. Sanctioned local Antigravity CLI (`agy acp` — zero GCP/Argolis project, zero scraped tokens)
+        from ush.brain.agy_acp import resolve_agy_binary
+
+        if resolve_agy_binary():
+            self._profiles.setdefault(
+                "agy-antigravity",
+                AuthProfile(
+                    name="agy-antigravity",
+                    provider="antigravity",
+                    auth_kind="none",
+                    base_url="agy://acp",
+                    default_model="gemini-4-argon",
+                    source="agy_cli",
+                    api_mode="agy_acp",
                 ),
             )
 
@@ -1066,13 +1089,12 @@ class CredentialVault:
         secret = ambient or self.load_secret(profile.name)
         if not secret:
             raise RuntimeError(f"Missing stored credentials for profile '{profile.name}'. Run `crux auth login`.")
-        # Auto-refresh OAuth token 5 minutes prior to expiry
+        # Auto-refresh OAuth token 5 minutes prior to expiry (or when only a refresh_token is cached)
         if (
             profile.auth_kind == "oauth"
             and secret.refresh_token
             and secret.token_url
-            and secret.expires_at > 0
-            and time.time() >= (secret.expires_at - 300)
+            and (not secret.access_token or secret.expires_at <= 0 or time.time() >= (secret.expires_at - 300))
         ):
             secret = self._refresh_oauth_token(profile.name, secret, persist=(ambient is None))
             if ambient is not None:
@@ -1296,57 +1318,81 @@ def run_oauth_pkce_login(
     scopes: list[str],
     base_url: str,
     no_browser: bool = False,
+    client_secret: str = "",
+    extra_authorize_params: dict[str, str] | None = None,
+    redirect_path: str = "/oauth/callback",
+    no_browser_redirect_uri: str = "",
+    api_mode: str = "",
+    project_id: str | None = None,
+    default_model: str | None = None,
 ) -> AuthProfile:
     """Runs OAuth 2.0 Authorization Code + PKCE bound strictly to 127.0.0.1."""
     verifier, challenge = generate_pkce_pair()
     expected_state = secrets.token_urlsafe(24)
     received: dict[str, str] = {}
+    clean_redirect_path = redirect_path if redirect_path.startswith("/") else f"/{redirect_path}"
 
     class _CallbackHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != clean_redirect_path:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", "default-src 'none'")
+                self.end_headers()
+                self.wfile.write(b"Not Found")
+                return
             qs = urllib.parse.parse_qs(parsed.query)
             received["code"] = (qs.get("code") or [""])[0]
             received["state"] = (qs.get("state") or [""])[0]
             received["error"] = (qs.get("error") or [""])[0]
+            received["done"] = "1"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+            self.send_header("Content-Security-Policy", "default-src 'none'")
             self.end_headers()
             self.wfile.write(
-                b"<!doctype html><html><body><h2>USH Authentication Complete</h2>"
+                b"<!doctype html><html><body><h2>Crucible (crux) Authentication Complete</h2>"
                 b"<p>You may close this tab and return to your terminal.</p></body></html>"
             )
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return  # Never log query params containing auth codes
 
-    # Strictly bind 127.0.0.1 (never 0.0.0.0)
-    server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
-    port = server.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}/oauth/callback"
-
-    query = urllib.parse.urlencode(
-        {
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "scope": " ".join(scopes),
-            "state": expected_state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        }
-    )
-    full_auth_url = f"{authorize_url}?{query}"
-
     is_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
-    if no_browser or is_ssh:
-        server.server_close()
+    use_manual = bool(no_browser or is_ssh or os.environ.get("NO_BROWSER") in ("1", "true", "TRUE"))
+
+    server: HTTPServer | None = None
+    if use_manual and no_browser_redirect_uri:
+        redirect_uri = no_browser_redirect_uri
+    else:
+        # Strictly bind 127.0.0.1 (never 0.0.0.0)
+        server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        port = server.server_address[1]
+        redirect_uri = f"http://127.0.0.1:{port}{clean_redirect_path}"
+
+    auth_params: dict[str, str] = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(scopes),
+        "state": expected_state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if extra_authorize_params:
+        auth_params.update(extra_authorize_params)
+    full_auth_url = f"{authorize_url}?{urllib.parse.urlencode(auth_params)}"
+
+    if use_manual:
+        if server is not None:
+            server.server_close()
         print(f"\nOpen this URL in any browser:\n  {full_auth_url}\n")
-        pasted = input("Paste the final redirected callback URL (or authorization code): ").strip()
+        pasted = input("Paste the authorization code (or final redirected callback URL): ").strip()
         if pasted.startswith("http"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
             code = (qs.get("code") or [""])[0]
@@ -1356,11 +1402,14 @@ def run_oauth_pkce_login(
         else:
             code = pasted
     else:
+        assert server is not None
         print(f"Opening browser for OAuth PKCE sign-in (fallback URL: {full_auth_url})...")
         webbrowser.open(full_auth_url)
-        server.timeout = 180
+        deadline = time.monotonic() + 180.0
         try:
-            server.handle_request()
+            while "done" not in received and time.monotonic() < deadline:
+                server.timeout = max(0.5, min(5.0, deadline - time.monotonic()))
+                server.handle_request()
         finally:
             server.server_close()
         if received.get("error"):
@@ -1372,15 +1421,16 @@ def run_oauth_pkce_login(
     if not code:
         raise RuntimeError("No authorization code received.")
 
-    token_body = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "code_verifier": verifier,
-        }
-    ).encode("utf-8")
+    token_params: dict[str, str] = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    }
+    if client_secret:
+        token_params["client_secret"] = client_secret
+    token_body = urllib.parse.urlencode(token_params).encode("utf-8")
     req = urllib.request.Request(
         token_url,
         data=token_body,
@@ -1397,6 +1447,7 @@ def run_oauth_pkce_login(
             refresh_token=str(tok.get("refresh_token", "")),
             expires_at=time.time() + float(tok.get("expires_in", 3600)),
             client_id=client_id,
+            client_secret=client_secret,
             token_url=token_url,
         ),
     )
@@ -1404,11 +1455,385 @@ def run_oauth_pkce_login(
         name=profile_name,
         provider=provider,
         auth_kind="oauth",
-        base_url=base_url,
+        base_url=base_url.rstrip("/"),
+        project_id=project_id,
+        default_model=default_model,
         source=src,
+        api_mode=api_mode,
     )
     vault._profiles[profile_name] = prof
     vault.switch_profile(profile_name)
+    return prof
+
+
+GOOGLE_OAUTH_CLIENT_VAULT_KEY = "__google_oauth_client__"
+GOOGLE_CODE_ASSIST_SCOPES: list[str] = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+
+@dataclass
+class CodeAssistUserSetup:
+    """Result of Code Assist `:loadCodeAssist` / `:onboardUser` tier & companion-project provisioning."""
+
+    project_id: str = ""
+    tier_id: str = ""
+    tier_name: str = ""
+    has_paid_tier: bool = False
+    google_one_credits: int = 0
+    ineligible_reasons: list[str] = field(default_factory=list)
+    validation_url: str = ""
+    project_id_required: bool = False
+
+
+def resolve_google_oauth_client_credentials(vault: CredentialVault) -> tuple[str, str]:
+    """Resolves Desktop OAuth `(client_id, client_secret)` without hardcoding credentials in source.
+
+    Checks in priority order:
+    1. `USH_GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_ID` (+ `_SECRET`) environment variables.
+    2. OS Keychain / `0600` vault entry `__google_oauth_client__`.
+    3. Trusted `0600` `~/.ush/workstation.json` (`{"google_oauth": {"client_id": ..., "client_secret": ...}}`).
+    4. Locally installed Apache-2.0 `@google/gemini-cli` (`gemini` in `PATH`) if present on the machine.
+    """
+    cid = (
+        os.environ.get("USH_GOOGLE_OAUTH_CLIENT_ID")
+        or os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+        or ""
+    ).strip()
+    csec = (
+        os.environ.get("USH_GOOGLE_OAUTH_CLIENT_SECRET")
+        or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+        or ""
+    ).strip()
+    if cid:
+        return cid, csec
+
+    stored = vault.load_secret(GOOGLE_OAUTH_CLIENT_VAULT_KEY)
+    if stored and stored.client_id:
+        return stored.client_id.strip(), stored.client_secret.strip()
+
+    if is_trusted_host_local_file(vault.workstation_path):
+        try:
+            ws = json.loads(vault.workstation_path.read_text(encoding="utf-8"))
+            goauth = ws.get("google_oauth") if isinstance(ws, dict) else None
+            if isinstance(goauth, dict) and goauth.get("client_id"):
+                return str(goauth["client_id"]).strip(), str(goauth.get("client_secret") or "").strip()
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    gemini_bin = shutil.which("gemini")
+    if gemini_bin:
+        try:
+            real_bin = pathlib.Path(gemini_bin).resolve()
+            candidates: list[pathlib.Path] = []
+            for anc in list(real_bin.parents)[:5]:
+                candidates.append(
+                    anc / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js"
+                )
+                candidates.append(
+                    anc / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js"
+                )
+            for js_path in candidates:
+                if js_path.is_file():
+                    src = js_path.read_text(encoding="utf-8", errors="replace")
+                    m_id = re.search(r"OAUTH_CLIENT_ID\s*=\s*['\"]([^'\"]+\.apps\.googleusercontent\.com)['\"]", src)
+                    m_sec = re.search(r"OAUTH_CLIENT_SECRET\s*=\s*['\"]([^'\"]+)['\"]", src)
+                    if m_id:
+                        return m_id.group(1).strip(), (m_sec.group(1).strip() if m_sec else "")
+        except OSError:
+            pass
+
+    return "", ""
+
+
+def fetch_google_userinfo_email(access_token: str, timeout: float = 5.0) -> str:
+    """Fetches the authenticated Google account email from `userinfo` (non-fatal on error)."""
+    if not access_token:
+        return ""
+    req = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, context=secure_ssl_context(), timeout=timeout) as resp:
+            data = json.loads(resp.read(32_768).decode("utf-8", errors="replace"))
+        return str(data.get("email") or "").strip() if isinstance(data, dict) else ""
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return ""
+
+
+def _extract_companion_project_id(raw_val: Any) -> str:
+    if isinstance(raw_val, str):
+        return raw_val.strip()
+    if isinstance(raw_val, dict):
+        return str(raw_val.get("id") or "").strip()
+    return ""
+
+
+def _sum_google_one_credits(tier_obj: dict[str, Any] | None) -> int:
+    if not isinstance(tier_obj, dict):
+        return 0
+    total = 0
+    for item in tier_obj.get("availableCredits") or []:
+        if isinstance(item, dict) and item.get("creditType") == "GOOGLE_ONE_AI":
+            try:
+                total += int(item.get("creditAmount") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def setup_code_assist_user(
+    access_token: str,
+    *,
+    base_url: str = "https://cloudcode-pa.googleapis.com",
+    api_version: str = "v1internal",
+    explicit_project_id: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+    poll_interval_seconds: float = 2.0,
+    max_poll_attempts: int = 20,
+    sleep_fn: Any = time.sleep,
+) -> CodeAssistUserSetup:
+    """Provisions or resolves a Google-managed `cloudaicompanionProject` and tier (`Free` / `Pro` / `Ultra` / `Standard`).
+
+    Implements the Code Assist `:loadCodeAssist` + `:onboardUser` + LRO polling handshake without requiring a user GCP project
+    for eligible individual / Google AI Pro / Google AI Ultra accounts.
+    """
+    base_clean = base_url.rstrip("/")
+    ver_clean = api_version.strip("/") or "v1internal"
+    proj_in = (explicit_project_id or "").strip() or None
+    if proj_in and proj_in.isdigit():
+        raise ValueError(
+            f"Invalid numeric Google Cloud Project ID '{proj_in}': provide the string Project ID, not project number."
+        )
+
+    core_meta: dict[str, Any] = {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    }
+    load_meta = {**core_meta, "duetProject": proj_in} if proj_in else dict(core_meta)
+    load_payload: dict[str, Any] = {"metadata": load_meta}
+    if proj_in:
+        load_payload["cloudaicompanionProject"] = proj_in
+
+    hdrs: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "crux-cli/0.1",
+        **dict(extra_headers or {}),
+    }
+    if access_token:
+        hdrs["Authorization"] = f"Bearer {access_token}"
+
+    ctx = secure_ssl_context() if base_clean.startswith("https://") else None
+
+    def _post_json(method_name: str, body_dict: dict[str, Any]) -> dict[str, Any]:
+        req = urllib.request.Request(
+            f"{base_clean}/{ver_clean}:{method_name}",
+            data=json.dumps(body_dict).encode("utf-8"),
+            headers=hdrs,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            raw = resp.read(131_072)
+        parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _get_operation(op_name: str) -> dict[str, Any]:
+        clean_op = op_name.lstrip("/")
+        if not clean_op or ".." in clean_op or not re.fullmatch(r"[A-Za-z0-9_./-]+", clean_op):
+            raise ValueError(f"Refused malformed Code Assist operation name: {op_name!r}")
+        req = urllib.request.Request(
+            f"{base_clean}/{ver_clean}/{clean_op}",
+            headers=hdrs,
+            method="GET",
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            raw = resp.read(131_072)
+        parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    load_res = _post_json("loadCodeAssist", load_payload)
+
+    ineligible_list = [x for x in (load_res.get("ineligibleTiers") or []) if isinstance(x, dict)]
+    reasons = [
+        f"{it.get('tierId') or it.get('tierName') or 'tier'}: {it.get('reasonCode') or ''} {it.get('reasonMessage') or ''}".strip()
+        for it in ineligible_list
+        if it.get("reasonMessage") or it.get("reasonCode")
+    ]
+    val_tier = next(
+        (
+            it
+            for it in ineligible_list
+            if it.get("reasonCode") == "VALIDATION_REQUIRED" and it.get("validationUrl")
+        ),
+        None,
+    )
+    validation_url = str(val_tier.get("validationUrl") or "").strip() if val_tier else ""
+
+    current_tier = load_res.get("currentTier") if isinstance(load_res.get("currentTier"), dict) else None
+    paid_tier = load_res.get("paidTier") if isinstance(load_res.get("paidTier"), dict) else None
+    direct_companion = _extract_companion_project_id(load_res.get("cloudaicompanionProject"))
+    allowed = [t for t in (load_res.get("allowedTiers") or []) if isinstance(t, dict)]
+
+    # Return immediately only when `currentTier` is already active (or when minimal server response omits `allowedTiers`)
+    if current_tier is not None or (direct_companion and not allowed):
+        companion_proj = direct_companion or (proj_in or "")
+        tier_id = str((paid_tier or {}).get("id") or (current_tier or {}).get("id") or "standard-tier")
+        tier_name = str((paid_tier or {}).get("name") or (current_tier or {}).get("name") or tier_id)
+        credits = _sum_google_one_credits(paid_tier) or _sum_google_one_credits(current_tier)
+        return CodeAssistUserSetup(
+            project_id=companion_proj,
+            tier_id=tier_id,
+            tier_name=tier_name,
+            has_paid_tier=paid_tier is not None,
+            google_one_credits=credits,
+            ineligible_reasons=reasons,
+            validation_url=validation_url,
+            project_id_required=not bool(companion_proj),
+        )
+
+    if validation_url:
+        return CodeAssistUserSetup(
+            ineligible_reasons=reasons,
+            validation_url=validation_url,
+            project_id_required=True,
+        )
+
+    chosen_tier = next((t for t in allowed if t.get("isDefault")), None) or (
+        allowed[0] if allowed else {"id": "legacy-tier", "userDefinedCloudaicompanionProject": True}
+    )
+    tier_id = str(chosen_tier.get("id") or "standard-tier")
+    tier_name = str(chosen_tier.get("name") or (paid_tier or {}).get("name") or tier_id)
+
+    # Managed/free tiers forbid passing `cloudaicompanionProject` in `:onboardUser` (`Precondition Failed`),
+    # whereas standard/managed-org tiers with a companion or explicit project MUST pass `onboard_proj` to activate the license.
+    onboard_proj = proj_in or direct_companion or None
+    user_defined_proj = bool(chosen_tier.get("userDefinedCloudaicompanionProject")) or bool(direct_companion)
+    onboard_body: dict[str, Any] = {"tierId": tier_id}
+    if tier_id != "free-tier" and onboard_proj and user_defined_proj:
+        onboard_body["cloudaicompanionProject"] = onboard_proj
+        onboard_body["metadata"] = {**core_meta, "duetProject": onboard_proj}
+    else:
+        onboard_body["metadata"] = dict(core_meta)
+
+    lro = _post_json("onboardUser", onboard_body)
+    attempts = 0
+    while not lro.get("done") and lro.get("name") and attempts < max_poll_attempts:
+        sleep_fn(poll_interval_seconds)
+        lro = _get_operation(str(lro["name"]))
+        attempts += 1
+
+    resp_obj = lro.get("response") if isinstance(lro.get("response"), dict) else {}
+    provisioned_proj = _extract_companion_project_id(resp_obj.get("cloudaicompanionProject")) or (onboard_proj or "")
+    credits = _sum_google_one_credits(paid_tier) or _sum_google_one_credits(chosen_tier)
+    return CodeAssistUserSetup(
+        project_id=provisioned_proj,
+        tier_id=str((paid_tier or {}).get("id") or tier_id),
+        tier_name=str((paid_tier or {}).get("name") or tier_name),
+        has_paid_tier=paid_tier is not None,
+        google_one_credits=credits,
+        ineligible_reasons=reasons,
+        validation_url=validation_url,
+        project_id_required=not bool(provisioned_proj),
+    )
+
+
+def login_google_code_assist_oauth(
+    vault: CredentialVault,
+    *,
+    profile_name: str = "antigravity",
+    provider: str = "antigravity",
+    base_url: str = "https://cloudcode-pa.googleapis.com",
+    default_model: str = "gemini-3.1-pro-preview",
+    explicit_project_id: str | None = None,
+    no_browser: bool = False,
+) -> AuthProfile:
+    """Browser OAuth PKCE login for Antigravity / Google AI Pro & Ultra (`cloudcode-pa`, zero GCP project required)."""
+    client_id, client_secret = resolve_google_oauth_client_credentials(vault)
+    if not client_id:
+        print(
+            "\nConfigure Desktop OAuth Client for Google OAuth (`cloudcode-pa.googleapis.com`).\n"
+            "Tip: set `USH_GOOGLE_OAUTH_CLIENT_ID` / `USH_GOOGLE_OAUTH_CLIENT_SECRET`, install `@google/gemini-cli`,\n"
+            "or enter a Google Desktop App OAuth Client ID once (stored encrypted in your OS Keychain)."
+        )
+        client_id = input("Google Desktop OAuth Client ID: ").strip()
+        if not client_id:
+            raise ValueError("Google OAuth Client ID is required for Google OAuth login.")
+        client_secret = getpass.getpass("Google Desktop OAuth Client Secret (optional if PKCE-only): ").strip()
+        vault.store_secret(
+            GOOGLE_OAUTH_CLIENT_VAULT_KEY,
+            StoredSecret(client_id=client_id, client_secret=client_secret),
+        )
+
+    prof = run_oauth_pkce_login(
+        vault,
+        profile_name=profile_name,
+        provider=provider,
+        authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=GOOGLE_CODE_ASSIST_SCOPES,
+        base_url=base_url,
+        no_browser=no_browser,
+        extra_authorize_params={"access_type": "offline", "prompt": "consent"},
+        redirect_path="/oauth2callback",
+        no_browser_redirect_uri="https://codeassist.google.com/authcode",
+        api_mode="code_assist",
+        project_id=(explicit_project_id or "").strip() or None,
+        default_model=default_model,
+    )
+
+    tok = vault.resolve_bearer_or_key(prof)
+    email = fetch_google_userinfo_email(tok)
+    if email:
+        print(f"Signed into Google OAuth as `{email}`.")
+
+    setup = setup_code_assist_user(
+        tok,
+        base_url=base_url,
+        explicit_project_id=prof.project_id,
+    )
+    if setup.validation_url and sys.stdin.isatty():
+        print(f"\nAccount verification required: {setup.validation_url}")
+        if setup.ineligible_reasons:
+            print(f"  Details: {'; '.join(setup.ineligible_reasons)}")
+        input("Complete verification in your browser and press Enter to retry (or Ctrl-C to cancel)...")
+        setup = setup_code_assist_user(tok, base_url=base_url, explicit_project_id=prof.project_id)
+
+    if setup.project_id_required and not setup.project_id:
+        reason_str = "; ".join(setup.ineligible_reasons) or "Account requires an explicit GOOGLE_CLOUD_PROJECT."
+        print(
+            f"\nNote: `{email or 'This Google account'}` did not receive a Google-managed companion project "
+            f"({reason_str}).\n"
+            "  • Personal `@gmail.com` accounts with Google AI Ultra / Pro / Free receive a managed project automatically.\n"
+            "  • Corporate Workspace / `@google.com` (`DASHER_USER`) accounts require either an admin-assigned companion\n"
+            "    project or an explicit GCP Project ID."
+        )
+        if sys.stdin.isatty():
+            fallback_proj = input(
+                "Optional GCP Project ID for this corp account (or press Enter to leave unset / switch account): "
+            ).strip()
+            if fallback_proj:
+                setup = setup_code_assist_user(tok, base_url=base_url, explicit_project_id=fallback_proj)
+
+    if setup.project_id:
+        prof.project_id = setup.project_id
+        vault._profiles[prof.name] = prof
+        vault._save_profiles()
+        credits_note = f" • Google One AI Credits: {setup.google_one_credits}" if setup.google_one_credits else ""
+        label = "Antigravity" if provider == "antigravity" else provider
+        print(
+            f"{label} ready — Tier: `{setup.tier_name or setup.tier_id}` "
+            f"• Companion Project: `{setup.project_id}`{credits_note}"
+        )
+
     return prof
 
 
@@ -1546,11 +1971,568 @@ def fetch_openai_compat_models(
     return sorted(dict.fromkeys(out))
 
 
-def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = None) -> AuthProfile:
-    """Interactive terminal login wizard supporting Gemini Enterprise, Antigravity, Claude, OpenAI, LiteLLM, GCP ADC & local."""
+def fetch_code_assist_quota_models(
+    base_url: str = "https://cloudcode-pa.googleapis.com",
+    *,
+    project_id: str = "",
+    token: str = "",
+    api_version: str = "v1internal",
+    timeout: float = 1.2,
+) -> list[tuple[str, float | None]]:
+    """Queries `POST /{api_version}:retrieveUserQuota` on `cloudcode-pa` to discover live models & remaining quota."""
+    if not token or not project_id:
+        return []
+    url = f"{base_url.rstrip('/')}/{api_version.strip('/')}:retrieveUserQuota"
+    hdrs = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "crux-cli/0.1",
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"project": project_id}).encode("utf-8"),
+        headers=hdrs,
+        method="POST",
+    )
+    try:
+        ctx = secure_ssl_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            payload = json.loads(resp.read(131_072).decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    buckets = payload.get("buckets") if isinstance(payload, dict) else None
+    if not isinstance(buckets, list):
+        return []
+    found: dict[str, float | None] = {}
+    for b in buckets:
+        if not isinstance(b, dict):
+            continue
+        mid = str(b.get("modelId") or "").strip()
+        if not mid or mid == "none":
+            continue
+        # Only auto-surface active Gemini/Gemma buckets (or buckets carrying an active quota reset window)
+        if not (mid.startswith(("gemini-", "gemma-")) and b.get("resetTime")):
+            continue
+        frac_raw = b.get("remainingFraction")
+        frac = float(frac_raw) if isinstance(frac_raw, (int, float)) else None
+        if mid not in found or (frac is not None and (found[mid] is None or frac < found[mid])):  # type: ignore[operator]
+            found[mid] = frac
+
+    priority = {
+        "gemini-3.1-pro-preview": 0,
+        "gemini-3.8-flash": 1,
+        "gemini-3.5-flash": 2,
+        "gemini-3-pro-preview": 3,
+        "gemini-3-flash-preview": 4,
+        "gemini-3-flash": 5,
+        "gemini-2.5-pro": 6,
+        "gemini-2.5-flash": 7,
+    }
+    return sorted(found.items(), key=lambda kv: (priority.get(kv[0], 50), kv[0]))
+
+
+def fetch_gemini_api_models(
+    base_url: str = "https://generativelanguage.googleapis.com",
+    *,
+    token: str = "",
+    auth_kind: str = "api_key",
+    timeout: float = 1.2,
+) -> list[str]:
+    """Queries `GET {base_url}/v1beta/models` to discover available Gemini models without provider labels."""
+    if not token:
+        return []
+    url = f"{base_url.rstrip('/')}/v1beta/models?pageSize=100"
+    hdrs = {"Accept": "application/json", "User-Agent": "crux-cli/0.1"}
+    if auth_kind in ("bearer", "oauth", "gcloud_adc"):
+        hdrs["Authorization"] = f"Bearer {token}"
+    else:
+        hdrs["x-goog-api-key"] = token
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    try:
+        ctx = secure_ssl_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            payload = json.loads(resp.read(262_144).decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    models_raw = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models_raw, list):
+        return []
+    out: list[str] = []
+    for item in models_raw:
+        if not isinstance(item, dict):
+            continue
+        methods = item.get("supportedGenerationMethods") or []
+        if methods and "generateContent" not in methods:
+            continue
+        raw_name = str(item.get("name") or "").strip()
+        mid = raw_name[len("models/") :] if raw_name.startswith("models/") else raw_name
+        if mid and mid.startswith(("gemini-", "gemma-")) and "embedding" not in mid and "tts" not in mid:
+            out.append(mid)
+    return list(dict.fromkeys(out))
+
+
+def fetch_anthropic_models(
+    base_url: str = "https://api.anthropic.com",
+    *,
+    token: str = "",
+    auth_kind: str = "api_key",
+    timeout: float = 1.2,
+) -> list[tuple[str, str]]:
+    """Queries `GET {base_url}/v1/models` to discover available Anthropic models."""
+    if not token:
+        return []
+    base = base_url.rstrip("/")
+    url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+    hdrs = {
+        "Accept": "application/json",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "crux-cli/0.1",
+    }
+    if auth_kind in ("bearer", "oauth") or (not token.startswith("sk-ant-api") and auth_kind != "api_key"):
+        hdrs["Authorization"] = f"Bearer {token}"
+    else:
+        hdrs["x-api-key"] = token
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    try:
+        ctx = secure_ssl_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            payload = json.loads(resp.read(262_144).decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    out: list[tuple[str, str]] = []
+    for item in data:
+        if isinstance(item, dict) and item.get("id"):
+            out.append((str(item["id"]), str(item.get("display_name") or "")))
+    return out
+
+
+_MODEL_DESCRIPTIONS: dict[str, str] = {
+    "gemini-4-argon": "Deep reasoning · 1M context",
+    "gemini-3.8-flash": "Latest fast reasoning · 1M context",
+    "gemini-3.7-flash": "Fast reasoning · 1M context",
+    "gemini-3.6-flash": "Fast reasoning · 1M context",
+    "gemini-3.5-flash": "Balanced reasoning · 1M context",
+    "gemini-3.1-pro": "Deep reasoning · 1M context",
+    "gemini-3.1-pro-preview": "Deep reasoning · 1M context",
+    "gemini-3-pro-preview": "Deep reasoning · 1M context",
+    "gemini-3-flash-preview": "Fast reasoning preview · 1M context",
+    "gemini-3-flash": "Fast reasoning · 1M context",
+    "gemini-3.1-flash-lite": "Lightweight low-latency · 1M context",
+    "gemini-3.1-flash-lite-preview": "Lightweight preview · 1M context",
+    "gemini-2.5-pro": "Deep reasoning · 1M context",
+    "gemini-2.5-flash": "Fast high-throughput · 1M context",
+    "gemini-2.5-flash-lite": "Lightweight low-latency · 1M context",
+    "claude-opus-4-20250514": "Deep interleaved reasoning · 200K context",
+    "claude-opus-4@20250514": "Deep interleaved reasoning · 200K context",
+    "claude-sonnet-4-20250514": "Balanced agentic coding · 200K context",
+    "claude-sonnet-4@20250514": "Balanced agentic coding · 200K context",
+    "claude-3-7-sonnet-latest": "Extended thinking · 200K context",
+    "claude-3-7-sonnet@20250219": "Extended thinking · 200K context",
+    "claude-3-5-haiku-latest": "Fast low-latency · 200K context",
+    "gpt-5": "Deep reasoning · 400K context",
+    "o3": "Multi-step reasoning · 200K context",
+    "o4-mini": "Fast reasoning · 200K context",
+    "gpt-4.1": "High-context coding · 1M context",
+    "deepseek-reasoner": "Chain-of-thought reasoning · 128K context",
+    "deepseek-chat": "Fast coding & general chat · 128K context",
+    "qwen3-coder": "Agentic coding · 128K context",
+}
+
+
+@dataclass(frozen=True)
+class DiscoveredModelOption:
+    """Clean, provider-label-free runtime model entry for `/model`."""
+
+    model_id: str
+    display_name: str
+    description: str
+
+
+def format_model_display_name(model_id: str, server_name: str = "") -> str:
+    """Formats a clean human-readable model label without provider tags."""
+    clean_srv = server_name.strip()
+    if clean_srv and not clean_srv.startswith("models/") and "/" not in clean_srv:
+        return clean_srv
+    low = model_id.strip().lower()
+    if low.startswith("gemini-"):
+        tokens = model_id.strip().split("-")
+        pretty: list[str] = []
+        for t in tokens:
+            tl = t.lower()
+            if tl == "gemini":
+                pretty.append("Gemini")
+            elif tl == "preview":
+                pretty.append("(Preview)")
+            elif tl in ("pro", "flash", "lite", "argon", "ultra", "nano"):
+                pretty.append(tl.capitalize())
+            else:
+                pretty.append(t)
+        return " ".join(pretty)
+    return model_id.strip()
+
+
+def describe_model(model_id: str, quota_fraction: float | None = None) -> str:
+    """Returns a clean, provider-agnostic description for `model_id` (with optional remaining quota)."""
+    base = _MODEL_DESCRIPTIONS.get(model_id, "")
+    if not base:
+        low = model_id.lower()
+        if "flash-lite" in low:
+            base = "Lightweight low-latency"
+        elif "flash" in low or "mini" in low or "haiku" in low:
+            base = "Fast reasoning"
+        elif any(k in low for k in ("argon", "pro", "opus", "gpt-5", "o3", "reasoner", "r1")):
+            base = "Deep reasoning"
+        else:
+            base = "Available model"
+    if quota_fraction is not None:
+        return f"{base} · {quota_fraction * 100:.0f}% remaining"
+    return base
+
+
+_AGY_DISCOVERY_CACHE_LOCK = threading.Lock()
+_AGY_DISCOVERY_CACHE: dict[str, tuple[float, str, list[tuple[str, str]]]] = {}
+
+
+def fetch_agy_models(
+    ush_home: pathlib.Path,
+    *,
+    timeout: float = 5.0,
+    ttl_seconds: float = 300.0,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Queries live Antigravity models at runtime via `agy acp` / `agy models` (`(default_id, [(id, name)])`)."""
+    from ush.brain.agy_acp import get_shared_agy_bridge, parse_agy_models_cli_output, resolve_agy_binary
+
+    agy_bin = resolve_agy_binary()
+    if not agy_bin:
+        return "", []
+    now = time.monotonic()
+    with _AGY_DISCOVERY_CACHE_LOCK:
+        cached = _AGY_DISCOVERY_CACHE.get(agy_bin)
+        if cached is not None and (now - cached[0]) < ttl_seconds and cached[2]:
+            return cached[1], list(cached[2])
+
+    default_mid = ""
+    pairs: list[tuple[str, str]] = []
+    try:
+        bridge = get_shared_agy_bridge(ush_home, agy_bin)
+        default_mid, opts = bridge.discover_models(timeout=max(timeout, 4.5))
+        pairs = [(o.model_id, o.display_name) for o in opts]
+    except Exception:  # noqa: BLE001
+        pairs = []
+
+    if not pairs:
+        try:
+            env = dict(os.environ)
+            env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
+            proc = subprocess.run(
+                [agy_bin, "models"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=max(timeout, 5.0),
+                check=False,
+                env=env,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                opts_cli = parse_agy_models_cli_output(proc.stdout)
+                pairs = [(o.model_id, o.display_name) for o in opts_cli]
+                if pairs and not default_mid:
+                    default_mid = pairs[0][0]
+        except (OSError, subprocess.SubprocessError):
+            pairs = []
+
+    if pairs:
+        with _AGY_DISCOVERY_CACHE_LOCK:
+            _AGY_DISCOVERY_CACHE[agy_bin] = (time.monotonic(), default_mid or pairs[0][0], pairs)
+    return default_mid, pairs
+
+
+def fetch_vertex_publisher_models(
+    base_url: str = "https://aiplatform.googleapis.com",
+    *,
+    token: str = "",
+    auth_kind: str = "gcloud_adc",
+    timeout: float = 1.5,
+) -> list[tuple[str, str]]:
+    """Queries live `GET {base_url}/v1beta1/publishers/google/models` to discover available Vertex / Antigravity models."""
+    if not token:
+        return []
+    host = (base_url or "https://aiplatform.googleapis.com").rstrip("/")
+    url = f"{host}/v1beta1/publishers/google/models?pageSize=100"
+    hdrs = {"Accept": "application/json", "User-Agent": "crux-cli/0.1"}
+    if auth_kind == "api_key":
+        hdrs["x-goog-api-key"] = token
+    else:
+        hdrs["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    try:
+        ctx = secure_ssl_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            payload = json.loads(resp.read(524_288).decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    raw_list = payload.get("publisherModels") if isinstance(payload, dict) else None
+    if not isinstance(raw_list, list):
+        return []
+
+    skip_substrings = (
+        "embedding",
+        "-tts",
+        "-transcribe",
+        "-image",
+        "-live",
+        "gemini-1.0",
+        "gemini-1.5",
+        "gemini-experimental",
+        "aqa",
+        "imagen",
+        "veo",
+        "chirp",
+        "medlm",
+    )
+    found: dict[str, str] = {}
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("name") or "").strip()
+        mid = raw_name.rsplit("/", 1)[-1] if "/" in raw_name else raw_name
+        low = mid.lower()
+        if not mid or not low.startswith(("gemini-", "gemma-")):
+            continue
+        if any(s in low for s in skip_substrings):
+            continue
+        disp = str(item.get("displayName") or "").strip()
+        found[mid] = format_model_display_name(mid, disp)
+
+    def _rank(mid: str) -> tuple[int, str]:
+        low = mid.lower()
+        if low.startswith("gemini-4"):
+            return (0, mid)
+        if low.startswith("gemini-3.8"):
+            return (1, mid)
+        if low.startswith("gemini-3.7"):
+            return (2, mid)
+        if low.startswith("gemini-3.6"):
+            return (3, mid)
+        if low.startswith("gemini-3.5"):
+            return (4, mid)
+        if low.startswith("gemini-3.1-pro"):
+            return (5, mid)
+        if low.startswith("gemini-3"):
+            return (6, mid)
+        if low.startswith("gemini-2.5-pro"):
+            return (7, mid)
+        if low.startswith("gemini-2.5"):
+            return (8, mid)
+        return (20, mid)
+
+    ordered = sorted(found.items(), key=lambda kv: _rank(kv[0]))
+    return ordered
+
+
+def discover_model_options(
+    vault: CredentialVault,
+    prof: AuthProfile,
+    *,
+    timeout: float = 1.2,
+) -> list[DiscoveredModelOption]:
+    """Dynamically discovers live `(model_id, display_name, description)` for `prof` with zero provider labels."""
+    base_clean = (prof.base_url or "").rstrip("/")
+
+    # 0. Sanctioned local Antigravity CLI (`agy acp` / `agy models`) -> exact live Antigravity models!
+    if prof.api_mode == "agy_acp" or base_clean.startswith("agy://"):
+        _, agy_pairs = fetch_agy_models(vault.ush_home, timeout=max(timeout, 4.5))
+        if agy_pairs:
+            return [
+                DiscoveredModelOption(
+                    model_id=mid,
+                    display_name=disp,
+                    description=describe_model(mid),
+                )
+                for mid, disp in agy_pairs
+            ]
+
+    tok = ""
+    if prof.auth_kind != "none":
+        try:
+            tok = vault.resolve_bearer_or_key(prof)
+        except Exception:  # noqa: BLE001
+            tok = ""
+
+    is_code_assist = prof.api_mode == "code_assist" or "cloudcode-pa.googleapis.com" in base_clean
+
+    # 1. Google OAuth / Code Assist (`cloudcode-pa.googleapis.com`) -> live `retrieveUserQuota`
+    if is_code_assist:
+        proj = prof.project_id or ""
+        if tok and not proj:
+            try:
+                setup = setup_code_assist_user(tok, base_url=base_clean or "https://cloudcode-pa.googleapis.com", timeout=timeout)
+                proj = setup.project_id
+            except Exception:  # noqa: BLE001
+                proj = ""
+        live_q = fetch_code_assist_quota_models(
+            base_clean or "https://cloudcode-pa.googleapis.com",
+            project_id=proj,
+            token=tok,
+            timeout=timeout,
+        )
+        if live_q:
+            return [
+                DiscoveredModelOption(
+                    model_id=mid,
+                    display_name=format_model_display_name(mid),
+                    description=describe_model(mid, frac),
+                )
+                for mid, frac in live_q
+            ]
+        fallback_gemini = (
+            "gemini-3.1-pro-preview",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
+            "gemini-3-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        )
+        return [
+            DiscoveredModelOption(mid, format_model_display_name(mid), describe_model(mid))
+            for mid in fallback_gemini
+        ]
+
+    # 2. Google AI Studio (`generativelanguage.googleapis.com`) -> live `/v1beta/models`
+    if prof.provider == "google" or "generativelanguage.googleapis.com" in base_clean:
+        live_g = fetch_gemini_api_models(base_clean or "https://generativelanguage.googleapis.com", token=tok, auth_kind=prof.auth_kind, timeout=timeout)
+        if live_g:
+            return [
+                DiscoveredModelOption(mid, format_model_display_name(mid), describe_model(mid))
+                for mid in live_g[:20]
+            ]
+        return [
+            DiscoveredModelOption(mid, format_model_display_name(mid), describe_model(mid))
+            for mid in ("gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite")
+        ]
+
+    # 3. Anthropic (`api.anthropic.com`) -> live `/v1/models`
+    if prof.provider == "anthropic":
+        live_a = fetch_anthropic_models(base_clean or "https://api.anthropic.com", token=tok, auth_kind=prof.auth_kind, timeout=timeout)
+        if live_a:
+            return [
+                DiscoveredModelOption(mid, disp or mid, describe_model(mid))
+                for mid, disp in live_a[:20]
+            ]
+        return [
+            DiscoveredModelOption(mid, mid, describe_model(mid))
+            for mid in ("claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest")
+        ]
+
+    # 4. Vertex AI Claude (`vertex-anthropic`)
+    if prof.provider == "vertex-anthropic":
+        return [
+            DiscoveredModelOption(mid, mid, describe_model(mid))
+            for mid in ("claude-opus-4@20250514", "claude-sonnet-4@20250514", "claude-3-7-sonnet@20250219")
+        ]
+
+    # 5. OpenAI / LiteLLM / OpenRouter / DeepSeek / Qwen / Kimi / Local (`GET /models`)
+    if prof.provider in ("openai", "litellm", "openrouter", "deepseek", "qwen", "kimi", "local") or prof.api_mode in ("responses", "chat_completions"):
+        live_o = fetch_openai_compat_models(base_clean, token=tok, extra_headers=prof.extra_headers, timeout=timeout)
+        if live_o:
+            if prof.provider == "openai":
+                skip = ("whisper", "tts", "dall-e", "embedding", "moderation", "babbage", "davinci", "audio", "realtime")
+                live_o = [m for m in live_o if not any(s in m.lower() for s in skip)]
+            if live_o:
+                return [DiscoveredModelOption(mid, mid, describe_model(mid)) for mid in live_o[:25]]
+        defaults_by_prov: dict[str, tuple[str, ...]] = {
+            "openai": ("gpt-5", "o3", "o4-mini", "gpt-4.1"),
+            "deepseek": ("deepseek-reasoner", "deepseek-chat"),
+            "qwen": ("qwen3-coder",),
+        }
+        fallbacks = defaults_by_prov.get(prof.provider, (prof.default_model,) if prof.default_model else ())
+        return [DiscoveredModelOption(mid, mid, describe_model(mid)) for mid in fallbacks if mid]
+
+    # 6. Vertex AI / Gemini Enterprise / Hosted Antigravity (`aiplatform.googleapis.com`) -> live `/v1beta1/publishers/google/models`
+    live_v = fetch_vertex_publisher_models(
+        base_clean or "https://aiplatform.googleapis.com",
+        token=tok,
+        auth_kind=prof.auth_kind,
+        timeout=timeout,
+    )
+    if live_v:
+        return [
+            DiscoveredModelOption(mid, disp, describe_model(mid))
+            for mid, disp in live_v[:25]
+        ]
+    vertex_fallbacks = [
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+    ]
+    if prof.default_model and prof.default_model not in vertex_fallbacks:
+        vertex_fallbacks.insert(0, prof.default_model)
+    return [
+        DiscoveredModelOption(mid, format_model_display_name(mid), describe_model(mid))
+        for mid in vertex_fallbacks
+    ]
+
+
+def discover_available_models(
+    vault: CredentialVault,
+    prof: AuthProfile,
+    *,
+    timeout: float = 1.0,
+) -> list[tuple[str, str]]:
+    """Discovers `(model_id, description)` for `prof` cleanly without cross-provider clutter or provider labels."""
+    return [(m.model_id, m.description) for m in discover_model_options(vault, prof, timeout=timeout)]
+
+
+def login_antigravity_acp(
+    vault: CredentialVault,
+    *,
+    profile_name: str = "antigravity",
+    run_login_if_needed: bool = True,
+) -> AuthProfile:
+    """Registers an Antigravity ACP profile using the installed `agy` CLI (`agy acp --login` if unauthenticated)."""
+    from ush.brain.agy_acp import resolve_agy_binary
+
+    agy_bin = resolve_agy_binary()
+    if not agy_bin:
+        raise FileNotFoundError("Antigravity CLI (`agy`) is not installed on PATH.")
+
+    def_mid, pairs = fetch_agy_models(vault.ush_home, timeout=6.0, ttl_seconds=0.0)
+    if not pairs and run_login_if_needed:
+        subprocess.run([agy_bin, "acp", "--login"], check=True)
+        def_mid, pairs = fetch_agy_models(vault.ush_home, timeout=8.0, ttl_seconds=0.0)
+
+    resolved_default = def_mid or (pairs[0][0] if pairs else "gemini-4-argon")
+    prof = AuthProfile(
+        name=profile_name,
+        provider="antigravity",
+        auth_kind="none",
+        base_url="agy://acp",
+        default_model=resolved_default,
+        source="vault",
+        api_mode="agy_acp",
+    )
+    vault._profiles[profile_name] = prof
+    vault.switch_profile(profile_name)
+    return prof
+
+
+def interactive_login_wizard(
+    vault: CredentialVault, provider_arg: str | None = None, *, no_browser: bool = False
+) -> AuthProfile:
+    """Interactive terminal login wizard supporting Google OAuth (Ultra/Pro/Code Assist), Gemini Enterprise, Antigravity, Claude, OpenAI, LiteLLM, GCP ADC & local."""
     choices = [
+        ("antigravity", "Antigravity Endpoints (Local `agy` ACP, Google Sign-In, or Priority Vertex)"),
+        ("google-oauth", "Login with Google (Antigravity / Google AI Pro & Ultra — Zero GCP/Argolis Project)"),
         ("gemini-enterprise", "Gemini Enterprise (Standard GCP ADC, Vertex Express API Key, or Code Assist)"),
-        ("antigravity", "Antigravity Endpoints (Hosted Priority / Standard or Local LiteRT / Custom URL)"),
         ("vertex", "Google Cloud Vertex AI (gcloud ADC — unlocks Gemini + Vertex Claude Model Garden)"),
         ("google", "Google Gemini API (AI Studio API Key)"),
         ("anthropic", "Anthropic Claude (Default API Key `x-api-key`, Bearer/OAuth Token, or Custom URL)"),
@@ -1563,7 +2545,7 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         ("local", "Local / Self-Hosted GPU Endpoint (Ollama / vLLM / SGLang)"),
         ("workstation", "Host-Local Workstation Adapter (`~/.ush/workstation.json` — command helper / local plugin)"),
     ]
-    provider = provider_arg
+    provider = provider_arg.lower() if provider_arg else None
     if not provider:
         print("\n=== Crucible (crux v0.1) — Authentication Setup ===")
         for idx, (slug, desc) in enumerate(choices, 1):
@@ -1574,9 +2556,38 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         else:
             provider = raw.lower()
 
+    if provider in ("google-oauth", "code-assist", "code-assist-oauth"):
+        ca_url = os.environ.get("CODE_ASSIST_ENDPOINT", "https://cloudcode-pa.googleapis.com").strip() or "https://cloudcode-pa.googleapis.com"
+        explicit_proj = os.environ.get("USH_CODE_ASSIST_PROJECT", "").strip() or None
+        name = "antigravity"
+        if not provider_arg and sys.stdin.isatty():
+            name = input("Profile name [antigravity]: ").strip() or "antigravity"
+        return login_google_code_assist_oauth(
+            vault,
+            profile_name=name,
+            provider="antigravity",
+            base_url=ca_url,
+            default_model="gemini-3.1-pro-preview",
+            explicit_project_id=explicit_proj,
+            no_browser=no_browser,
+        )
+
     if provider == "gemini-enterprise":
-        print("  Modes: [1] Standard Enterprise (gcloud ADC + Project)  [2] Express API Key  [3] Code Assist (`cloudcode-pa`)")
+        print(
+            "  Modes: [1] Standard Enterprise (gcloud ADC + Project)  [2] Express API Key  "
+            "[3] Code Assist OAuth (Browser — Zero GCP Project)  [4] Code Assist (gcloud ADC + Project)"
+        )
         mode_in = input("Select Gemini Enterprise mode [1]: ").strip() or "1"
+        if mode_in == "3":
+            ca_url = input("Code Assist Endpoint [https://cloudcode-pa.googleapis.com]: ").strip() or "https://cloudcode-pa.googleapis.com"
+            name = input("Profile name [google-oauth]: ").strip() or "google-oauth"
+            return login_google_code_assist_oauth(
+                vault,
+                profile_name=name,
+                base_url=ca_url,
+                default_model="gemini-3.1-pro-preview",
+                no_browser=no_browser,
+            )
         if mode_in == "2":
             url = input("Enterprise Base URL [https://aiplatform.googleapis.com]: ").strip() or "https://aiplatform.googleapis.com"
             name = input("Profile name [gemini-enterprise-express]: ").strip() or "gemini-enterprise-express"
@@ -1592,7 +2603,7 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         detected = vault._read_gcloud_default_project() or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
         proj = input(f"GCP Project ID [{detected}]: ").strip() or detected
         reg = input("Region [global]: ").strip() or "global"
-        if mode_in == "3":
+        if mode_in == "4":
             ca_url = input("Code Assist Endpoint [https://cloudcode-pa.googleapis.com]: ").strip() or "https://cloudcode-pa.googleapis.com"
             name = input("Profile name [gemini-code-assist]: ").strip() or "gemini-code-assist"
             return vault.register_vertex_profile(
@@ -1618,6 +2629,47 @@ def interactive_login_wizard(vault: CredentialVault, provider_arg: str | None = 
         )
 
     if provider == "antigravity":
+        from ush.brain.agy_acp import resolve_agy_binary
+
+        has_agy = bool(resolve_agy_binary())
+        if not os.environ.get("ANTIGRAVITY_BASE_URL"):
+            if has_agy:
+                print(
+                    "  Modes: [1] Antigravity Local Session (`agy acp` — Argon + Flash, Zero GCP Project)  "
+                    "[2] Google OAuth (`cloudcode-pa`)  [3] Custom / Vertex / LiteRT Endpoint"
+                )
+                ag_mode = input("Select Antigravity mode [1]: ").strip() or "1"
+                if ag_mode == "1":
+                    name = input("Profile name [antigravity]: ").strip() or "antigravity"
+                    return login_antigravity_acp(vault, profile_name=name)
+                if ag_mode == "2":
+                    ca_url = os.environ.get("CODE_ASSIST_ENDPOINT", "https://cloudcode-pa.googleapis.com").strip() or "https://cloudcode-pa.googleapis.com"
+                    name = input("Profile name [antigravity]: ").strip() or "antigravity"
+                    return login_google_code_assist_oauth(
+                        vault,
+                        profile_name=name,
+                        provider="antigravity",
+                        base_url=ca_url,
+                        default_model="gemini-3.1-pro-preview",
+                        no_browser=no_browser,
+                    )
+            else:
+                print(
+                    "  Modes: [1] Google Account Sign-In (`cloudcode-pa` — Zero GCP/Argolis Project)  "
+                    "[2] Custom / Vertex / Local LiteRT Endpoint"
+                )
+                ag_mode = input("Select Antigravity mode [1]: ").strip() or "1"
+                if ag_mode == "1":
+                    ca_url = os.environ.get("CODE_ASSIST_ENDPOINT", "https://cloudcode-pa.googleapis.com").strip() or "https://cloudcode-pa.googleapis.com"
+                    name = input("Profile name [antigravity]: ").strip() or "antigravity"
+                    return login_google_code_assist_oauth(
+                        vault,
+                        profile_name=name,
+                        provider="antigravity",
+                        base_url=ca_url,
+                        default_model="gemini-3.1-pro-preview",
+                        no_browser=no_browser,
+                    )
         default_url = os.environ.get("ANTIGRAVITY_BASE_URL") or "https://aiplatform.googleapis.com"
         url = input(f"Antigravity Endpoint URL [{default_url}]: ").strip() or default_url
         tier = input("Service Tier (`priority` or blank) [priority]: ").strip()

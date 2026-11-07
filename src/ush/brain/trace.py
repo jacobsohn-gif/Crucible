@@ -600,6 +600,11 @@ class StreamTracePrinter:
         self._wrote_text = False
         self._text_bol = True
         self._compact_buf: list[str] = []
+        self._md_stream: Any = None
+        if self.use_color:
+            from ush.cli.markdown import MarkdownStreamRenderer
+
+            self._md_stream = MarkdownStreamRenderer(use_color=True)
 
     def _dim(self, s: str) -> str:
         return f"\033[2m{s}\033[0m" if self.use_color else s
@@ -623,7 +628,12 @@ class StreamTracePrinter:
             self._in_think = False
             self._think_bol = True
         if self._wrote_text:
-            if not self._text_bol:
+            if self._md_stream is not None:
+                tail = self._md_stream.flush()
+                if tail:
+                    self.out.write(tail)
+                    self.out.flush()
+            elif not self._text_bol:
                 self.out.write("\n")
             self._wrote_text = False
             self._text_bol = True
@@ -711,10 +721,20 @@ class StreamTracePrinter:
                     self._in_think = False
                     self._think_bol = True
                     self.out.write("\n")
-                self.out.write(evt.text)
-                self.out.flush()
-                self._wrote_text = True
-                self._text_bol = evt.text.endswith("\n")
+                if self._md_stream is not None:
+                    if not self._wrote_text:
+                        self._md_stream.reset()
+                    committed, _ = self._md_stream.feed(evt.text)
+                    if committed:
+                        self.out.write(committed)
+                        self.out.flush()
+                    self._wrote_text = True
+                    self._text_bol = True
+                else:
+                    self.out.write(evt.text)
+                    self.out.flush()
+                    self._wrote_text = True
+                    self._text_bol = evt.text.endswith("\n")
                 return
 
             if kind == "tool_call" and evt.part:
