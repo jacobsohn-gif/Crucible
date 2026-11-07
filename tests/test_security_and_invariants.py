@@ -2514,6 +2514,127 @@ class SecurityAndInvariantsSuite(unittest.TestCase):
         self.assertIn("<current_user_request>", cold_blocks[-1]["text"])
         self.assertIn("Turn 35 user objective: build module_35.py", cold_blocks[-1]["text"])
 
+    # =========================================================================
+    # 14. Full-Width Multi-Line `ask_user` Options, `Space` Expand & Quick Pick
+    # =========================================================================
+
+    def test_ask_user_full_width_wrapping_space_expand_and_quick_keys(self) -> None:
+        from ush.cli.main import handle_slash_command
+        from ush.cli.tui import VisualTuiController, decode_key_buffer, strip_ansi, vis_width
+
+        with tempfile.TemporaryDirectory() as raw_dir, mock.patch.dict(
+            os.environ,
+            {
+                "USH_HOME": str(pathlib.Path(raw_dir) / "home"),
+                "USH_DISABLE_KEYCHAIN": "1",
+                "GEMINI_API_KEY": "AIzaMockKey123456789012345678901234",
+            },
+            clear=False,
+        ):
+            ws = pathlib.Path(raw_dir) / "ws"
+            ws.mkdir()
+            rt = HarnessRuntime(ws, mode=PermissionMode.DEFAULT)
+            try:
+                scr = io.StringIO()
+                ctrl = VisualTuiController(
+                    rt,
+                    slash_handler=lambda r, ln: handle_slash_command(r, ln, headless=False),
+                    out=scr,
+                    cols_fn=lambda: 80,
+                    use_color=True,
+                )
+                ctrl.comp.rows = lambda: 34  # type: ignore[method-assign]
+                ctrl.input_buf = "saved composer draft"
+                ctrl.cursor = len(ctrl.input_buf)
+
+                # 14a. Multi-sentence question + 3 long options (~135 chars each) render 100% un-truncated by default!
+                long_q = (
+                    "Which evaluator plugin architecture should we adopt for the repository so external "
+                    "contributors can register custom scoring suites without modifying core files? QUESTION_END_MARKER"
+                )
+                opts_3 = [
+                    "(Recommended) Declarative entry-point registry in pyproject.toml with automatic schema validation OPT_ONE_TAIL",
+                    "Directory-based drop-in Python modules discovered dynamically under evaluators/plugins/ at runtime OPT_TWO_TAIL",
+                    "Subprocess JSON-RPC evaluator protocol isolating third-party dependencies per benchmark suite OPT_THREE_TAIL",
+                ]
+                chosen_1: list[str] = []
+                done_1 = threading.Event()
+
+                def _ask_1() -> None:
+                    chosen_1.append(ctrl._request_ask_user_menu(long_q, opts_3))
+                    done_1.set()
+
+                th1 = threading.Thread(target=_ask_1, daemon=True)
+                th1.start()
+                deadline = time.monotonic() + 2.0
+                while not ctrl.is_awaiting_user and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ctrl.is_awaiting_user)
+
+                dock_lines_1, _, _ = ctrl._build_dock(80)
+                for dl in dock_lines_1:
+                    self.assertLessEqual(vis_width(dl), 79)
+                plain_1 = "\n".join(strip_ansi(x) for x in dock_lines_1)
+                self.assertIn("QUESTION_END_MARKER", plain_1)
+                self.assertIn("OPT_ONE_TAIL", plain_1)
+                self.assertIn("OPT_TWO_TAIL", plain_1)
+                self.assertIn("OPT_THREE_TAIL", plain_1)
+
+                # Press quick-pick `2` -> selects full Option 2 immediately!
+                ctrl.handle_key(decode_key_buffer("2")[0][0])
+                self.assertTrue(done_1.wait(timeout=2.0))
+                self.assertEqual(chosen_1, [opts_3[1]])
+
+                # 14b. Compact terminal height + 5 huge options: selected option always expands; `Space` expands all + scrolls!
+                ctrl.comp.rows = lambda: 22  # type: ignore[method-assign]
+                huge_opts = [
+                    f"Detailed architectural option #{i}: " + ("comprehensive tradeoff explanation segment " * 5) + f"OPT{i}_FINAL_SENTINEL"
+                    for i in range(1, 6)
+                ]
+                chosen_2: list[str] = []
+                done_2 = threading.Event()
+
+                def _ask_2() -> None:
+                    chosen_2.append(ctrl._request_ask_user_menu("Pick full spec QUESTION_2_TAIL", huge_opts))
+                    done_2.set()
+
+                th2 = threading.Thread(target=_ask_2, daemon=True)
+                th2.start()
+                deadline = time.monotonic() + 2.0
+                while not ctrl.is_awaiting_user and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+                plain_init = "\n".join(strip_ansi(x) for x in ctrl._build_dock(76)[0])
+                # Highlighted option #1 shows its ending sentinel in full; unselected options show `Space` hint
+                self.assertIn("OPT1_FINAL_SENTINEL", plain_init)
+                self.assertIn("Space", plain_init)
+
+                # Arrow DOWN twice to option #3 -> option #3 immediately expands in full to reveal `OPT3_FINAL_SENTINEL`!
+                for ev in decode_key_buffer("\x1b[B\x1b[B")[0]:
+                    ctrl.handle_key(ev)
+                plain_sel3 = "\n".join(strip_ansi(x) for x in ctrl._build_dock(76)[0])
+                self.assertIn("OPT3_FINAL_SENTINEL", plain_sel3)
+
+                # Press `Space` -> toggles `expand_all=True`; press `RIGHT` x3 to scroll down to `OPT5_FINAL_SENTINEL`!
+                ctrl.handle_key(decode_key_buffer(" ")[0][0])
+                self.assertTrue(bool(ctrl.menu and ctrl.menu.expand_all))
+                for _ in range(4):
+                    ctrl.handle_key(decode_key_buffer("\x1b[C")[0][0])
+                plain_scrolled = "\n".join(strip_ansi(x) for x in ctrl._build_dock(76)[0])
+                self.assertIn("OPT5_FINAL_SENTINEL", plain_scrolled)
+
+                # Press `c` -> switches to custom composer while keeping full question visible & preserving saved draft!
+                ctrl.handle_key(decode_key_buffer("c")[0][0])
+                plain_custom = "\n".join(strip_ansi(x) for x in ctrl._build_dock(76)[0])
+                self.assertIn("QUESTION_2_TAIL", plain_custom)
+                for ev in decode_key_buffer("Custom hybrid design\r")[0]:
+                    ctrl.handle_key(ev)
+                self.assertTrue(done_2.wait(timeout=2.0))
+                self.assertEqual(chosen_2, ["Custom hybrid design"])
+                self.assertEqual(ctrl.input_buf, "saved composer draft")
+            finally:
+                rt.runner.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

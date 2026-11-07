@@ -618,6 +618,46 @@ class ThinkingThreadTracker:
 # ============================================================================
 
 
+def _wrap_menu_text(text: str, max_cols: int) -> list[str]:
+    """Word-wraps multi-paragraph menu/question text cleanly within `max_cols` (`INV-TUI-1` safe)."""
+    from ush.cli.markdown import render_inline_markdown
+
+    budget = max(12, max_cols)
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\t", "  ")
+    if not raw.strip():
+        return [""]
+
+    wrapped: list[str] = []
+    for raw_para in raw.split("\n"):
+        if not raw_para.strip():
+            if wrapped and wrapped[-1] != "":
+                wrapped.append("")
+            continue
+        para = render_inline_markdown(raw_para.strip(), use_color=False)
+        cur = ""
+        for word in para.split(" "):
+            if not word:
+                continue
+            cand = f"{cur} {word}" if cur else word
+            if vis_width(cand) <= budget:
+                cur = cand
+                continue
+            if cur:
+                wrapped.append(cur)
+                cur = ""
+            rem = word
+            while vis_width(rem) > budget:
+                chunk = clip_to_cols(rem, budget, ellipsis="")
+                if not chunk:
+                    chunk = rem[:1]
+                wrapped.append(chunk)
+                rem = rem[len(strip_ansi(chunk)) :]
+            cur = rem
+        if cur:
+            wrapped.append(cur)
+    return wrapped or [""]
+
+
 @dataclass
 class MenuItem:
     key: str
@@ -641,9 +681,11 @@ class MenuOverlay:
     replace_span: tuple[int, int] | None = None  # char span in input_buf for auto-completion menus
     on_select: Callable[[MenuItem], None] | None = None
     on_cancel: Callable[[], None] | None = None
-    # For `threads` explorer overlay:
+    # Multi-line prompt header & expandable option/body controls:
+    prompt_body: str = ""
     body_scroll: int = 0
     expanded_detail: bool = True
+    expand_all: bool = False
 
     def filtered_items(self) -> list[MenuItem]:
         q = self.filter_query.strip().lower()
@@ -1198,6 +1240,7 @@ class VisualTuiController:
         self.menu: MenuOverlay | None = None
         self._custom_input_cb: Callable[[str], None] | None = None
         self._custom_input_label: str = ""
+        self._custom_input_question: str = ""
         self._interaction_lock = threading.Lock()
 
         # Background worker synchronization
@@ -1242,8 +1285,8 @@ class VisualTuiController:
 
             done = threading.Event()
             decision = [False]
-            raw_target = str(args.get("command") or args.get("path") or args)
-            target = " ".join(raw_target.split())[:72]
+            raw_target = str(args.get("command") or args.get("path") or args).strip()
+            short_target = " ".join(raw_target.split())[:48]
             clean_reason = " ".join(str(reason).split())[:48]
 
             def _pick(item: MenuItem) -> None:
@@ -1272,7 +1315,8 @@ class VisualTuiController:
 
             overlay = MenuOverlay(
                 kind="approval",
-                title=f"? Approve `{tool_name}`: {target}  ({clean_reason})",
+                title=f"? Approve `{tool_name}`: {short_target}  ({clean_reason})",
+                prompt_body=raw_target if len(raw_target) > 48 or "\n" in raw_target else "",
                 items=[
                     MenuItem("allow", "Allow once", "Execute this tool call and continue", badge="y"),
                     MenuItem("auto_edit", "Allow & enable auto-edit", "Auto-apply workspace edits this session", badge="e"),
@@ -1300,10 +1344,15 @@ class VisualTuiController:
         with self._interaction_lock:
             done = threading.Event()
             answer = [""]
-            clean_q = " ".join(str(question).split())
+            full_q = str(question or "").strip()
+            clean_q = " ".join(full_q.split())
 
-            items = [MenuItem(opt, " ".join(str(opt).split()), "Select option") for opt in options]
-            items.append(MenuItem("__custom__", "Type custom response...", "Enter free-form answer in composer"))
+            items: list[MenuItem] = []
+            for idx, opt in enumerate(options):
+                full_opt = str(opt).strip()
+                badge = str(idx + 1) if idx < 9 else ""
+                items.append(MenuItem(full_opt, full_opt, "", badge=badge))
+            items.append(MenuItem("__custom__", "Type custom response...", "Enter free-form answer in composer", badge="c"))
 
             def _pick(item: MenuItem) -> None:
                 self.menu = None
@@ -1311,11 +1360,13 @@ class VisualTuiController:
                     saved_draft = (self.input_buf, self.cursor)
                     self.input_buf = ""
                     self.cursor = 0
-                    self._custom_input_label = f"Answer `{clean_q[:54]}`"
+                    self._custom_input_label = f"Answer `{clean_q[:48]}`"
+                    self._custom_input_question = full_q
 
                     def _finish_custom(val: str) -> None:
                         answer[0] = val
                         self._custom_input_label = ""
+                        self._custom_input_question = ""
                         self.input_buf, self.cursor = saved_draft
                         done.set()
                         self.comp.render()
@@ -1334,7 +1385,8 @@ class VisualTuiController:
 
             overlay = MenuOverlay(
                 kind="ask_user",
-                title=f"? Agent asks: {clean_q}",
+                title="? Question",
+                prompt_body=full_q,
                 items=items,
                 allow_filter=False,
                 on_select=_pick,
@@ -1355,6 +1407,7 @@ class VisualTuiController:
                 if (self.rt.runner.cancel_event.is_set() or self.should_exit) and self._custom_input_cb is not None:
                     self._custom_input_cb = None
                     self._custom_input_label = ""
+                    self._custom_input_question = ""
 
     # ---- Auto-Completion Popup Menus (`/`, `@`, `$`) ----
 
@@ -1792,7 +1845,142 @@ class VisualTuiController:
                     m.selected = idx
                     break
 
+    def _render_ask_user_menu_lines(self, m: MenuOverlay, width: int, avail_rows: int) -> list[str]:
+        inner = max(30, width - 5)
+        lines: list[str] = []
+        vis = m.clamp_selection()
+
+        exp_hint = "Space compact" if m.expand_all else "Space expand all"
+        cnt_lbl = f" [{m.selected + 1}/{len(vis)}]" if vis else ""
+        hdr_txt = clip_to_cols(
+            f" {m.title}  (↑↓ move · 1-9/c pick · {exp_hint} · Enter confirm · Esc skip){cnt_lbl} ",
+            max(10, width - 5),
+        )
+        bar_fill = max(0, (width - 4) - vis_width(hdr_txt))
+        lines.append(self.s.cyan("╭─") + self.s.bold_cyan(hdr_txt) + self.s.cyan("─" * bar_fill))
+
+        if m.prompt_body:
+            q_wrap_w = max(18, inner - 3)
+            q_all = _wrap_menu_text(m.prompt_body, q_wrap_w)
+            q_cap = max(3, avail_rows // 2) if m.expand_all else max(2, min(5, avail_rows // 3))
+            if len(q_all) > q_cap:
+                tail_q = clip_to_cols(q_all[q_cap - 1], max(10, q_wrap_w - 17)) + " [Space: expand]"
+                q_shown = [*q_all[: q_cap - 1], tail_q]
+            else:
+                q_shown = q_all
+            for qi, ql in enumerate(q_shown):
+                lead_q = "? " if qi == 0 else "  "
+                lines.append(self.s.cyan("│ ") + self.s.bold(clip_to_cols(f"{lead_q}{ql}", inner)))
+            lines.append(self.s.cyan("├" + "─" * max(1, width - 3)))
+
+        if not vis:
+            lines.append(self.s.cyan("│ ") + self.s.dim("(no options)"))
+            lines.append(self.s.cyan("╰" + "─" * max(1, width - 3)))
+            return lines
+
+        opt_budget = max(4, avail_rows - len(lines) - 1)
+        prepared: list[tuple[MenuItem, str, str, list[str]]] = []
+        for idx, it in enumerate(vis):
+            tag = "[c] " if it.key == "__custom__" else f"[{idx + 1}] "
+            full_txt = f"{it.label} — {it.detail}" if (it.key == "__custom__" and it.detail) else it.label
+            p0 = ("❯ " if idx == m.selected else "  ") + tag
+            p_cont = " " * vis_width(p0)
+            wrap_w = max(14, inner - vis_width(p0))
+            w_lines = _wrap_menu_text(full_txt, wrap_w)
+            prepared.append((it, p0, p_cont, w_lines))
+
+        total_wrapped_rows = sum(len(w) for _, _, _, w in prepared)
+
+        if m.expand_all or total_wrapped_rows <= opt_budget:
+            expanded_rows: list[str] = []
+            sel_first = 0
+            for idx, (it, p0, p_cont, w_lines) in enumerate(prepared):
+                if idx == m.selected:
+                    sel_first = len(expanded_rows)
+                for li, wl in enumerate(w_lines):
+                    pfx = p0 if li == 0 else p_cont
+                    if idx == m.selected:
+                        plain_row = pad_to_cols(f"{pfx}{wl}", inner)
+                        expanded_rows.append(self.s.cyan("│") + self.s.sel_row(" " + plain_row))
+                    else:
+                        body_part = self.s.dim(wl) if it.key == "__custom__" else wl
+                        head_part = self.s.bold(pfx) if li == 0 else pfx
+                        expanded_rows.append(self.s.cyan("│") + clip_to_cols(f" {head_part}{body_part}", width - 2))
+
+            if len(expanded_rows) <= opt_budget:
+                lines.extend(expanded_rows)
+            else:
+                win_h = max(3, opt_budget - 1)
+                max_top = max(0, len(expanded_rows) - win_h)
+                default_top = max(0, min(sel_first, max_top))
+                m.body_scroll = max(-default_top, min(m.body_scroll, max_top - default_top))
+                top = default_top + m.body_scroll
+                lines.extend(expanded_rows[top : top + win_h])
+                lines.append(
+                    self.s.cyan("│ ")
+                    + self.s.dim(
+                        clip_to_cols(
+                            f"[rows {top + 1}-{min(len(expanded_rows), top + win_h)} of {len(expanded_rows)} · ←/→ scroll · Space compact]",
+                            inner,
+                        )
+                    )
+                )
+        else:
+            _, sel_p0, sel_pcont, sel_w = prepared[m.selected]
+            sel_cap = max(3, opt_budget - min(len(vis) - 1, 4))
+            sel_note = ""
+            if len(sel_w) > sel_cap:
+                slice_h = max(2, sel_cap - 1)
+                max_s = max(0, len(sel_w) - slice_h)
+                m.body_scroll = max(0, min(m.body_scroll, max_s))
+                sel_slice = sel_w[m.body_scroll : m.body_scroll + slice_h]
+                sel_note = f"[option lines {m.body_scroll + 1}-{m.body_scroll + len(sel_slice)} of {len(sel_w)} · ←/→ scroll · Space expand all]"
+            else:
+                m.body_scroll = 0
+                sel_slice = sel_w
+
+            sel_rows_used = len(sel_slice) + (1 if sel_note else 0)
+            other_slots = max(1, opt_budget - sel_rows_used)
+            win_items = min(len(vis), other_slots + 1)
+            if win_items < len(vis):
+                win_items = max(2, win_items - 1)
+            half = win_items // 2
+            start = max(0, min(m.selected - half, max(0, len(vis) - win_items)))
+            end = min(len(vis), start + win_items)
+
+            if start > 0:
+                lines.append(self.s.cyan("│ ") + self.s.dim(f"  ↑ {start} above..."))
+            for idx in range(start, end):
+                it, p0, p_cont, w_lines = prepared[idx]
+                if idx == m.selected:
+                    for li, wl in enumerate(sel_slice):
+                        pfx = p0 if li == 0 else p_cont
+                        plain_row = pad_to_cols(f"{pfx}{wl}", inner)
+                        lines.append(self.s.cyan("│") + self.s.sel_row(" " + plain_row))
+                    if sel_note:
+                        lines.append(self.s.cyan("│ ") + self.s.dim(clip_to_cols(f"{p_cont}{sel_note}", inner)))
+                else:
+                    if len(w_lines) == 1:
+                        body_s = self.s.dim(w_lines[0]) if it.key == "__custom__" else w_lines[0]
+                        lines.append(self.s.cyan("│") + clip_to_cols(f" {self.s.bold(p0)}{body_s}", width - 2))
+                    else:
+                        hint = f"  (+{len(w_lines) - 1}L · Space)"
+                        first_c = clip_to_cols(w_lines[0], max(12, inner - vis_width(p0) - vis_width(hint)))
+                        lines.append(
+                            self.s.cyan("│")
+                            + clip_to_cols(f" {self.s.bold(p0)}{first_c}{self.s.dim(hint)}", width - 2)
+                        )
+            if end < len(vis):
+                lines.append(self.s.cyan("│ ") + self.s.dim(f"  ↓ {len(vis) - end} more..."))
+
+        lines.append(self.s.cyan("╰" + "─" * max(1, width - 3)))
+        return lines
+
     def _render_menu_lines(self, m: MenuOverlay, width: int) -> list[str]:
+        avail_rows = max(9, self.comp.rows() - 9)
+        if m.kind == "ask_user":
+            return self._render_ask_user_menu_lines(m, width, avail_rows)
+
         inner = max(30, width - 5)
         lines: list[str] = []
 
@@ -1806,6 +1994,17 @@ class VisualTuiController:
         bar_fill = max(0, (width - 4) - vis_width(hdr_txt))
         lines.append(self.s.cyan("╭─") + self.s.bold_cyan(hdr_txt) + self.s.cyan("─" * bar_fill))
 
+        if m.prompt_body:
+            p_wrap = _wrap_menu_text(m.prompt_body, max(18, inner - 2))
+            p_cap = max(4, avail_rows - 8) if m.expand_all else 3
+            if len(p_wrap) > p_cap:
+                shown_p = [*p_wrap[: p_cap - 1], clip_to_cols(p_wrap[p_cap - 1], max(10, inner - 20)) + " [Space: expand]"]
+            else:
+                shown_p = p_wrap
+            for pl in shown_p:
+                lines.append(self.s.cyan("│ ") + clip_to_cols(pl, inner))
+            lines.append(self.s.cyan("├" + "─" * max(1, width - 3)))
+
         if not vis:
             lines.append(self.s.cyan("│ ") + self.s.dim("(no matching items — Backspace to widen filter or Esc to close)"))
         else:
@@ -1814,6 +2013,7 @@ class VisualTuiController:
             end = min(len(vis), start + m.max_visible)
             if start > 0:
                 lines.append(self.s.cyan("│ ") + self.s.dim(f"  ↑ {start} above..."))
+            sel_was_clipped = False
             for idx in range(start, end):
                 it = vis[idx]
                 is_sel = idx == m.selected
@@ -1823,6 +2023,8 @@ class VisualTuiController:
                 left = pad_to_cols(f"{ptr}{it.label}", lbl_w)
                 right_budget = max(8, inner - vis_width(left) - vis_width(badge) - 2)
                 det = clip_to_cols(it.detail, right_budget)
+                if is_sel and (vis_width(f"{ptr}{it.label}") > lbl_w or vis_width(it.detail) > right_budget):
+                    sel_was_clipped = True
                 row_plain = f"{left}  {det}{badge}"
                 row_padded = pad_to_cols(row_plain, inner)
                 if is_sel:
@@ -1835,6 +2037,15 @@ class VisualTuiController:
                     lines.append(self.s.cyan("│") + clip_to_cols(styled_row, width - 2))
             if end < len(vis):
                 lines.append(self.s.cyan("│ ") + self.s.dim(f"  ↓ {len(vis) - end} more..."))
+
+            if m.kind != "threads" and sel_was_clipped:
+                cur_it = vis[m.selected]
+                full_sel = f"{cur_it.label} — {cur_it.detail}" if cur_it.detail else cur_it.label
+                foot_lines = _wrap_menu_text(full_sel, max(18, inner - 3))[:3]
+                lines.append(self.s.cyan("├" + "─" * max(1, width - 3)))
+                for fl_i, fl in enumerate(foot_lines):
+                    lead_f = "▸ " if fl_i == 0 else "  "
+                    lines.append(self.s.cyan("│ ") + self.s.dim(clip_to_cols(f"{lead_f}{fl}", inner)))
 
             # For `Ctrl+O` Thinking Threads Explorer: live split-pane preview of selected thread's verbatim CoT & tools!
             if m.kind == "threads" and m.expanded_detail:
@@ -1893,7 +2104,7 @@ class VisualTuiController:
                     "  "
                     + self.s.yellow(
                         clip_to_cols(
-                            f"◈ Paused — awaiting approval on {r.model_profile.model_id} (y allow · e auto-edit · t turbo · n deny)",
+                            f"◈ Paused — awaiting approval on {r.model_profile.model_id} (y allow · e auto-edit · t turbo · n deny · Space expand)",
                             width - 4,
                         )
                     )
@@ -1903,7 +2114,7 @@ class VisualTuiController:
                     "  "
                     + self.s.cyan(
                         clip_to_cols(
-                            "◈ Paused — awaiting your response below (↑↓ navigate · Enter confirm · Esc skip)",
+                            "◈ Paused — awaiting your response below (↑↓ move · Space expand · 1-9/c/Enter pick · Esc skip)",
                             width - 4,
                         )
                     )
@@ -1948,11 +2159,16 @@ class VisualTuiController:
         # 4. Active Navigable Menu / Thinking Threads Explorer (renders neatly right above composer!)
         if self.menu is not None:
             lines.extend(self._render_menu_lines(self.menu, width))
+        elif self._custom_input_question:
+            q_lines = _wrap_menu_text(self._custom_input_question, max(20, width - 8))[:6]
+            for qi, ql in enumerate(q_lines):
+                lead_q = "? " if qi == 0 else "  "
+                lines.append("  " + self.s.cyan(clip_to_cols(f"{lead_q}{ql}", width - 4)))
 
         # 5. Always-Live Bordered Prompt Composer Box
         top_lbl = ""
         if self._custom_input_label:
-            top_lbl = f" {self._custom_input_label} (Enter confirm · Esc cancel) "
+            top_lbl = " Type your custom answer below (Enter confirm · Esc cancel) "
         elif self.input_buf.startswith("/steer "):
             top_lbl = " » Live Steer: type guidance + Enter to inject into active turn "
         elif self.turn_busy.is_set():
@@ -2428,12 +2644,19 @@ class VisualTuiController:
                     out_f = self.rt.runner.trace_ledger.export_markdown()
                     self.flash(f"Exported thinking threads -> {out_f}")
                 return
-            if m.kind == "threads" and k in ("PGUP", "LEFT"):
-                m.body_scroll = max(0, m.body_scroll - 6)
+            if k in ("PGUP", "LEFT"):
+                step_scr = 4 if m.kind == "ask_user" else 6
+                m.body_scroll = (m.body_scroll - step_scr) if m.kind == "ask_user" else max(0, m.body_scroll - step_scr)
                 self.comp.render()
                 return
-            if m.kind == "threads" and k in ("PGDN", "RIGHT"):
-                m.body_scroll += 6
+            if k in ("PGDN", "RIGHT"):
+                step_scr = 4 if m.kind == "ask_user" else 6
+                m.body_scroll += step_scr
+                self.comp.render()
+                return
+            if not m.allow_filter and k == "CHAR" and ev.text == " ":
+                m.expand_all = not m.expand_all
+                m.body_scroll = 0
                 self.comp.render()
                 return
             if m.kind == "approval" and k == "CHAR" and ev.text.lower() in ("y", "e", "t", "n"):
@@ -2443,6 +2666,23 @@ class VisualTuiController:
                 if cur_it and m.on_select:
                     m.on_select(cur_it)
                 return
+            if m.kind == "ask_user" and k == "CHAR":
+                vis_items = m.clamp_selection()
+                ch_low = ev.text.lower()
+                if ch_low == "c":
+                    for idx_c, it_c in enumerate(vis_items):
+                        if it_c.key == "__custom__":
+                            m.selected = idx_c
+                            if m.on_select:
+                                m.on_select(it_c)
+                            return
+                elif "1" <= ev.text <= "9":
+                    pick_idx = int(ev.text) - 1
+                    if 0 <= pick_idx < len(vis_items) and vis_items[pick_idx].key != "__custom__":
+                        m.selected = pick_idx
+                        if m.on_select:
+                            m.on_select(vis_items[pick_idx])
+                        return
             if k == "ENTER":
                 if m.kind == "threads":
                     m.expanded_detail = not m.expanded_detail

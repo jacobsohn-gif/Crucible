@@ -1138,13 +1138,18 @@ def run_interactive_tui(rt: HarnessRuntime) -> int:
         try:
             with stdin_lock:
                 with rt.print_lock:
+                    opt_lines = "\n".join(f"  [{i + 1}] {o}" for i, o in enumerate(opts))
                     sys.stdout.write(
-                        f"\n{c_cyan('? Agent question')}: {q}"
-                        + (f"\n  Options: {', '.join(opts)}" if opts else "")
-                        + "\n"
+                        f"\n{c_cyan('? Question')}: {q}\n"
+                        + (f"{opt_lines}\n" if opt_lines else "")
                     )
                     sys.stdout.flush()
-                return input("  Your answer: ").strip()
+                raw_ans = input("  Select 1-9 or type custom answer: ").strip()
+                if raw_ans.isdigit():
+                    idx = int(raw_ans) - 1
+                    if 0 <= idx < len(opts):
+                        return str(opts[idx])
+                return raw_ans
         finally:
             stdin_claimed.clear()
 
