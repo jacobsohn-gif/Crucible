@@ -1,0 +1,10 @@
+evaluator_id: epistemic_grounding_auditor
+name: Epistemic Grounding & Claim-to-Evidence Auditor
+paradigm: llm_judge
+stage: 2
+events: [BeforeTool, Stop]
+tool_matcher: ^(edit_file)$
+requires_blind_context: false
+cross_family_preferred: true
+mcp_tool_name: eval_epistemic_grounding
+description: Enforces Read-Before-Edit provenance on BeforeTool[edit_file] and audits proposed completion claims against ground-truth tool execution telemetry.

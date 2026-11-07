@@ -1,0 +1,10 @@
+evaluator_id: trajectory_sentinel
+name: Trajectory Loop & Process Advantage Compass
+paradigm: deterministic
+stage: 1
+events: [AfterTool]
+tool_matcher: .*
+requires_blind_context: true
+cross_family_preferred: false
+mcp_tool_name: eval_trajectory_compass
+description: Detects exact action loops, A<->B k-cycle oscillations, error-signature stagnation across edits, diff state hash regressions, and read spirals; returns PAV progress delta and suggested next probes.

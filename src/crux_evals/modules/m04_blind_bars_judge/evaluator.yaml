@@ -1,0 +1,10 @@
+evaluator_id: blind_bars_judge
+name: Provenance-Blind Cross-Family BARS Judge
+paradigm: llm_judge
+stage: 2
+events: [Stop]
+tool_matcher: .*
+requires_blind_context: true
+cross_family_preferred: true
+mcp_tool_name: eval_blind_judge
+description: Evaluates ONLY the raw task objective, anonymous git diff, and raw test output with Actor CoT stripped, scoring 0.0/0.5/1.0 Behaviorally Anchored Rating Scales with conservative Bayesian LCB.

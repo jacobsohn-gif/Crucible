@@ -1,0 +1,10 @@
+evaluator_id: clean_patch_and_contract
+name: Clean Patch, Test Integrity & Contract Gate
+paradigm: deterministic
+stage: 1
+events: [AfterTool, Stop]
+tool_matcher: ^(edit_file|write_file)$
+requires_blind_context: true
+cross_family_preferred: false
+mcp_tool_name: eval_invariant_and_patch
+description: Audits unified diffs for deleted or weakened test assertions (Anti-Goodhart), syntax/AST errors, secret leaks, declared invariants, and checks empirical verification after code edits.
