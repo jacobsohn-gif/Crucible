@@ -2250,6 +2250,270 @@ class SecurityAndInvariantsSuite(unittest.TestCase):
         self.assertIn("⎣ 0  λ ⎦", mat)
         self.assertEqual(normalize_terminal_math_glyphs("𝑥ₙ", use_color=False), "x_n")
 
+    # =========================================================================
+    # 13. Multi-Turn ACP Session Reuse & Tail-Safe Cold Hydration (`<=135k` chars)
+    # =========================================================================
+
+    def test_agy_acp_multi_turn_session_reuse_and_tail_safe_cold_hydration(self) -> None:
+        from ush.auth.vault import login_antigravity_acp
+        from ush.brain.agy_acp import (
+            MAX_ACP_PROMPT_CHARS,
+            ToolCallTagStreamSplitter,
+            _blocks_char_len,
+            _build_bounded_cold_prompt_blocks,
+            close_all_agy_bridges,
+        )
+        from ush.brain.context_dag import build_deterministic_epistemic_summary
+        from ush.brain.wire import wrap_dynamic_instructions
+
+        # 13a. `<crux_tool_call>` + `agy` malformed-call warning banner are stripped on 1-char boundaries
+        sp = ToolCallTagStreamSplitter()
+        noisy_stream = (
+            "Analyzing a < b.\n"
+            "⚠ Your previous response contained an improperly formatted function call\nRetries remaining: 3\n"
+            '<crux_tool_call>{"name": "read_file", "arguments": {"path": "cfg.txt"}}</crux_tool_call>'
+            "Clean prose!"
+        )
+        vis_out = "".join(sp.feed(c) for c in noisy_stream) + sp.flush()
+        self.assertEqual(vis_out, "Analyzing a < b.\nClean prose!")
+
+        # 13b. Deterministic epistemic summary keeps BOTH Turn-1 objective and latest user turns (never drops >Turn 4)
+        twelve_turns = [
+            CanonicalMessage(role="user", parts=[CanonicalPart(kind="text", text=f"USER_GOAL_TURN_{i:02d}")])
+            for i in range(1, 13)
+        ]
+        epi = build_deterministic_epistemic_summary(twelve_turns)
+        self.assertIn("USER_GOAL_TURN_01", epi)
+        self.assertIn("USER_GOAL_TURN_12", epi)
+        self.assertIn("USER_GOAL_TURN_11", epi)
+
+        # 13c. Live multi-turn reuse across `<dynamic_instructions>`, quoted assistant tags, read tombstoning, `/btw` & `/model`
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            ws = root / "ws"
+            home = root / "home"
+            skill_dir = root / "skills" / "eval-kit"
+            ws.mkdir()
+            skill_dir.mkdir(parents=True)
+            # Large >512-byte target file so `tombstone_superseded_reads` activates on duplicate `read_file`!
+            (ws / "spec.txt").write_text("SPEC_HEADER_v1\n" + ("line_payload_alpha_beta_gamma\n" * 30), encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: eval-kit\ndescription: Evaluator harness plugin benchmark\n---\nUse evaluator plugins.\n",
+                encoding="utf-8",
+            )
+            rpc_log = root / "acp_rpc_log.jsonl"
+            mock_agy = root / "mock_agy_multi.py"
+            mock_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"log_path = pathlib.Path({str(rpc_log)!r})\n"
+                "sess_seq = 0\n"
+                "step = 0\n"
+                "cur_model = 'gemini-4-argon-high'\n"
+                "for line in sys.stdin:\n"
+                "    obj = json.loads(line)\n"
+                "    rid = obj.get('id')\n"
+                "    m = obj.get('method')\n"
+                "    with log_path.open('a', encoding='utf-8') as lf:\n"
+                "        lf.write(json.dumps({'method': m, 'params': obj.get('params')}) + '\\n')\n"
+                "    if m == 'initialize':\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': 1}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/new':\n"
+                "        sess_seq += 1\n"
+                "        res = {\n"
+                "            'sessionId': f'acp_live_{sess_seq}',\n"
+                "            'models': {\n"
+                "                'currentModelId': cur_model,\n"
+                "                'availableModels': [\n"
+                "                    {'modelId': 'gemini-4-argon-high', 'name': 'Gemini 4 Argon (High)'},\n"
+                "                    {'modelId': 'gemini-3.8-flash-high', 'name': 'Gemini 3.8 Flash (High)'},\n"
+                "                ],\n"
+                "            },\n"
+                "            'configOptions': [{\n"
+                "                'id': 'model',\n"
+                "                'currentValue': 'gemini-4-argon',\n"
+                "                'options': [\n"
+                "                    {'value': 'gemini-4-argon', 'name': 'Gemini 4 Argon'},\n"
+                "                    {'value': 'gemini-3.8-flash', 'name': 'Gemini 3.8 Flash'},\n"
+                "                ],\n"
+                "            }],\n"
+                "        }\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': res}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/set_model':\n"
+                "        cur_model = obj['params']['modelId']\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif m == 'session/prompt':\n"
+                "        sid = obj['params']['sessionId']\n"
+                "        p_dump = json.dumps(obj['params']['prompt'])\n"
+                "        if 'SIDE_QUESTION /btw' in p_dump:\n"
+                "            txt = 'BTW_SIDE_ANSWER_OK'\n"
+                "        else:\n"
+                "            step += 1\n"
+                "            if step == 1:\n"
+                "                txt = '<crux_tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"spec.txt\"}}</crux_tool_call>'\n"
+                "            elif step == 2:\n"
+                "                # Assistant quotes `<dynamic_instructions>` in Markdown — must NOT break Turn 2 fingerprint!\n"
+                "                txt = 'Explained `<dynamic_instructions>skills</dynamic_instructions>` cleanly in Turn 1.'\n"
+                "            elif step == 3:\n"
+                "                # Re-reading `spec.txt` triggers `tombstone_superseded_reads` on Step 4!\n"
+                "                txt = '<crux_tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"spec.txt\"}}</crux_tool_call>'\n"
+                "            elif step == 4:\n"
+                "                txt = 'Completed Turn 2 after superseded read tombstoning.'\n"
+                "            else:\n"
+                "                txt = f'Answered Turn 3 directly on {cur_model} without repeating Turn 1!'\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+                "            'sessionId': sid,\n"
+                "            'update': {'sessionUpdate': 'agent_thought_chunk', 'content': {'type': 'text', 'text': f'Thought {step}'}}\n"
+                "        }}) + '\\n')\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+                "            'sessionId': sid,\n"
+                "            'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': txt}}\n"
+                "        }}) + '\\n')\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {\n"
+                "            'stopReason': 'end_turn',\n"
+                "            'usage': {'inputTokens': 200, 'outputTokens': 25, 'cachedReadTokens': 800, 'thoughtTokens': 10}\n"
+                "        }}) + '\\n')\n"
+                "        sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            os.chmod(mock_agy, 0o700)
+
+            with mock.patch.dict(
+                os.environ,
+                {"USH_HOME": str(home), "USH_DISABLE_KEYCHAIN": "1", "CRUX_AGY_BIN": str(mock_agy)},
+                clear=False,
+            ):
+                try:
+                    vault = CredentialVault(home, probe_ambient=False)
+                    prof = login_antigravity_acp(vault, profile_name="antigravity", run_login_if_needed=False)
+                    sk_mgr = SkillManager(
+                        ws,
+                        ush_home=home,
+                        is_workspace_trusted=True,
+                        extension_skill_dirs=[root / "skills"],
+                        include_user_ecosystem_dirs=False,
+                    )
+                    runner = SessionRunner(
+                        workspace_root=ws,
+                        client=UniversalModelClient(vault, HttpProviderTransport(vault)),
+                        auth_profile=prof,
+                        model_profile=resolve_model_profile("gemini-4-argon", "antigravity"),
+                        mode=PermissionMode.AUTO_EDIT,
+                        tools=build_default_tool_registry(),
+                        skill_manager=sk_mgr,
+                        ush_home=home,
+                    )
+                    try:
+                        # Turn 1: BM25 skill delta injects `<dynamic_instructions>`, reads `spec.txt`, quotes `<dynamic_instructions>`
+                        t1 = runner.run_turn("Inspect evaluator benchmark plugin and spec.txt")
+                        self.assertIn("<dynamic_instructions>", t1.final_message.plain_text())
+                        # `TokenUsage.input_tokens` = `raw_in (200) + cached_in (800) = 1000` per step (`0.80` cache hit rate!)
+                        self.assertEqual(t1.final_message.usage.input_tokens, 1000)
+                        self.assertAlmostEqual(t1.final_message.usage.cache_hit_rate, 0.80)
+
+                        # Mid-session `/btw` (`tools=[]`) MUST NOT clobber the main ACP session!
+                        btw = runner.ask_btw("Quick side check?")
+                        self.assertEqual(btw.plain_text(), "BTW_SIDE_ANSWER_OK")
+
+                        # Turn 2: Re-reads `spec.txt` -> triggers `tombstone_superseded_reads` on Turn 1's tool output!
+                        t2 = runner.run_turn("Re-verify spec.txt for evaluator harness")
+                        self.assertEqual(t2.final_message.plain_text(), "Completed Turn 2 after superseded read tombstoning.")
+
+                        # Turn 3: Switch live model (`gemini-4-argon` -> `gemini-3.8-flash`) -> foreign thoughts scrubbed, SAME ACP session kept!
+                        runner.model_profile = resolve_model_profile("gemini-3.8-flash", "antigravity")
+                        t3 = runner.run_turn("What is the final decision?")
+                        self.assertIn("gemini-3.8-flash-high", t3.final_message.plain_text())
+
+                        # Verify ALL 5 main-session `session/prompt` calls used `acp_live_1` and NEVER re-sent `<crux_system_instructions>` after step 1!
+                        logged = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                        main_prompts = [
+                            rec["params"]
+                            for rec in logged
+                            if rec["method"] == "session/prompt"
+                            and "SIDE_QUESTION /btw" not in json.dumps(rec["params"]["prompt"])
+                        ]
+                        self.assertEqual(len(main_prompts), 5)
+                        self.assertTrue(all(p["sessionId"] == "acp_live_1" for p in main_prompts))
+                        self.assertIn("<crux_system_instructions>", json.dumps(main_prompts[0]["prompt"]))
+                        for idx_p, follow_p in enumerate(main_prompts[1:], start=2):
+                            dumped = json.dumps(follow_p["prompt"])
+                            self.assertNotIn(
+                                "<crux_system_instructions>",
+                                dumped,
+                                f"Main step {idx_p} unexpectedly cold-restarted ACP session!",
+                            )
+                    finally:
+                        runner.close()
+                finally:
+                    close_all_agy_bridges()
+
+        # 13d. Tail-safe cold hydration (`crux -c` resume of an 800,000-char session) stays `<= 135,000` chars & keeps latest prompt verbatim!
+        huge_msgs: list[CanonicalMessage] = []
+        for turn_i in range(1, 36):
+            u_parts = [CanonicalPart(kind="text", text=f"Turn {turn_i} user objective: build module_{turn_i}.py")]
+            if turn_i == 35:
+                u_parts.append(wrap_dynamic_instructions("<skills_delta>eval</skills_delta>"))
+            huge_msgs.append(CanonicalMessage(role="user", parts=u_parts, entry_id=f"u_{turn_i}"))
+            if turn_i < 35:
+                huge_msgs.append(
+                    CanonicalMessage(
+                        role="assistant",
+                        parts=[
+                            CanonicalPart(
+                                kind="tool_call",
+                                tool_call_id=f"c_{turn_i}",
+                                tool_name="read_file",
+                                tool_args={"path": f"src/module_{turn_i}.py"},
+                            )
+                        ],
+                        entry_id=f"a_tc_{turn_i}",
+                    )
+                )
+                huge_msgs.append(
+                    CanonicalMessage(
+                        role="tool",
+                        parts=[
+                            CanonicalPart(
+                                kind="tool_result",
+                                tool_call_id=f"c_{turn_i}",
+                                tool_name="read_file",
+                                text=(f"# File src/module_{turn_i}.py\n" + ("x = 42  # padding payload line\n" * 800)),
+                            )
+                        ],
+                        entry_id=f"t_{turn_i}",
+                    )
+                )
+                huge_msgs.append(
+                    CanonicalMessage(
+                        role="assistant",
+                        parts=[
+                            CanonicalPart(
+                                kind="text",
+                                text=(f"Completed analysis of module_{turn_i}.py.\n" + ("Detailed section summary line.\n" * 90)),
+                            )
+                        ],
+                        entry_id=f"a_ans_{turn_i}",
+                    )
+                )
+        raw_total = sum(len(p.text or "") for m in huge_msgs for p in m.parts)
+        self.assertGreater(raw_total, 800_000)
+
+        cold_blocks = _build_bounded_cold_prompt_blocks(
+            system_prompt="Crucible system prompt",
+            tool_decl="<crux_tool_protocol>tools</crux_tool_protocol>",
+            messages=huge_msgs,
+        )
+        cold_chars = _blocks_char_len(cold_blocks)
+        self.assertLessEqual(cold_chars, MAX_ACP_PROMPT_CHARS)
+        full_cold_txt = "\n".join(str(b.get("text") or "") for b in cold_blocks)
+        self.assertIn("<prior_conversation_digest>", full_cold_txt)
+        self.assertIn("Turn 1 user objective: build module_1.py", full_cold_txt)
+        self.assertIn("<current_user_request>", cold_blocks[-1]["text"])
+        self.assertIn("Turn 35 user objective: build module_35.py", cold_blocks[-1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

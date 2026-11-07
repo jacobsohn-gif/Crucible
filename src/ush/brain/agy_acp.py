@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from ush.brain.wire import extract_fallback_tool_calls, parse_lenient_json_object
+from ush.brain.wire import DYNAMIC_TAG_RE, extract_fallback_tool_calls, parse_lenient_json_object
 from ush.core.types import (
     CanonicalMessage,
     CanonicalPart,
@@ -38,6 +38,19 @@ from ush.core.types import (
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\r")
 _EFFORT_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<effort>high|medium|low|xhigh|max)$", re.IGNORECASE)
 _EFFORT_LABEL_RE = re.compile(r"\s*\((?:High|Medium|Low|XHigh|Max)\)\s*$", re.IGNORECASE)
+_AGY_MALFORMED_BANNER_RE = re.compile(
+    r"⚠\s*Your previous response contained an improperly formatted function call[\s\S]*?Retries remaining:\s*\d+\s*"
+)
+_AGY_MALFORMED_BANNER_STREAM_RE = re.compile(
+    r"⚠\s*Your previous response contained an improperly formatted function call[\s\S]*?Retries remaining:\s*\d+[ \t]*\r?\n+"
+)
+
+# `agy acp` silently front-truncates any single `session/prompt` payload above ~195,000 chars (~54.8k tokens).
+# Enforce a strict 135,000-char ceiling with tail-first preservation so the user's latest prompt is NEVER cut off.
+MAX_ACP_PROMPT_CHARS = 135_000
+_OLD_TOOL_OUTPUT_CAP_CHARS = 3_200
+_RECENT_TOOL_OUTPUT_CAP_CHARS = 28_000
+_DELTA_TOOL_OUTPUT_CAP_CHARS = 90_000
 
 _CRUX_PIPE_AGENT_NAME = "crux-llm-pipe"
 _CRUX_PIPE_AGENT_MD = """---
@@ -53,7 +66,7 @@ hidden: true
 
 # System Prompt
 
-You are the core reasoning model inside the Crucible (`crux`) agent harness. Follow the system instructions and `<tool_call>` protocol in the conversation accurately.
+You are the core reasoning model inside the Crucible (`crux`) agent harness. Follow the system instructions and `<crux_tool_call>` protocol in the conversation accurately. Always prioritize and answer the latest user request directly without repeating already-completed prior explanations.
 """
 
 
@@ -209,13 +222,16 @@ def resolve_acp_variant_id(
 
 
 class ToolCallTagStreamSplitter:
-    """Streams assistant prose with zero lag while withholding `<tool_call>...</tool_call>` XML from TUI scrollback."""
+    """Streams assistant prose with zero lag while withholding `<crux_tool_call>` / `<tool_call>` XML from TUI."""
 
-    OPEN_TAG = "<tool_call>"
-    CLOSE_TAG = "</tool_call>"
+    TAG_PAIRS: tuple[tuple[str, str], ...] = (
+        ("<crux_tool_call>", "</crux_tool_call>"),
+        ("<tool_call>", "</tool_call>"),
+    )
+    _BANNER_PREFIX = "⚠ Your previous response contained an improperly formatted function call"
 
     def __init__(self) -> None:
-        self._in_tag = False
+        self._active_close_tag: str | None = None
         self._buf = ""
 
     def feed(self, chunk: str) -> str:
@@ -225,35 +241,55 @@ class ToolCallTagStreamSplitter:
         self._buf += chunk
         visible: list[str] = []
         while self._buf:
-            if not self._in_tag:
-                idx = self._buf.find(self.OPEN_TAG)
-                if idx != -1:
-                    if idx > 0:
-                        visible.append(self._buf[:idx])
-                    self._buf = self._buf[idx + len(self.OPEN_TAG) :]
-                    self._in_tag = True
+            if self._active_close_tag is None:
+                self._buf = _AGY_MALFORMED_BANNER_STREAM_RE.sub("", self._buf)
+                if not self._buf:
+                    break
+
+                best_idx = -1
+                best_open = ""
+                best_close = ""
+                for otag, ctag in self.TAG_PAIRS:
+                    idx = self._buf.find(otag)
+                    if idx != -1 and (best_idx == -1 or idx < best_idx):
+                        best_idx = idx
+                        best_open = otag
+                        best_close = ctag
+
+                if best_idx != -1:
+                    if best_idx > 0:
+                        visible.append(self._buf[:best_idx])
+                    self._buf = self._buf[best_idx + len(best_open) :]
+                    self._active_close_tag = best_close
                     continue
-                hold = self._partial_suffix_len(self._buf, self.OPEN_TAG)
+
+                hold = max(self._partial_suffix_len(self._buf, otag) for otag, _ in self.TAG_PAIRS)
+                warn_idx = self._buf.rfind("⚠")
+                if warn_idx != -1 and len(self._buf) - warn_idx < 260:
+                    tail = self._buf[warn_idx:]
+                    if self._BANNER_PREFIX.startswith(tail) or tail.startswith("⚠ Your previous response"):
+                        hold = max(hold, len(tail))
+
                 emit_end = len(self._buf) - hold
                 if emit_end > 0:
                     visible.append(self._buf[:emit_end])
                     self._buf = self._buf[emit_end:]
                 break
             else:
-                cidx = self._buf.find(self.CLOSE_TAG)
+                cidx = self._buf.find(self._active_close_tag)
                 if cidx != -1:
-                    self._buf = self._buf[cidx + len(self.CLOSE_TAG) :]
-                    self._in_tag = False
+                    self._buf = self._buf[cidx + len(self._active_close_tag) :]
+                    self._active_close_tag = None
                     continue
-                hold = self._partial_suffix_len(self._buf, self.CLOSE_TAG)
+                hold = self._partial_suffix_len(self._buf, self._active_close_tag)
                 self._buf = self._buf[len(self._buf) - hold :] if hold else ""
                 break
         return "".join(visible)
 
     def flush(self) -> str:
-        rem = "" if self._in_tag else self._buf
+        rem = "" if self._active_close_tag is not None else _AGY_MALFORMED_BANNER_RE.sub("", self._buf)
         self._buf = ""
-        self._in_tag = False
+        self._active_close_tag = None
         return rem
 
     @staticmethod
@@ -265,13 +301,23 @@ class ToolCallTagStreamSplitter:
         return 0
 
 
+@dataclass(frozen=True)
+class _AcpMsgRecord:
+    """Normalization-invariant message record so dynamic tags & read tombstoning never drop live ACP sessions."""
+
+    entry_id: str
+    role: str
+    msg_fp: str
+    tool_part_fps: tuple[str, ...] = ()
+
+
 @dataclass
 class _TrackedAcpSession:
     acp_session_id: str
     current_variant_id: str
     sys_hash: str
     tools_hash: str
-    msg_fingerprints: list[str] = field(default_factory=list)
+    msg_records: list[_AcpMsgRecord] = field(default_factory=list)
 
 
 def _ensure_isolated_pipe_workspace(ush_home: pathlib.Path) -> pathlib.Path:
@@ -284,7 +330,7 @@ def _ensure_isolated_pipe_workspace(ush_home: pathlib.Path) -> pathlib.Path:
     except OSError:
         pass
 
-    # Minimal `.git` marker so `agy` treats `pipe_dir` as an isolatedcustomization root without shelling out
+    # Minimal `.git` marker so `agy` treats `pipe_dir` as an isolated customization root without shelling out
     git_dir = pipe_dir / ".git"
     if not git_dir.exists():
         (git_dir / "objects").mkdir(parents=True, exist_ok=True)
@@ -301,20 +347,104 @@ def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
-def _fingerprint_message(msg: CanonicalMessage) -> str:
-    summary = [
-        (
-            p.kind,
-            p.text,
-            p.tool_call_id,
-            p.tool_name,
-            canonical_json(p.tool_args or {}) if p.kind == "tool_call" else "",
-            len(p.base64_data or ""),
-            p.is_error,
+def _is_pure_dynamic_msg(msg: CanonicalMessage) -> bool:
+    """Returns True when a `user` frame carries only transient `<dynamic_instructions>` (erased on subsequent steps)."""
+    if msg.role != "user":
+        return False
+    has_any = False
+    for p in msg.parts:
+        if p.kind == "image" and p.base64_data:
+            return False
+        if p.kind == "text":
+            has_any = True
+            if p.is_dynamic_instruction:
+                continue
+            if DYNAMIC_TAG_RE.sub("", p.text or "").strip():
+                return False
+    return has_any
+
+
+def _build_acp_msg_record(msg: CanonicalMessage) -> _AcpMsgRecord:
+    """Computes a stable prefix record invariant to `<dynamic_instructions>` erasure and model-switch thought scrubbing."""
+    if msg.role == "tool":
+        t_fps = tuple(
+            _hash_text(f"{p.tool_name or ''}:{int(bool(p.is_error))}:{len(p.base64_data or '')}:{p.text or ''}")
+            for p in msg.parts
+            if p.kind == "tool_result"
         )
-        for p in msg.parts
-    ]
-    return _hash_text(f"{msg.role}:{json.dumps(summary, ensure_ascii=False)}")
+        return _AcpMsgRecord(
+            entry_id=msg.entry_id or "",
+            role="tool",
+            msg_fp=_hash_text("tool:" + "|".join(t_fps)),
+            tool_part_fps=t_fps,
+        )
+
+    if msg.role == "assistant":
+        a_items: list[tuple[str, str, str]] = []
+        for p in msg.parts:
+            if p.kind == "thinking":
+                continue
+            if p.kind == "text":
+                cleaned = _AGY_MALFORMED_BANNER_RE.sub("", p.text or "").strip()
+                if cleaned:
+                    a_items.append(("text", cleaned, ""))
+            elif p.kind == "tool_call":
+                a_items.append(("tool_call", p.tool_name or "", canonical_json(p.tool_args or {})))
+        return _AcpMsgRecord(
+            entry_id=msg.entry_id or "",
+            role="assistant",
+            msg_fp=_hash_text("assistant:" + json.dumps(a_items, ensure_ascii=False)),
+        )
+
+    u_items: list[tuple[str, str, int]] = []
+    for p in msg.parts:
+        if p.is_dynamic_instruction:
+            continue
+        if p.kind == "text":
+            cleaned = DYNAMIC_TAG_RE.sub("", p.text or "").strip()
+            if cleaned:
+                u_items.append(("text", cleaned, 0))
+        elif p.kind == "image":
+            u_items.append(("image", p.mime_type or "", len(p.base64_data or "")))
+    return _AcpMsgRecord(
+        entry_id=msg.entry_id or "",
+        role=msg.role,
+        msg_fp=_hash_text(f"{msg.role}:" + json.dumps(u_items, ensure_ascii=False)),
+    )
+
+
+def _acp_record_matches(tr: _AcpMsgRecord, cur_msg: CanonicalMessage, cur_rec: _AcpMsgRecord) -> bool:
+    """Checks whether `cur_msg` represents the same turn `agy` already holds in KV cache at this position."""
+    if tr.role != cur_msg.role:
+        return False
+    if tr.entry_id and cur_msg.entry_id and tr.entry_id != cur_msg.entry_id:
+        return False
+    if tr.msg_fp == cur_rec.msg_fp:
+        return True
+    if tr.role == "tool":
+        tool_parts = [p for p in cur_msg.parts if p.kind == "tool_result"]
+        if len(tool_parts) != len(tr.tool_part_fps) or not tool_parts:
+            return False
+        for tp, tr_pfp, cur_pfp in zip(tool_parts, tr.tool_part_fps, cur_rec.tool_part_fps):
+            if tr_pfp == cur_pfp:
+                continue
+            # `tombstone_superseded_reads` replaces older duplicate `read_file` outputs locally; `agy` already cached the read
+            if not tp.is_error and (tp.text or "").startswith("[Superseded `read_file("):
+                continue
+            return False
+        return True
+    return False
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars < 320:
+        return text[-max_chars:]
+    head = int(max_chars * 0.60)
+    tail = max(120, max_chars - head - 110)
+    omitted = max(0, len(text) - head - tail)
+    return f"{text[:head]}\n...[truncated {omitted:,} middle chars to fit ACP prompt window]...\n{text[-tail:]}"
 
 
 def _render_tool_declarations(tools: list[dict[str, Any]]) -> str:
@@ -324,9 +454,9 @@ def _render_tool_declarations(tools: list[dict[str, Any]]) -> str:
         "<crux_tool_protocol>",
         "You are executing inside the Crucible (`crux`) agent harness.",
         "ONLY the following tools exist. Whenever you need to call one or more tools, emit ONLY",
-        '`<tool_call>{"name": "<tool_name>", "arguments": {...}}</tool_call>` XML blocks (one tag per call; '
-        "you may emit multiple `<tool_call>` tags in one turn for parallel reads) and then STOP and wait for "
-        "`<tool_response>`. Never fabricate tool outputs or claim a file was edited without emitting `<tool_call>`.",
+        '`<crux_tool_call>{"name": "<tool_name>", "arguments": {...}}</crux_tool_call>` XML blocks (one tag per call; '
+        "you may emit multiple `<crux_tool_call>` tags in one turn for parallel reads) and then STOP and wait for "
+        "`<tool_response>`. Never fabricate tool outputs or claim a file was edited without emitting `<crux_tool_call>`.",
         "",
         "Available Crux Tools:",
     ]
@@ -337,7 +467,14 @@ def _render_tool_declarations(tools: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _message_to_acp_blocks(msg: CanonicalMessage, *, include_role_tag: bool = False) -> list[dict[str, Any]]:
+def _message_to_acp_blocks(
+    msg: CanonicalMessage,
+    *,
+    include_role_tag: bool = False,
+    tool_output_cap: int | None = None,
+    wrap_tag: str | None = None,
+    text_cap: int | None = None,
+) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     if msg.role == "tool":
         res_lines: list[str] = []
@@ -345,9 +482,12 @@ def _message_to_acp_blocks(msg: CanonicalMessage, *, include_role_tag: bool = Fa
             if p.kind != "tool_result":
                 continue
             status_attr = ' status="error"' if p.is_error else ""
+            body_txt = p.text or ""
+            if tool_output_cap is not None and len(body_txt) > tool_output_cap:
+                body_txt = _truncate_middle(body_txt, tool_output_cap)
             res_lines.append(
                 f'<tool_response name="{p.tool_name or "tool"}" call_id="{p.tool_call_id or ""}"{status_attr}>\n'
-                f"{p.text or ''}\n"
+                f"{body_txt}\n"
                 f"</tool_response>"
             )
             if p.base64_data:
@@ -359,25 +499,30 @@ def _message_to_acp_blocks(msg: CanonicalMessage, *, include_role_tag: bool = Fa
                     }
                 )
         if res_lines:
-            blocks.insert(0, {"type": "text", "text": "\n\n".join(res_lines)})
+            joined_res = "\n\n".join(res_lines)
+            if text_cap is not None and len(joined_res) > text_cap:
+                joined_res = _truncate_middle(joined_res, text_cap)
+            blocks.insert(0, {"type": "text", "text": joined_res})
         return blocks
 
     if msg.role == "assistant":
         seg: list[str] = []
         for p in msg.parts:
             if p.kind == "text" and p.text:
-                seg.append(p.text)
+                seg.append(_AGY_MALFORMED_BANNER_RE.sub("", p.text))
             elif p.kind == "tool_call":
                 seg.append(
-                    f'<tool_call>{canonical_json({"name": p.tool_name, "arguments": p.tool_args or {}})}</tool_call>'
+                    f'<crux_tool_call>{canonical_json({"name": p.tool_name, "arguments": p.tool_args or {}})}</crux_tool_call>'
                 )
         joined = "\n".join(seg).strip()
+        if text_cap is not None and len(joined) > text_cap:
+            joined = _truncate_middle(joined, text_cap)
         if joined:
             tag = f"<prior_assistant_turn>\n{joined}\n</prior_assistant_turn>" if include_role_tag else joined
             blocks.append({"type": "text", "text": tag})
         return blocks
 
-    role_lbl = "system_note" if msg.role == "system" else "user"
+    role_lbl = wrap_tag or ("system_note" if msg.role == "system" else "user")
     text_segs: list[str] = []
     for p in msg.parts:
         if p.kind == "text" and p.text:
@@ -392,10 +537,201 @@ def _message_to_acp_blocks(msg: CanonicalMessage, *, include_role_tag: bool = Fa
             )
     if text_segs:
         body = "\n".join(text_segs)
-        if include_role_tag:
+        if text_cap is not None and len(body) > text_cap:
+            body = _truncate_middle(body, text_cap)
+        if include_role_tag or wrap_tag:
             body = f"<{role_lbl}>\n{body}\n</{role_lbl}>"
         blocks.insert(0, {"type": "text", "text": body})
     return blocks
+
+
+def _blocks_char_len(blocks: list[dict[str, Any]]) -> int:
+    return sum(len(str(b.get("text") or "")) for b in blocks)
+
+
+def _build_prior_conversation_digest(older_messages: list[CanonicalMessage], max_chars: int = 14_000) -> str:
+    """Summarizes earlier turns chronologically when cold-resuming a large session so older goals & files stay visible."""
+    user_turns: list[str] = []
+    files_touched: list[str] = []
+    prior_answers: list[str] = []
+
+    for m in older_messages:
+        if m.role == "user" and not _is_pure_dynamic_msg(m):
+            cleaned = DYNAMIC_TAG_RE.sub("", m.plain_text() or "").strip()
+            if cleaned:
+                one_line = " ".join(cleaned.split())[:260]
+                user_turns.append(one_line)
+        elif m.role == "assistant":
+            for p in m.parts:
+                if p.kind == "tool_call" and isinstance(p.tool_args, dict):
+                    fp = p.tool_args.get("path")
+                    if isinstance(fp, str) and fp and fp not in files_touched:
+                        files_touched.append(fp)
+            ans_txt = _AGY_MALFORMED_BANNER_RE.sub("", m.plain_text() or "").strip()
+            if ans_txt:
+                first_ln = " ".join(ans_txt.splitlines()[:2])[:220]
+                prior_answers.append(first_ln)
+
+    if len(user_turns) <= 14:
+        selected_users = [f"  {i + 1}. {u}" for i, u in enumerate(user_turns)]
+    else:
+        head_u = [f"  {i + 1}. {u}" for i, u in enumerate(user_turns[:4])]
+        tail_start_num = len(user_turns) - 9
+        tail_u = [f"  {tail_start_num + j}. {u}" for j, u in enumerate(user_turns[-10:])]
+        selected_users = [*head_u, f"  ... ({len(user_turns) - 14} intermediate user turns) ...", *tail_u]
+
+    lines = [
+        "<prior_conversation_digest>",
+        "Earlier turns in this session (already completed — DO NOT repeat prior explanations; use for background context only):",
+    ]
+    if selected_users:
+        lines.append("Chronological earlier user prompts:")
+        lines.extend(selected_users)
+    if files_touched:
+        lines.append("Files already inspected/modified earlier: " + ", ".join(files_touched[-30:]))
+    if prior_answers:
+        lines.append("Recent completed assistant conclusions (do not re-emit):")
+        for pa in prior_answers[-6:]:
+            lines.append(f"  - {pa}")
+    lines.append("</prior_conversation_digest>")
+    digest = "\n".join(lines)
+    return _truncate_middle(digest, max_chars)
+
+
+def _build_bounded_cold_prompt_blocks(
+    *,
+    system_prompt: str,
+    tool_decl: str,
+    messages: list[CanonicalMessage],
+    max_total_chars: int = MAX_ACP_PROMPT_CHARS,
+) -> list[dict[str, Any]]:
+    """Builds a cold-hydration ACP prompt guaranteed `<= max_total_chars` while keeping the latest prompt 100% intact."""
+    header_parts: list[str] = []
+    if system_prompt.strip():
+        header_parts.append(f"<crux_system_instructions>\n{system_prompt.strip()}\n</crux_system_instructions>")
+    if tool_decl:
+        header_parts.append(tool_decl)
+    header_blocks: list[dict[str, Any]] = (
+        [{"type": "text", "text": "\n\n".join(header_parts)}] if header_parts else []
+    )
+    header_chars = _blocks_char_len(header_blocks)
+    avail_total = max(20_000, max_total_chars - header_chars - 512)
+
+    if not messages:
+        return [*header_blocks, {"type": "text", "text": "Hello."}]
+
+    if len(messages) == 1:
+        single_blocks = _message_to_acp_blocks(
+            messages[0],
+            include_role_tag=False,
+            tool_output_cap=avail_total,
+            text_cap=avail_total,
+        )
+        return [*header_blocks, *(single_blocks or [{"type": "text", "text": "Hello."}])]
+
+    # Multi-turn cold hydration (e.g. `crux -c` resume): reserve headroom for `<prior_conversation_digest>` if needed
+    digest_reserve = min(14_500, avail_total // 5)
+    tail_budget = max(16_000, avail_total - digest_reserve)
+    n = len(messages)
+    last_is_user = messages[-1].role == "user"
+
+    # Always render the final message first so its tail is guaranteed to fit verbatim
+    final_cap = max(8_000, tail_budget - 2_000)
+    final_blocks = _message_to_acp_blocks(
+        messages[-1],
+        include_role_tag=not last_is_user,
+        wrap_tag="current_user_request" if last_is_user else None,
+        tool_output_cap=final_cap,
+        text_cap=final_cap,
+    )
+    used_chars = _blocks_char_len(final_blocks)
+
+    # Walk backwards from `n - 2` down to `0` collecting as many recent turns verbatim as fit in `tail_budget`
+    rendered_by_idx: dict[int, list[dict[str, Any]]] = {n - 1: final_blocks}
+    tail_start = n - 1
+    for idx in range(n - 2, -1, -1):
+        t_cap = _RECENT_TOOL_OUTPUT_CAP_CHARS if idx >= n - 5 else _OLD_TOOL_OUTPUT_CAP_CHARS
+        cand_blocks = _message_to_acp_blocks(
+            messages[idx],
+            include_role_tag=True,
+            tool_output_cap=t_cap,
+            text_cap=max(t_cap, 24_000),
+        )
+        cand_len = _blocks_char_len(cand_blocks)
+        if used_chars + cand_len > tail_budget:
+            break
+        rendered_by_idx[idx] = cand_blocks
+        used_chars += cand_len
+        tail_start = idx
+
+    # Snap `tail_start` forward off any orphan `role == "tool"` onto a clean `user`/`assistant` boundary
+    while tail_start < n - 1 and messages[tail_start].role == "tool":
+        used_chars -= _blocks_char_len(rendered_by_idx.pop(tail_start, []))
+        tail_start += 1
+
+    out_blocks: list[dict[str, Any]] = list(header_blocks)
+    if tail_start > 0:
+        digest_budget = max(2_000, avail_total - used_chars - 300)
+        digest_txt = _build_prior_conversation_digest(messages[:tail_start], max_chars=min(14_000, digest_budget))
+        out_blocks.append({"type": "text", "text": digest_txt})
+
+    prior_tail_indices = [i for i in range(tail_start, n - 1) if i in rendered_by_idx]
+    if last_is_user:
+        if prior_tail_indices:
+            out_blocks.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "<recent_conversation_transcript>\n"
+                        "[Completed prior turns in this session — reference for context, do NOT repeat their answers:]"
+                    ),
+                }
+            )
+            for i in prior_tail_indices:
+                out_blocks.extend(rendered_by_idx[i])
+            out_blocks.append({"type": "text", "text": "</recent_conversation_transcript>"})
+        out_blocks.extend(final_blocks)
+    else:
+        out_blocks.append({"type": "text", "text": "<recent_conversation_transcript>"})
+        for i in range(tail_start, n):
+            if i in rendered_by_idx:
+                out_blocks.extend(rendered_by_idx[i])
+        out_blocks.append(
+            {
+                "type": "text",
+                "text": "</recent_conversation_transcript>\nContinue the active turn directly from the latest `<tool_response>` above.",
+            }
+        )
+    return out_blocks
+
+
+def _build_bounded_delta_blocks(
+    delta_msgs: list[CanonicalMessage],
+    *,
+    updated_tool_decl: str = "",
+    max_total_chars: int = MAX_ACP_PROMPT_CHARS,
+) -> list[dict[str, Any]]:
+    """Renders incremental `delta_msgs` while guaranteeing single-step tool outputs never exceed `max_total_chars`."""
+    prefix_blocks: list[dict[str, Any]] = []
+    if updated_tool_decl:
+        prefix_blocks.append(
+            {"type": "text", "text": f"<updated_crux_tool_protocol>\n{updated_tool_decl}\n</updated_crux_tool_protocol>"}
+        )
+    avail = max(16_000, max_total_chars - _blocks_char_len(prefix_blocks) - 256)
+    per_msg_cap = max(8_000, avail // max(1, len(delta_msgs)))
+    t_cap = min(_DELTA_TOOL_OUTPUT_CAP_CHARS, per_msg_cap)
+
+    blocks: list[dict[str, Any]] = list(prefix_blocks)
+    for dm in delta_msgs:
+        blocks.extend(
+            _message_to_acp_blocks(
+                dm,
+                include_role_tag=False,
+                tool_output_cap=t_cap,
+                text_cap=per_msg_cap,
+            )
+        )
+    return blocks or [{"type": "text", "text": "Continue."}]
 
 
 class AgyAcpBridge:
@@ -669,27 +1005,36 @@ class AgyAcpBridge:
         tool_decl = _render_tool_declarations(tools)
         sys_h = _hash_text(system_prompt)
         tools_h = _hash_text(tool_decl)
-        cur_fps = [_fingerprint_message(m) for m in messages]
+        sess_key = f"{session_id}::__notools__" if not tools else session_id
+        durable_pairs = [
+            (idx, m, _build_acp_msg_record(m))
+            for idx, m in enumerate(messages)
+            if not _is_pure_dynamic_msg(m)
+        ]
 
-        tracked = self._sessions.get(session_id)
-        can_reuse = (
+        tracked = self._sessions.get(sess_key)
+        can_reuse = False
+        delta_msgs: list[CanonicalMessage] = []
+        if (
             tracked is not None
             and tracked.sys_hash == sys_h
-            and tracked.tools_hash == tools_h
-            and len(cur_fps) > len(tracked.msg_fingerprints)
-            and cur_fps[: len(tracked.msg_fingerprints)] == tracked.msg_fingerprints
-        )
-
-        prompt_blocks: list[dict[str, Any]] = []
-        if can_reuse and tracked is not None:
-            delta_msgs = messages[len(tracked.msg_fingerprints) :]
-            # Skip leading assistant message generated by the immediately preceding step on this same ACP session
+            and len(durable_pairs) >= len(tracked.msg_records)
+            and all(
+                _acp_record_matches(tracked.msg_records[k], durable_pairs[k][1], durable_pairs[k][2])
+                for k in range(len(tracked.msg_records))
+            )
+        ):
+            last_matched_raw_idx = durable_pairs[len(tracked.msg_records) - 1][0] if tracked.msg_records else -1
+            delta_msgs = messages[last_matched_raw_idx + 1 :]
             if delta_msgs and delta_msgs[0].role == "assistant":
                 delta_msgs = delta_msgs[1:]
-            for dm in delta_msgs:
-                prompt_blocks.extend(_message_to_acp_blocks(dm, include_role_tag=False))
-            if not prompt_blocks:
-                prompt_blocks.append({"type": "text", "text": "Continue."})
+            if delta_msgs:
+                can_reuse = True
+
+        if can_reuse and tracked is not None:
+            updated_decl = tool_decl if (tracked.tools_hash != tools_h and tool_decl) else ""
+            prompt_blocks = _build_bounded_delta_blocks(delta_msgs, updated_tool_decl=updated_decl)
+            tracked.tools_hash = tools_h
         else:
             spare = self._sessions.pop("__warm_spare__", None)
             if spare is not None:
@@ -711,20 +1056,11 @@ class AgyAcpBridge:
                     sys_hash=sys_h,
                     tools_hash=tools_h,
                 )
-            header_parts: list[str] = []
-            if system_prompt.strip():
-                header_parts.append(f"<crux_system_instructions>\n{system_prompt.strip()}\n</crux_system_instructions>")
-            if tool_decl:
-                header_parts.append(tool_decl)
-            if header_parts:
-                prompt_blocks.append({"type": "text", "text": "\n\n".join(header_parts)})
-
-            multi_msg = len(messages) > 1
-            for idx, m in enumerate(messages):
-                is_last_user = idx == len(messages) - 1 and m.role == "user"
-                prompt_blocks.extend(_message_to_acp_blocks(m, include_role_tag=(multi_msg and not is_last_user)))
-            if not prompt_blocks:
-                prompt_blocks.append({"type": "text", "text": "Hello."})
+            prompt_blocks = _build_bounded_cold_prompt_blocks(
+                system_prompt=system_prompt,
+                tool_decl=tool_decl,
+                messages=messages,
+            )
 
         assert tracked is not None
         target_variant = resolve_acp_variant_id(
@@ -812,22 +1148,25 @@ class AgyAcpBridge:
         _close_thought()
 
         if res.get("_canceled") or res.get("stopReason") == "cancelled":
-            self._sessions.pop(session_id, None)
+            self._sessions.pop(sess_key, None)
             return CanonicalMessage(role="assistant", parts=[], stop_reason=StopReason.CANCELED)
 
         usage_raw = res.get("usage") if isinstance(res.get("usage"), dict) else {}
+        raw_in = int(usage_raw.get("inputTokens") or 0)
+        cached_in = int(usage_raw.get("cachedReadTokens") or 0)
         usage = TokenUsage(
-            input_tokens=int(usage_raw.get("inputTokens") or 0),
+            input_tokens=raw_in + cached_in,
             output_tokens=int(usage_raw.get("outputTokens") or 0),
-            cached_input_tokens=int(usage_raw.get("cachedReadTokens") or 0),
+            cached_input_tokens=cached_in,
             reasoning_tokens=int(usage_raw.get("thoughtTokens") or 0),
         )
         if think_buf and usage.reasoning_tokens == 0:
             usage.reasoning_tokens = max(1, sum(len(x) for x in think_buf) // 4)
 
-        full_raw_text = "".join(raw_text_buf)
+        full_raw_text = _AGY_MALFORMED_BANNER_RE.sub("", "".join(raw_text_buf))
         known_names = {str(t["name"]) for t in tools if t.get("name")} if tools else None
         cleaned_text, tool_calls = extract_fallback_tool_calls(full_raw_text, known_names)
+        cleaned_text = cleaned_text.strip()
 
         # Also catch bare JSON tool invocation if model emitted a standalone JSON tool object without XML tags
         if not tool_calls and known_names and cleaned_text.startswith("{") and cleaned_text.endswith("}"):
@@ -871,9 +1210,12 @@ class AgyAcpBridge:
             usage=usage,
         )
 
-        # Record exact fingerprint state including the assistant reply `agy` now holds in this ACP session!
-        tracked.msg_fingerprints = [*cur_fps, _fingerprint_message(assistant_msg)]
-        self._sessions[session_id] = tracked
+        # Record durable prefix state including the assistant reply `agy` now holds in this ACP session!
+        next_records = [rec for _, _, rec in durable_pairs]
+        if assistant_msg.parts and stop_r != StopReason.EMPTY_200_RESPONSE:
+            next_records.append(_build_acp_msg_record(assistant_msg))
+        tracked.msg_records = next_records
+        self._sessions[sess_key] = tracked
         return assistant_msg
 
 
