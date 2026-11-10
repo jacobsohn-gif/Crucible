@@ -262,7 +262,7 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
                 def __init__(self) -> None:
                     self.idx = 0
 
-                def stream_turn(self, profile, auth_profile, payload, on_event=None, cancel_event=None):
+                def stream_turn(self, **kwargs):
                     msg = replies[min(self.idx, len(replies) - 1)]
                     self.idx += 1
                     return msg
