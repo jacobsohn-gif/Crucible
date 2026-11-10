@@ -58,13 +58,40 @@ class ShellHookSpec:
 class HookSystem:
     """Executes shell (`hooks.json`) and in-process Python lifecycle hooks across all 9 agent loop events."""
 
-    def __init__(self, workspace_root: pathlib.Path, *, is_workspace_trusted: bool = False) -> None:
+    def __init__(
+        self,
+        workspace_root: pathlib.Path,
+        *,
+        is_workspace_trusted: bool = False,
+        enable_crux_evals: bool = True,
+        crux_evals_mode: str = "complementary",
+    ) -> None:
         self.workspace_root = workspace_root.expanduser().resolve()
         self.is_workspace_trusted = is_workspace_trusted
+        self.enable_crux_evals = enable_crux_evals
+        self.crux_evals_mode = os.environ.get("CRUX_EVALS_MODE", crux_evals_mode)
         self.shell_hooks: list[ShellHookSpec] = []
         self._tool_filter_callbacks: list[
             Callable[[set[str], ModelCapabilityProfile], set[str]]
         ] = []
+        self._last_tool_args: dict[str, dict[str, Any]] = {}
+        self.last_eval_report: Any = None
+        self.eval_reports: list[Any] = []
+        try:
+            from crux_evals.core.runner import build_default_cascade
+            from crux_evals.core.state import SessionTelemetry
+
+            self.session_telemetry: Any = SessionTelemetry(
+                session_id="ush_live",
+                workspace_root=str(self.workspace_root),
+            )
+            self.evals_cascade: Any = build_default_cascade(
+                enforce_read_before_edit=False,
+                workspace_root=self.workspace_root,
+            )
+        except Exception:
+            self.session_telemetry = None
+            self.evals_cascade = None
 
     def add_tool_selection_filter(
         self, fn: Callable[[set[str], ModelCapabilityProfile], set[str]]
@@ -162,8 +189,41 @@ class HookSystem:
         return 0, "\n".join(notes), merged_json
 
     def fire(self, event: str, payload: dict[str, Any]) -> tuple[bool, str]:
+        if event == "UserPromptSubmit" and self.session_telemetry is not None:
+            prompt_txt = str(payload.get("prompt", "")).strip()
+            if prompt_txt:
+                self.session_telemetry.task_objective = prompt_txt
+
         rc, msg, _ = self._run_matching(event, "*", payload)
-        return rc != 2, msg
+        if rc == 2:
+            return False, msg
+
+        if event == "Stop" and self.enable_crux_evals and self.evals_cascade is not None and self.session_telemetry is not None:
+            try:
+                from crux_evals.core.state import capture_git_diff
+
+                diff = capture_git_diff(self.workspace_root) if self.session_telemetry.modified_files else ""
+                frame = self.session_telemetry.to_evaluation_frame(
+                    event="Stop",
+                    unified_git_diff=diff,
+                    actor_claim_text=str(payload.get("final_text", "")),
+                )
+                report = self.evals_cascade.run(frame)
+                self.last_eval_report = report
+                self.eval_reports.append(report)
+                eval_rc, eval_json = report.to_hook_output(
+                    mode="strict" if self.crux_evals_mode == "strict" else "complementary"
+                )
+                extra = str(eval_json.get("additionalContext", "")).strip()
+                if eval_rc == 2:
+                    reason = str(eval_json.get("reason", extra or "Vetoed by Crux-Evals Stop Gate"))
+                    return False, reason
+                if extra:
+                    msg = chr(10).join([msg, extra]).strip() if msg else extra
+            except Exception:
+                pass
+
+        return True, msg
 
     def filter_tools(
         self,
@@ -184,12 +244,14 @@ class HookSystem:
         return None if (current_allowed is None and active == all_tools) else active
 
     def before_tool(self, tool_name: str, args: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
+        self._last_tool_args[tool_name] = dict(args)
         rc, msg, meta = self._run_matching("BeforeTool", tool_name, {"tool_name": tool_name, "tool_input": args})
         if rc == 2:
             return False, args, msg
         updated = meta.get("updatedInput")
         if isinstance(updated, dict):
             args = {**args, **updated}
+            self._last_tool_args[tool_name] = dict(args)
         return True, args, msg
 
     def after_tool(self, tool_name: str, result_part: CanonicalPart) -> str:
@@ -198,6 +260,39 @@ class HookSystem:
             tool_name,
             {"tool_name": tool_name, "is_error": result_part.is_error, "preview": result_part.text[:500]},
         )
+        if self.enable_crux_evals and self.evals_cascade is not None and self.session_telemetry is not None:
+            try:
+                from crux_evals.core.state import capture_git_diff
+
+                t_args = self._last_tool_args.get(tool_name, {})
+                diff = capture_git_diff(self.workspace_root) if tool_name in ("write_file", "edit_file") else ""
+                self.session_telemetry.record_after_tool(
+                    tool_name=tool_name,
+                    tool_args=t_args,
+                    output_raw=result_part.text,
+                    is_error=result_part.is_error,
+                    exit_code=1 if result_part.is_error else 0,
+                    current_diff=diff,
+                )
+                frame = self.session_telemetry.to_evaluation_frame(
+                    event="AfterTool",
+                    tool_name=tool_name,
+                    tool_args=t_args,
+                    tool_output_raw=result_part.text,
+                    tool_is_error=result_part.is_error,
+                    tool_exit_code=1 if result_part.is_error else 0,
+                    unified_git_diff=diff,
+                )
+                report = self.evals_cascade.run(frame)
+                self.last_eval_report = report
+                self.eval_reports.append(report)
+                if report.final_decision != "ALLOW":
+                    _, eval_json = report.to_hook_output(mode="complementary")
+                    extra = str(eval_json.get("additionalContext", "")).strip()
+                    if extra:
+                        msg = chr(10).join([msg, extra]).strip() if msg else extra
+            except Exception:
+                pass
         return msg
 
 

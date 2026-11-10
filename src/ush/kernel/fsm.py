@@ -109,7 +109,17 @@ class SessionRunner:
         self.id_map = ToolIdBijectionMap()
         self.loop_guard = PopperianLoopGuard()
 
-        self.hook_runner = hook_runner
+        if hook_runner is None:
+            from ush.platform.hooks_memory_ext import HookSystem
+
+            self.hook_runner = HookSystem(
+                self.workspace_root,
+                is_workspace_trusted=False,
+                enable_crux_evals=True,
+                crux_evals_mode="complementary",
+            )
+        else:
+            self.hook_runner = hook_runner
         self.skill_manager = skill_manager
         self.memory_manager = memory_manager
 
@@ -871,6 +881,28 @@ class SessionRunner:
                         allow_stop, feedback = self.hook_runner.fire(
                             "Stop", {"final_text": last_assistant.plain_text()[:1000]}
                         )
+                        eval_rep = getattr(self.hook_runner, "last_eval_report", None)
+                        if eval_rep is not None:
+                            ev_ids = [v.evaluator_id for v in getattr(eval_rep, "verdicts", [])]
+                            _emit(
+                                StreamEvent(
+                                    kind="cognitive_event",
+                                    step=steps,
+                                    text=(
+                                        f"Crux-Evals Scorecard: decision={eval_rep.final_decision} "
+                                        f"min_bars={eval_rep.min_bars_score:.2f} "
+                                        f"lcb={eval_rep.conservative_lcb_score:.2f} "
+                                        f"evaluators={ev_ids}"
+                                    ),
+                                    meta={
+                                        "event": "crux_evals_scorecard",
+                                        "decision": eval_rep.final_decision,
+                                        "min_bars_score": eval_rep.min_bars_score,
+                                        "conservative_lcb_score": eval_rep.conservative_lcb_score,
+                                        "evaluators": ev_ids,
+                                    },
+                                )
+                            )
                         if not allow_stop:
                             stop_vetoes += 1
                             self.dag.append(

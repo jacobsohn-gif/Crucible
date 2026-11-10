@@ -230,5 +230,83 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
             self.assertEqual(out_strict["decision"], "block")
 
 
+    def test_live_session_runner_and_cascading_judge_crux_evals_wiring(self) -> None:
+        """Verifies SessionRunner auto-wires HookSystem+Crux-Evals and CascadingJudge populates crux_evals_report."""
+        from ush.auth.vault import AuthProfile, CredentialVault
+        from ush.brain.providers import UniversalModelClient
+        from ush.core.types import CanonicalMessage, CanonicalPart, StopReason, StreamEvent
+        from ush.kernel.fsm import SessionRunner
+        from ush.platform.hooks_memory_ext import HookSystem
+        from ush.swarm.judge import CandidatePatch, CascadingJudge
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ws = pathlib.Path(tmpdir) / "ws"
+            ws.mkdir()
+            home = pathlib.Path(tmpdir) / "home"
+            vault = CredentialVault(home, probe_ambient=False)
+
+            replies = [
+                CanonicalMessage(
+                    role="assistant",
+                    parts=[CanonicalPart(kind="text", text="All tests passed and 0 failed!")],
+                    stop_reason=StopReason.STOP,
+                ),
+                CanonicalMessage(
+                    role="assistant",
+                    parts=[CanonicalPart(kind="text", text="Acknowledged: verification command not yet executed.")],
+                    stop_reason=StopReason.STOP,
+                ),
+            ]
+
+            class _DummyTransport:
+                def __init__(self) -> None:
+                    self.idx = 0
+
+                def stream_turn(self, profile, auth_profile, payload, on_event=None, cancel_event=None):
+                    msg = replies[min(self.idx, len(replies) - 1)]
+                    self.idx += 1
+                    return msg
+
+            auth = AuthProfile(
+                name="test",
+                provider="google",
+                auth_kind="api_key",
+                base_url="https://generativelanguage.googleapis.com",
+                default_model="gemini-2.5-pro",
+                source="none",
+            )
+            hs = HookSystem(ws, is_workspace_trusted=True, enable_crux_evals=True, crux_evals_mode="strict")
+            runner = SessionRunner(
+                workspace_root=ws,
+                client=UniversalModelClient(vault, _DummyTransport()),
+                auth_profile=auth,
+                ush_home=home,
+                hook_runner=hs,
+            )
+            events: list[StreamEvent] = []
+            try:
+                outcome = runner.run_turn("Implement feature and verify", on_event=events.append)
+                self.assertEqual(outcome.steps_executed, 2)
+                self.assertIn("verification command not yet executed", outcome.final_message.plain_text())
+                scorecards = [e for e in events if e.meta.get("event") == "crux_evals_scorecard"]
+                self.assertGreaterEqual(len(scorecards), 2)
+                self.assertEqual(scorecards[0].meta["decision"], "VETO")
+                self.assertEqual(scorecards[-1].meta["decision"], "ALLOW")
+            finally:
+                runner.close()
+
+            cand = CandidatePatch(
+                candidate_id="c1",
+                contributor_ids=("cell-0",),
+                family="gemini",
+                unified_diff="--- a/x.py\n+++ b/x.py\n@@ -1 +1,2 @@\n x = 1\n+y = 2\n",
+                worktree_path=str(ws),
+                summary="Add y",
+            )
+            stage_a = CascadingJudge.run_stage_a(cand)
+            self.assertTrue(stage_a.passed)
+            self.assertEqual(stage_a.crux_evals_report.get("final_decision"), "ALLOW")
+
+
 if __name__ == "__main__":
     unittest.main()

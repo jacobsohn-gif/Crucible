@@ -14,6 +14,7 @@ from crux_evals.core.protocol import EvaluationFrame, HookEvent, ToolRecord, sha
 VERIFICATION_CMD_RE = re.compile(
     r"\b(pytest|py\.test|unittest|python3?\s+-m\s+(pytest|unittest)|"
     r"python3?\s+[^\s]+_test\.py|python3?\s+test_[^\s]+\.py|"
+    r"uv\s+run\b|python3?\s+[^\s]+\.py|"
     r"python3?\s+-c\b|cargo\s+(test|check)|go\s+test|npm\s+test|"
     r"pnpm\s+test|vitest|jest|ruff\s+check|mypy|pyright|tsc\b|bazel\s+test)\b",
     re.IGNORECASE,

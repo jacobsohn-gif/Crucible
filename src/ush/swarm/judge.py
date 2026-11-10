@@ -41,6 +41,7 @@ class StageAResult:
     audit: CleanPatchAudit
     test_exit_code: int | None = None
     reasons: list[str] = field(default_factory=list)
+    crux_evals_report: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -116,7 +117,39 @@ class CascadingJudge:
                 tail = (res.stdout + "\n" + res.stderr).strip()[-600:]
                 reasons.append(f"Deterministic test command failed (exit {rc}): {tail}")
 
-        return StageAResult(passed=(len(reasons) == 0), audit=audit, test_exit_code=rc, reasons=reasons)
+        crux_rep: dict[str, object] = {}
+        try:
+            from crux_evals.core.protocol import EvaluationFrame
+            from crux_evals.core.runner import build_default_cascade
+
+            ws_path = candidate.worktree_path or "."
+            cascade = build_default_cascade(enforce_read_before_edit=False)
+            frame = EvaluationFrame(
+                session_id=candidate.candidate_id,
+                workspace_root=str(ws_path),
+                event="AfterTool",
+                step_index=1,
+                task_objective=candidate.summary or "Verify candidate patch",
+                tool_name="edit_file",
+                unified_git_diff=candidate.unified_diff,
+            )
+            rep = cascade.run(frame)
+            crux_rep = rep.to_dict()
+            if rep.final_decision in ("VETO", "REWIND") and not allow_test_assertion_deletions:
+                for v in rep.verdicts:
+                    for hv in v.hard_vetoes_triggered:
+                        if hv not in str(reasons):
+                            reasons.append(f"CRUX_EVALS_{hv}: {v.remediation_directive}")
+        except Exception:
+            pass
+
+        return StageAResult(
+            passed=(len(reasons) == 0),
+            audit=audit,
+            test_exit_code=rc,
+            reasons=reasons,
+            crux_evals_report=crux_rep,
+        )
 
     # ---- Stage B: Provenance-Blind Cross-Family `BARS` Sentinel ----
 
