@@ -134,7 +134,7 @@ class CascadingJudge:
                 unified_git_diff=candidate.unified_diff,
             )
             rep = cascade.run(frame)
-            crux_rep = rep.to_navigation_report()
+            crux_rep = rep.to_mcp_payload()
             if rep.final_decision in ("VETO", "REWIND") and not allow_test_assertion_deletions:
                 for v in rep.verdicts:
                     for hv in v.hard_vetoes_triggered:
