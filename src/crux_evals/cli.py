@@ -30,18 +30,26 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--workspace", default=".", help="Workspace root directory")
     p_list.add_argument("--plugin-dir", action="append", default=[], help="Additional plugin directory")
 
-    p_new = sub.add_parser("new", help="Scaffold a new plug-and-play Evaluator module")
+    p_new = sub.add_parser("new", help="Scaffold a new plug-and-play Evaluator module (`EVALUATOR.md` or Python)")
     p_new.add_argument("evaluator_id", help="Snake_case identifier (e.g. sql_cost_guard)")
     p_new.add_argument("--name", default=None, help="Human-readable evaluator title")
     p_new.add_argument(
+        "--style",
+        choices=["markdown", "md", "python", "py"],
+        default="markdown",
+        help="Plugin format: `markdown` (single-file EVALUATOR.md lens, default) or `python` (evaluator.yaml + module.py)",
+    )
+    p_new.add_argument(
         "--paradigm",
         choices=["deterministic", "llm_judge", "adversarial"],
-        default="deterministic",
+        default="llm_judge",
         help="Evaluator paradigm",
     )
     p_new.add_argument("--stage", type=int, default=None, help="Cascade stage (1, 2, or 3)")
     p_new.add_argument("--target-dir", default=None, help="Directory in which to create the plugin folder")
     p_new.add_argument("--description", default="Custom complementary evaluator plugin.", help="Description")
+    p_new.add_argument("--when-to-use", default="", help="Usefulness hint explaining when the model should pick this evaluator")
+    p_new.add_argument("--paths", action="append", default=[], help="Optional file glob trigger (e.g. --paths '*.sql')")
 
     p_run = sub.add_parser("run", help="Run the Crux-Evals cascade against the workspace")
     p_run.add_argument("--workspace", default=".", help="Workspace root directory")
@@ -63,8 +71,11 @@ def main(argv: list[str] | None = None) -> int:
             stage=args.stage,
             target_root=target,
             description=args.description,
+            when_to_use=args.when_to_use,
+            paths=args.paths,
+            style=args.style,
         )
-        sys.stdout.write(json.dumps({"status": "CREATED", "plugin_dir": str(created)}, indent=2) + "\n")
+        sys.stdout.write(json.dumps({"status": "CREATED", "plugin_dir": str(created), "style": args.style}, indent=2) + "\n")
         return 0
 
     if args.cmd == "mcp":
@@ -98,9 +109,12 @@ def main(argv: list[str] | None = None) -> int:
             "stage": m.stage,
             "events": list(m.events),
             "requires_blind_context": m.requires_blind_context,
+            "cross_family_preferred": m.cross_family_preferred,
+            "when_to_use": m.when_to_use,
+            "paths": list(m.paths),
             "description": m.description,
         }
-        for m, _ in reg.discover_classes()
+        for m in reg.list_manifests()
     ]
     sys.stdout.write(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n")
     return 0

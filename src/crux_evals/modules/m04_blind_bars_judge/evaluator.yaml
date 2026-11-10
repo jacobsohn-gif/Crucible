@@ -8,3 +8,4 @@ requires_blind_context: true
 cross_family_preferred: true
 mcp_tool_name: eval_blind_judge
 description: Evaluates ONLY the raw task objective, anonymous git diff, and raw test output with Actor CoT stripped, scoring 0.0/0.5/1.0 Behaviorally Anchored Rating Scales with conservative Bayesian LCB.
+when_to_use: When weighing complex tradeoffs or before finalizing a multi-step engineering change so an isolated judge reviews only objective ground truth.

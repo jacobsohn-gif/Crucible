@@ -12,6 +12,7 @@ from crux_evals.core.protocol import (
     EvaluationFrame,
     EvaluationVerdict,
     LLMJudgeCallable,
+    load_package_text_resource,
 )
 from crux_evals.core.registry import register_evaluator
 
@@ -34,7 +35,8 @@ class EpistemicGroundingAuditor(BaseEvaluator):
         enforce_read_before_edit: bool = True,
     ) -> None:
         super().__init__(pathlib.Path(__file__).with_name("evaluator.yaml"))
-        self.prompt_template = pathlib.Path(__file__).with_name("prompt.md").read_text(encoding="utf-8")
+        pkg_name = self.__class__.__module__.rsplit(".", 1)[0]
+        self.prompt_template = load_package_text_resource(__file__, pkg_name, "prompt.md")
         self.llm_judge = llm_judge
         self.enforce_read_before_edit = enforce_read_before_edit
 

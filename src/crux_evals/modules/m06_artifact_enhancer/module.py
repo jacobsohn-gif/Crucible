@@ -1,51 +1,64 @@
-"""Module 06: Generative Artifact & Pedagogy Enhancer Lens (`ArtifactEnhancerEvaluator`).
+"""Module 06: Generative Artifact & UX Enhancer Lens (`ArtifactEnhancerEvaluator`).
 
-Designed to be invoked as a native tool (`consult_evaluator`) mid-task to elevate
-the quality, interactivity, and mathematical depth of user deliverables without
-acting as a punitive gatekeeper.
+Domain-agnostic deliverable quality evaluator invoked mid-task via `consult_evaluator`
+(without blocking tools) to catch internal harness scorecard leakage, unfinished
+placeholders, missing interactive controls, and optional isolated UX review.
 """
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
-from crux_evals.core.protocol import BaseEvaluator, EvaluationFrame, EvaluationVerdict
+from crux_evals.core.protocol import BaseEvaluator, EvaluationFrame, EvaluationVerdict, LLMJudgeCallable
 from crux_evals.core.registry import register_evaluator
 
 LEAKED_SCORECARD_RE = re.compile(
-    r"(CRUX-EVALS\s+SCORECARD|crux_evals_scorecard|FINAL\s+DECISION:\s*ALLOW|conservative_lcb_score)",
+    r"(CRUX-EVALS\s+SCORECARD|crux_evals_scorecard|FINAL\s+DECISION:\s*ALLOW|"
+    r"conservative_lcb_score|<dynamic_instructions>|<crux_tool_call>)",
     re.IGNORECASE,
 )
-STATIC_SLICE_ARRAY_RE = re.compile(r"const\s+V1_SLICE_HEX\s*=\s*\[", re.IGNORECASE)
-FAKE_MOD_HASH_RE = re.compile(r"314159265\s*\+\s*idx\s*\*\s*7919")
+PLACEHOLDER_RE = re.compile(
+    r"(Lorem\s+ipsum|\b(?:TODO|FIXME|XXX)\s*:|PLACEHOLDER_DATA|mockData\s*=\s*\[\s*\])",
+    re.IGNORECASE,
+)
+NOOP_HANDLER_RE = re.compile(r"(?:onclick|onClick|onChange)\s*=\s*['\"{]\s*(?:\(\)\s*=>\s*\{\s*\}|void\s+0|return\s+false)", re.IGNORECASE)
+VISUAL_SURFACE_RE = re.compile(r"(<canvas\b|<svg\b|Plotly|new\s+Chart\(|d3\.select|recharts)", re.IGNORECASE)
+INTERACTIVE_CONTROL_RE = re.compile(r"(<input\b|<select\b|<button\b|addEventListener\s*\(|onClick\s*=|onChange\s*=)", re.IGNORECASE)
+LARGE_INT_HINT_RE = re.compile(r"(MAX_SAFE_INTEGER|BigInt\b|\bmod\s+M\b|2\s*\*\*\s*5[3-9]|2\s*\*\*\s*[6-9]\d)", re.IGNORECASE)
 
 
 @register_evaluator
 class ArtifactEnhancerEvaluator(BaseEvaluator):
-    """Surfaces high-leverage interactive, visual, and numerical enhancements for user deliverables."""
+    """Domain-agnostic deliverable quality, purity, and interactive-depth evaluator."""
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, *, llm_judge: LLMJudgeCallable | None = None, **kwargs: object) -> None:
         super().__init__(pathlib.Path(__file__).with_name("evaluator.yaml"))
+        self.llm_judge = llm_judge
 
     def evaluate(self, frame: EvaluationFrame) -> EvaluationVerdict:
-        ws = pathlib.Path(frame.workspace_root).resolve()
+        safe_frame = frame.with_epistemic_firewall() if self.manifest.requires_blind_context else frame
+        ws = pathlib.Path(safe_frame.workspace_root).resolve()
         blind_spots: list[str] = []
         probes: list[str] = []
         scores: dict[str, float] = {
             "deliverable_purity": 1.0,
-            "interactive_computation_depth": 1.0,
-            "visual_pedagogy": 1.0,
+            "placeholder_hygiene": 1.0,
+            "interactive_depth": 1.0,
         }
 
-        candidates = list(frame.modified_files)
+        candidates = list(safe_frame.modified_files)
         if not candidates and ws.is_dir():
             for p in sorted(ws.iterdir()):
-                if p.is_file() and p.suffix in (".html", ".py", ".js", ".ts", ".tsx"):
+                if p.is_file() and p.suffix.lower() in (".html", ".htm", ".jsx", ".tsx", ".vue", ".svg"):
                     candidates.append(p.name)
 
-        for rel in candidates:
-            fp = ws / rel if not pathlib.Path(rel).is_absolute() else pathlib.Path(rel)
+        excerpts: list[str] = []
+        for rel in candidates[:8]:
+            fp = pathlib.Path(rel)
+            if not fp.is_absolute():
+                fp = (ws / fp).resolve()
             if not fp.is_file():
                 continue
             try:
@@ -53,43 +66,82 @@ class ArtifactEnhancerEvaluator(BaseEvaluator):
             except OSError:
                 continue
 
-            # 1. Check for leaked evaluator/harness scorecards inside user-facing HTML/UI deliverables
-            if fp.suffix in (".html", ".tsx", ".jsx", ".vue") and LEAKED_SCORECARD_RE.search(content):
+            suffix = fp.suffix.lower()
+            if suffix in (".html", ".htm", ".tsx", ".jsx", ".vue", ".svg", ".md"):
+                excerpts.append(f"--- {rel} ---\n{content[:4_000]}")
+
+            # 1. Forbid internal evaluator scorecards / harness XML inside user deliverables
+            if suffix in (".html", ".htm", ".tsx", ".jsx", ".vue", ".svg", ".md") and LEAKED_SCORECARD_RE.search(content):
                 scores["deliverable_purity"] = 0.0
                 blind_spots.append(
-                    f"DELIVERABLE_POLLUTION in `{fp.name}`: Found internal `Crux-Evals Scorecard` / harness metadata "
-                    f"rendered inside the user's visualization HTML. Users asked for a domain visualization, not harness telemetry."
+                    f"DELIVERABLE_POLLUTION in `{fp.name}`: Internal harness/evaluator metadata "
+                    f"(`Crux-Evals Scorecard` or harness tags) leaked into the user deliverable."
                 )
                 probes.append(
-                    f"Remove the `CRUX-EVALS SCORECARD` card from `{fp.name}` immediately so the UI stays 100% focused on the domain visualization."
+                    f"Remove all internal harness/evaluator scorecards and control tags from `{fp.name}` "
+                    f"so the deliverable stays 100% focused on the user's domain."
                 )
 
-            # 2. Check HTML/JS visualizations for static canned values vs real interactive BigInt/FP64 computation
-            if fp.suffix == ".html":
-                if STATIC_SLICE_ARRAY_RE.search(content) or FAKE_MOD_HASH_RE.search(content):
-                    scores["interactive_computation_depth"] = 0.5
+            # 2. Catch unfinished placeholders, Lorem ipsum, or empty no-op handlers
+            if suffix in (".html", ".htm", ".tsx", ".jsx", ".vue", ".js", ".ts") and (
+                PLACEHOLDER_RE.search(content) or NOOP_HANDLER_RE.search(content)
+            ):
+                scores["placeholder_hygiene"] = 0.5
+                blind_spots.append(
+                    f"STATIC_PLACEHOLDER_DATA in `{fp.name}`: Found placeholder markers (`TODO`/`Lorem ipsum`/`mockData`) "
+                    f"or empty no-op UI handlers."
+                )
+                probes.append(
+                    f"Replace static placeholder data and empty event handlers in `{fp.name}` with real computed values and live state updates."
+                )
+
+            # 3. Domain-appropriate UI / interactive visualization checks
+            if suffix in (".html", ".htm"):
+                if VISUAL_SURFACE_RE.search(content) and not INTERACTIVE_CONTROL_RE.search(content):
+                    scores["interactive_depth"] = 0.5
                     blind_spots.append(
-                        f"STATIC_PLACEHOLDER_DATA in `{fp.name}`: Stage 1 slice chips (`V1_SLICE_HEX`) and modulo residues "
-                        f"(`314159265 + idx * 7919`) use hardcoded demo constants rather than live interactive computation."
+                        f"STATIC_VISUALIZATION in `{fp.name}`: Detected graphical canvas/chart elements without interactive parameter controls."
                     )
                     probes.append(
-                        f"Upgrade `{fp.name}` with a real in-browser `BigInt` + IEEE-754 FP64 Ozaki Scheme I & II kernel "
-                        f"so users can edit/select input values `(a_il, b_lj)`, drag live sliders for slices `k in [2..8]` "
-                        f"and moduli `s in [2..16]`, and watch real `conv_32i_2_8u`, `m_1=256 (+128 -> -128)` wraparound, "
-                        f"and CRT reconstruction mod `M = prod m_t` (using JS `BigInt` since `M > 2^109` exceeds `Number.MAX_SAFE_INTEGER`)."
+                        f"Consider adding interactive controls (e.g., sliders, selectors, or hover readouts) tailored to `{safe_frame.task_objective[:80] or fp.name}`."
                     )
-                if "BigInt" not in content:
-                    scores["visual_pedagogy"] = 0.5
+                if "<html" in content.lower() and "viewport" not in content.lower():
+                    scores["interactive_depth"] = min(scores["interactive_depth"], 0.75)
+                    blind_spots.append(f"RESPONSIVE_VIEWPORT in `{fp.name}`: Missing `<meta name=\"viewport\" ...>` tag for responsive scaling.")
+                if LARGE_INT_HINT_RE.search(content) and "BigInt" not in content:
+                    scores["interactive_depth"] = min(scores["interactive_depth"], 0.5)
                     blind_spots.append(
-                        f"JS_PRECISION_OPPORTUNITY in `{fp.name}`: Ozaki Scheme II modulus product `M = prod_(t=1..14) m_t` "
-                        f"is ~109.7 bits (`> 2^53` JS `Number.MAX_SAFE_INTEGER`). Using native JS `BigInt` enables a live "
-                        f"interactive CRT Dynamic-Range Cliff explorer (`2*c_max < M`) right inside the browser!"
+                        f"JS_SAFE_INTEGER_HAZARD in `{fp.name}`: Detected >53-bit integer/modular arithmetic cues without `BigInt` precision."
                     )
-                    probes.append(
-                        f"Add a live interactive 'Single Dot-Product & CRT Reconstruction Microscope' + 'VMEM SRAM Occupancy Meter' "
-                        f"powered by JS `BigInt` inside `{fp.name}` so the user can interactively see CRT overflow when `s` is too small "
-                        f"and exact 53-bit FP64 lock-in as soon as `M > 2*c_max`."
-                    )
+                    probes.append(f"Use native JS `BigInt` in `{fp.name}` where values can exceed `Number.MAX_SAFE_INTEGER`.")
+
+        analysis = ""
+        if self.llm_judge is not None and excerpts:
+            sys_p = (
+                "You are an independent Deliverable & UX Quality Evaluator. Inspect ONLY the ground-truth "
+                "user deliverable excerpts below and the task objective (zero Actor CoT). Return STRICT JSON:\n"
+                '{"analysis":"crisp independent UX/accuracy critique","blind_spots":[],"suggested_next_probes":[]}'
+            )
+            usr_p = (
+                f"<task_objective>\n{safe_frame.task_objective}\n</task_objective>\n\n"
+                f"<deliverable_excerpts>\n{chr(10).join(excerpts)[:12_000]}\n</deliverable_excerpts>"
+            )
+            raw = self.llm_judge(sys_p, usr_p, safe_frame.actor_model_family)
+            m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    analysis = str(parsed.get("analysis") or "").strip()
+                    for item in parsed.get("blind_spots") or []:
+                        txt = str(item).strip()
+                        if txt and txt not in blind_spots:
+                            blind_spots.append(txt)
+                    for pr in parsed.get("suggested_next_probes") or []:
+                        txt = str(pr).strip()
+                        if txt and txt not in probes:
+                            probes.append(txt)
+                except json.JSONDecodeError:
+                    pass
 
         mean_score = sum(scores.values()) / len(scores)
         return EvaluationVerdict(
@@ -104,6 +156,8 @@ class ArtifactEnhancerEvaluator(BaseEvaluator):
             remediation_directive=" ".join(probes),
             blind_spots=blind_spots,
             suggested_next_probes=probes,
+            evaluator_analysis=analysis,
+            isolated_context=True,
         )
 
 

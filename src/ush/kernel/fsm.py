@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from ush.auth.vault import AuthProfile
 from ush.brain.context_dag import PopperianLoopGuard, SessionDAG
+from ush.brain.evaluator_isolation import IsolatedEvaluatorRunner
 from ush.brain.model_tiers import build_adaptive_system_prompt, resolve_model_profile
 from ush.brain.providers import UniversalModelClient, WireError, is_context_overflow_error
 from ush.brain.trace import ThoughtTraceLedger
@@ -115,6 +116,7 @@ class SessionRunner:
             self.hook_runner = HookSystem(
                 self.workspace_root,
                 is_workspace_trusted=False,
+                ush_home=ush_home,
                 enable_crux_evals=True,
                 crux_evals_mode="complementary",
             )
@@ -122,6 +124,16 @@ class SessionRunner:
             self.hook_runner = hook_runner
         self.skill_manager = skill_manager
         self.memory_manager = memory_manager
+
+        self._active_turn_emit: Callable[[StreamEvent], None] | None = None
+        self.isolated_evaluator = IsolatedEvaluatorRunner(
+            vault=getattr(self.client, "vault", None),
+            client=self.client,
+            get_actor_auth=lambda: self.auth_profile,
+            get_actor_profile=lambda: self.model_profile,
+            thinking_effort=ThinkingEffort.MEDIUM,
+            on_trace_event=self._emit_isolated_eval_event,
+        )
 
         self.phase: LoopPhase = LoopPhase.DONE
         self.writer_lease_epoch: int = 0
@@ -200,6 +212,39 @@ class SessionRunner:
                 drained += 1
         return drained
 
+    def _emit_isolated_eval_event(self, evt: StreamEvent) -> None:
+        if self.trace_ledger is not None:
+            self.trace_ledger.record_stream_event(evt)
+        emit = self._active_turn_emit
+        if emit is not None:
+            emit(evt)
+
+    def _build_consult_evaluator_callback(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        def _consult(req: dict[str, Any]) -> dict[str, Any]:
+            lens = str(req.get("lens", "blind_bars_judge") or "blind_bars_judge")
+
+            def _last_meta() -> dict[str, Any]:
+                tr = self.isolated_evaluator.last_trace
+                if tr is None:
+                    return {}
+                return {
+                    "evaluator_model": tr.evaluator_model,
+                    "evaluator_thought": tr.evaluator_thought,
+                }
+
+            return self.hook_runner.consult_evaluator(
+                lens=lens,
+                objective=str(req.get("objective", "")),
+                target_paths=list(req.get("target_paths") or []),
+                proposed_claims=req.get("proposed_claims"),
+                actor_model_family=self.model_profile.family,
+                llm_judge=self.isolated_evaluator.make_llm_callable(lens),
+                llm_breaker=self.isolated_evaluator.make_llm_callable("adversarial_falsifier"),
+                get_last_eval_meta=_last_meta,
+            )
+
+        return _consult
+
     def get_system_prompt(self) -> str:
         """Turn-0 system prompt is generated ONCE and kept immutable to preserve >90% prefix KV-cache."""
         if self._cached_turn0_system_prompt is None:
@@ -209,12 +254,18 @@ class SessionRunner:
                 if self.skill_manager
                 else ""
             )
+            ev = (
+                self.hook_runner.initial_evaluator_catalog()
+                if (self.hook_runner and hasattr(self.hook_runner, "initial_evaluator_catalog"))
+                else ""
+            )
             self._cached_turn0_system_prompt = build_adaptive_system_prompt(
                 self.model_profile,
                 str(self.workspace_root),
                 self.mode,
                 memory_block=mem,
                 initial_skills_block=sk,
+                initial_evaluators_block=ev,
             )
         return self._cached_turn0_system_prompt
 
@@ -322,14 +373,21 @@ class SessionRunner:
         steps = 0
         output_retries = 0
         stop_vetoes = 0
+        complementary_stop_nudges = 0
         context_overflow_recoveries = 0
         modified_in_step: list[str] = []
+        turn_edits_since_eval = 0
+        eval_wave_nudge_sent = False
+        thrash_eval_nudge_sent = False
 
         def _emit(evt: StreamEvent) -> None:
             if self.trace_ledger is not None:
                 self.trace_ledger.record_stream_event(evt)
             if on_event is not None:
                 on_event(evt)
+
+        prev_turn_emit = self._active_turn_emit
+        self._active_turn_emit = _emit
 
         # Lazy pre-mutation Shadow Git checkpoint (0ms startup on read-only turns; captures strictly BEFORE first write tool!)
         snap: ShadowSnapshot | None = None
@@ -346,7 +404,10 @@ class SessionRunner:
             if extra_ctx:
                 self._pending_jit_deltas.append(extra_ctx)
 
-        # Compute BM25/path skill catalog delta for tail `<dynamic_instructions>` (0 Turn-0 drift!)
+        # Ensure Turn-0 system prompt catalogs (skills + evaluators) populate `_shown_fingerprints` BEFORE delta computation
+        self.get_system_prompt()
+
+        # Compute BM25/path skill & evaluator catalog deltas for tail `<dynamic_instructions>` (0 Turn-0 drift!)
         if self.skill_manager:
             delta = self.skill_manager.compute_turn_delta(
                 query=user_prompt,
@@ -354,6 +415,10 @@ class SessionRunner:
             )
             if delta:
                 self._pending_jit_deltas.append(delta)
+        if self.hook_runner and hasattr(self.hook_runner, "compute_evaluator_turn_delta"):
+            ev_delta = self.hook_runner.compute_evaluator_turn_delta(user_prompt)
+            if ev_delta:
+                self._pending_jit_deltas.append(ev_delta)
 
         # Durable pre-turn boundary repair (`geminiChat.ts:534-537`):
         # Close any unanswered trailing `assistant(tool_call)` and/or unanswered trailing `tool(tool_result)`
@@ -466,7 +531,16 @@ class SessionRunner:
                         self.hook_runner.fire("BeforeModel", {"step": steps, "model": self.model_profile.model_id})
 
                     skill_enum = self.skill_manager.model_invocable_names() if self.skill_manager else []
-                    wire_tools = self.tools.wire_schemas(allowed_names=allowed_tools, skill_enum=skill_enum)
+                    eval_enum = (
+                        self.hook_runner.all_evaluator_ids()
+                        if (self.hook_runner and hasattr(self.hook_runner, "all_evaluator_ids"))
+                        else None
+                    )
+                    wire_tools = self.tools.wire_schemas(
+                        allowed_names=allowed_tools,
+                        skill_enum=skill_enum,
+                        evaluator_enum=eval_enum,
+                    )
 
                     hist = self.dag.active_messages(apply_hygiene=True)
                     if self._pending_jit_deltas and hist:
@@ -729,6 +803,10 @@ class SessionRunner:
                             )
                             if sk_delta:
                                 self._pending_jit_deltas.append(sk_delta)
+                        if self.hook_runner and hasattr(self.hook_runner, "on_file_accessed_evaluator_delta"):
+                            ev_delta = self.hook_runner.on_file_accessed_evaluator_delta(fp)
+                            if ev_delta:
+                                self._pending_jit_deltas.append(ev_delta)
 
                     def _on_mod(fp: pathlib.Path, _diff: str) -> None:
                         rel = str(fp)
@@ -753,6 +831,11 @@ class SessionRunner:
                             skill_activate_callback=(
                                 (lambda name: self.skill_manager.activate(name, self.firewall))
                                 if self.skill_manager
+                                else None
+                            ),
+                            evaluator_consult_callback=(
+                                self._build_consult_evaluator_callback()
+                                if (self.hook_runner and hasattr(self.hook_runner, "consult_evaluator"))
                                 else None
                             ),
                         )
@@ -801,13 +884,26 @@ class SessionRunner:
                         committed_steps += 1
                         raise
 
-                    # Track KPI edit metrics & Popperian falsification streaks
+                    # Track KPI edit metrics, Popperian falsification streaks & utility-based evaluator hints
                     guard_notes: list[str] = []
+                    did_consult_eval = False
+                    ui_edited_in_step = False
                     for tc, tr in zip(tcalls, results):
-                        if tc.tool_name == "edit_file":
-                            self.edits_attempted += 1
-                            if tr.is_error:
-                                self.edits_failed += 1
+                        if tc.tool_name == "consult_evaluator":
+                            did_consult_eval = True
+                            turn_edits_since_eval = 0
+                            eval_wave_nudge_sent = False
+                            thrash_eval_nudge_sent = False
+                        if tc.tool_name in ("edit_file", "write_file"):
+                            if tc.tool_name == "edit_file":
+                                self.edits_attempted += 1
+                                if tr.is_error:
+                                    self.edits_failed += 1
+                            if not tr.is_error:
+                                turn_edits_since_eval += 1
+                                tpath = str((tc.tool_args or {}).get("path", "")).lower()
+                                if tpath.endswith((".html", ".htm", ".jsx", ".tsx", ".vue", ".svg")):
+                                    ui_edited_in_step = True
                         nudge = self.loop_guard.record(
                             str(tc.tool_name),
                             canonical_json(tc.tool_args or {})[:240],
@@ -816,6 +912,27 @@ class SessionRunner:
                         )
                         if nudge:
                             guard_notes.append(nudge)
+
+                    if not did_consult_eval:
+                        if self.loop_guard.thrash_streak >= 2 and not thrash_eval_nudge_sent:
+                            thrash_eval_nudge_sent = True
+                            guard_notes.append(
+                                "Evaluator usefulness hint: repeated failures detected — call "
+                                "`consult_evaluator(lens='trajectory_sentinel', ...)` or `lens='adversarial_falsifier'` "
+                                "to inspect the loop/failure blind spot before your next edit."
+                            )
+                        elif (ui_edited_in_step or turn_edits_since_eval >= 2) and not eval_wave_nudge_sent:
+                            eval_wave_nudge_sent = True
+                            if ui_edited_in_step:
+                                guard_notes.append(
+                                    "Evaluator usefulness hint: UI/visualization file updated — consider calling "
+                                    "`consult_evaluator(lens='artifact_enhancer', target_paths=[...])` before finalizing."
+                                )
+                            else:
+                                guard_notes.append(
+                                    "Evaluator usefulness hint: multi-file/non-trivial code modified — run tests via `exec_pty`, "
+                                    "and consider `consult_evaluator(lens='adversarial_falsifier' | 'clean_patch_and_contract')`."
+                                )
 
                     tool_msg = CanonicalMessage(
                         role="tool",
@@ -913,6 +1030,29 @@ class SessionRunner:
                             )
                             self.phase = LoopPhase.PRE_INVOCATION
                             continue
+                        if (
+                            eval_rep is not None
+                            and complementary_stop_nudges == 0
+                            and steps < max_steps
+                            and getattr(eval_rep, "final_decision", "ALLOW") in ("VETO", "REWIND")
+                            and any(getattr(v, "hard_vetoes_triggered", ()) for v in getattr(eval_rep, "verdicts", []))
+                        ):
+                            advisory = eval_rep.combined_feedback(mode="complementary").strip()
+                            if advisory:
+                                complementary_stop_nudges += 1
+                                self.dag.append(
+                                    CanonicalMessage(
+                                        role="user",
+                                        parts=[
+                                            wrap_dynamic_instructions(
+                                                f"[CRUX_EVALS_ADVISORY]: {advisory}\n"
+                                                "Resolve or empirically verify the findings above before finishing."
+                                            )
+                                        ],
+                                    )
+                                )
+                                self.phase = LoopPhase.PRE_INVOCATION
+                                continue
                     self.phase = LoopPhase.DONE
                     break
         except BaseException:
@@ -923,6 +1063,8 @@ class SessionRunner:
                 del self.checkpoints[pre_cp_len:]
             self.phase = LoopPhase.DONE
             raise
+        finally:
+            self._active_turn_emit = prev_turn_emit
 
         self.phase = LoopPhase.DONE
         _emit(

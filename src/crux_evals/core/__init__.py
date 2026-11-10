@@ -12,7 +12,9 @@ from crux_evals.core.protocol import (
     EvaluatorProtocol,
     HookEvent,
     LLMJudgeCallable,
+    MarkdownPromptEvaluator,
     ToolRecord,
+    load_package_text_resource,
     sha256_short,
 )
 from crux_evals.core.registry import EvaluatorRegistry, register_evaluator
@@ -41,6 +43,7 @@ __all__ = [
     "HarnessTelemetryStore",
     "HookEvent",
     "LLMJudgeCallable",
+    "MarkdownPromptEvaluator",
     "SessionTelemetry",
     "ToolRecord",
     "build_default_cascade",
@@ -48,6 +51,7 @@ __all__ = [
     "compute_action_signature",
     "compute_error_signature",
     "discover_git_modified_files",
+    "load_package_text_resource",
     "register_evaluator",
     "sha256_short",
 ]

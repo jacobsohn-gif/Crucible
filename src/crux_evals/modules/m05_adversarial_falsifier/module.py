@@ -15,6 +15,7 @@ from crux_evals.core.protocol import (
     EvaluationFrame,
     EvaluationVerdict,
     LLMJudgeCallable,
+    load_package_text_resource,
 )
 from crux_evals.core.registry import register_evaluator
 
@@ -33,7 +34,8 @@ class AdversarialFalsifierEvaluator(BaseEvaluator):
         enable_ast_property_fuzzer: bool = True,
     ) -> None:
         super().__init__(pathlib.Path(__file__).with_name("evaluator.yaml"))
-        self.breaker_prompt = pathlib.Path(__file__).with_name("breaker_prompt.md").read_text(encoding="utf-8")
+        pkg_name = self.__class__.__module__.rsplit(".", 1)[0]
+        self.breaker_prompt = load_package_text_resource(__file__, pkg_name, "breaker_prompt.md")
         self.llm_breaker = llm_breaker
         self.sandbox_timeout_seconds = sandbox_timeout_seconds
         self.enable_ast_property_fuzzer = enable_ast_property_fuzzer

@@ -11,6 +11,7 @@ Score each criterion strictly using Behaviorally Anchored Rating Scales (`0.0`, 
 
 Return STRICT JSON:
 {
+  "analysis": "concise independent technical analysis grounded strictly in the artifacts above",
   "dynamic_rubric_checks": ["check 1", "check 2"],
   "bars": {
     "functional_completeness": 0.0 | 0.5 | 1.0,

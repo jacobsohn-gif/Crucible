@@ -64,6 +64,7 @@ class ToolExecutionContext:
     ask_user_callback: Callable[[str, list[str]], str] | None = None
     swarm_callback: Callable[[dict[str, Any]], str] | None = None
     skill_activate_callback: Callable[[str], str] | None = None
+    evaluator_consult_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 class ReadWriteLock:
@@ -119,6 +120,7 @@ class ToolRegistry:
         *,
         allowed_names: set[str] | None = None,
         skill_enum: list[str] | None = None,
+        evaluator_enum: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for name in sorted(self._specs):
@@ -142,6 +144,20 @@ class ToolRegistry:
                         },
                         "required": ["name"],
                     },
+                }
+            elif name == "consult_evaluator" and evaluator_enum:
+                base_schema = d["input_schema"]
+                props = dict(base_schema.get("properties") or {})
+                lens_enum = [str(e) for e in evaluator_enum if str(e) and str(e) != "all"]
+                if "all" not in lens_enum:
+                    lens_enum.append("all")
+                lens_prop = dict(props.get("lens") or {"type": "string"})
+                lens_prop["enum"] = lens_enum
+                props["lens"] = lens_prop
+                d = {
+                    "name": d["name"],
+                    "description": d["description"],
+                    "input_schema": {**base_schema, "properties": props},
                 }
             out.append(d)
         return out
@@ -602,30 +618,41 @@ def build_default_tool_registry() -> ToolRegistry:
 
     
     def _consult_evaluator(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
-        """Native read-only enhancement tool allowing the agent to query Crux-Evals lenses mid-task."""
+        """Native read-only enhancement & audit tool consulting Crux-Evals in strict isolation."""
         import json
-        from crux_evals.core.protocol import EvaluationFrame
-        from crux_evals.core.runner import build_default_cascade
-        from crux_evals.core.state import capture_git_diff, discover_git_modified_files
 
         ws = ctx.firewall.workspace_root
-        lens = str(args.get("lens", "artifact_enhancer") or "artifact_enhancer")
-        objective = str(args.get("objective", "Enhance artifact quality and correctness"))
+        lens = str(args.get("lens", "blind_bars_judge") or "blind_bars_judge").strip()
+        objective = str(args.get("objective", "Evaluate artifact quality and correctness"))
+        proposed_claims = str(args.get("proposed_claims", "")).strip() or None
         raw_paths = args.get("target_paths") or []
         target_paths: list[str] = []
         if isinstance(raw_paths, list):
             for rp in raw_paths:
+                resolved = ctx.firewall.resolve_and_validate(str(rp), write=False)
                 try:
-                    resolved = ctx.firewall.resolve_and_validate(str(rp), write=False)
-                    try:
-                        target_paths.append(str(resolved.relative_to(ws)))
-                    except ValueError:
-                        target_paths.append(str(resolved))
-                except Exception:
-                    target_paths.append(str(rp))
+                    target_paths.append(str(resolved.relative_to(ws)))
+                except ValueError:
+                    target_paths.append(str(resolved))
+
+        if ctx.evaluator_consult_callback is not None:
+            payload = ctx.evaluator_consult_callback(
+                {
+                    "lens": lens,
+                    "objective": objective,
+                    "target_paths": target_paths,
+                    "proposed_claims": proposed_claims,
+                }
+            )
+            return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
+
+        # Standalone fallback when ToolRegistry is invoked outside SessionRunner
+        from crux_evals.core.protocol import EvaluationFrame
+        from crux_evals.core.runner import build_default_cascade
+        from crux_evals.core.state import capture_git_diff, discover_git_modified_files
+
         if not target_paths:
             target_paths = discover_git_modified_files(ws)
-
         diff = capture_git_diff(ws, target_paths if target_paths else None)
         cascade = build_default_cascade(enforce_read_before_edit=False, workspace_root=ws)
         frame = EvaluationFrame(
@@ -636,22 +663,25 @@ def build_default_tool_registry() -> ToolRegistry:
             task_objective=objective,
             unified_git_diff=diff,
             modified_files=tuple(target_paths),
+            actor_claim_text=proposed_claims,
         )
         if lens != "all":
             ev = cascade.get_evaluator(lens)
             if ev is not None:
                 verdict = ev.evaluate(frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame)
                 payload = verdict.to_mcp_payload()
+                payload["epistemic_firewall_active"] = bool(ev.manifest.requires_blind_context)
                 payload["usage_note"] = (
-                    "Use `blind_spots` and `suggested_next_probes` to enhance the user's artifact directly. "
+                    "Use `blind_spots`, `counterexamples`, and `suggested_next_probes` to improve the artifact directly. "
                     "NEVER render evaluator scorecards or harness metadata inside user deliverables."
                 )
                 return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
 
         report = cascade.run(frame)
         payload = report.to_mcp_payload()
+        payload["epistemic_firewall_active"] = True
         payload["usage_note"] = (
-            "Use `blind_spots` and `suggested_next_probes` to enhance the user's artifact directly. "
+            "Use `blind_spots`, `counterexamples`, and `suggested_next_probes` to improve the artifact directly. "
             "NEVER render evaluator scorecards or harness metadata inside user deliverables."
         )
         return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
@@ -824,24 +854,40 @@ def build_default_tool_registry() -> ToolRegistry:
         ),
         ToolSpec(
             "consult_evaluator",
-            "Consult a specialized enhancement & verification lens (`artifact_enhancer`, `clean_patch_and_contract`, `trajectory_sentinel`, `epistemic_grounding_auditor`, `blind_bars_judge`, `adversarial_falsifier`, or `all`) to discover UX/pedagogical upgrades, blind spots, and numerical edge cases without blocking.",
+            (
+                "Consult an independent, model-isolated Crux-Evals lens by usefulness (skip for trivial reads/Q&A): "
+                "`trajectory_sentinel` when debugging repeats >=2 failures; `clean_patch_and_contract` after multi-file "
+                "code/test edits; `adversarial_falsifier` after non-trivial logic/math/parsers; `artifact_enhancer` for "
+                "HTML/UI/visualization deliverables; `blind_bars_judge` before finalizing complex changes; "
+                "`epistemic_grounding_auditor` to verify claims; or any custom discovered evaluator / `all`. "
+                "Blind lenses inspect only workspace ground truth (never your reasoning)."
+            ),
             {
                 "type": "object",
                 "properties": {
                     "lens": {
                         "type": "string",
                         "enum": [
-                            "artifact_enhancer",
-                            "all",
-                            "clean_patch_and_contract",
                             "trajectory_sentinel",
+                            "clean_patch_and_contract",
                             "epistemic_grounding_auditor",
                             "blind_bars_judge",
                             "adversarial_falsifier",
+                            "artifact_enhancer",
+                            "all",
                         ],
+                        "description": "Evaluator lens ID to consult (choose the single most useful lens, or `all`).",
                     },
-                    "objective": {"type": "string"},
-                    "target_paths": {"type": "array", "items": {"type": "string"}},
+                    "objective": {"type": "string", "description": "Focus aspect or task goal for evaluation."},
+                    "target_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional workspace-relative files to inspect.",
+                    },
+                    "proposed_claims": {
+                        "type": "string",
+                        "description": "Optional claims to verify when using `epistemic_grounding_auditor` (stripped for all blind lenses).",
+                    },
                 },
                 "required": ["objective"],
             },

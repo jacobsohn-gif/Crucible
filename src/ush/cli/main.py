@@ -105,7 +105,11 @@ class HarnessRuntime:
         self.is_trusted = self.trust_store.is_trusted(self.workspace)
 
         self.policy_engine = PolicyEngine()
-        self.hook_system = HookSystem(self.workspace, is_workspace_trusted=self.is_trusted)
+        self.hook_system = HookSystem(
+            self.workspace,
+            is_workspace_trusted=self.is_trusted,
+            ush_home=self.ush_home,
+        )
         self.ext_manager = ExtensionManager(self.ush_home)
         exts = self.ext_manager.discover_and_wire(self.policy_engine, self.hook_system)
 
@@ -178,6 +182,7 @@ class HarnessRuntime:
         self.is_trusted = self.trust_store.is_trusted(self.workspace)
         self.skill_manager.is_workspace_trusted = self.is_trusted
         self.slash_registry.is_workspace_trusted = self.is_trusted
+        self.hook_system.reload_evaluators(is_workspace_trusted=self.is_trusted)
         n_sk = self.skill_manager.reload()
         n_cmd = self.slash_registry.reload()
         return n_sk, n_cmd
@@ -243,6 +248,7 @@ def render_doctor_report(rt: HarnessRuntime) -> str:
         f"  gcloud SDK        : {'OK (' + str(gcloud_ok) + ')' if has_gcloud else 'not installed'}",
         f"  Keychain Vault    : {'macOS Keychain (`security`)' if platform.system() == 'Darwin' else '0600 `~/.ush/credentials.vault.json`'}",
         f"  Loaded Skills     : {len(rt.skill_manager.all_skills())} skills across 4 tiers",
+        f"  Evaluators        : {len(rt.hook_system.all_evaluator_ids())} independent Crux-Evals lenses ({rt.hook_system.crux_evals_mode})",
         f"  Slash Commands    : {len(rt.slash_registry.list_commands())} commands (`Builtin + File + Skill + MCP`)",
         f"  Memory Files      : {len(rt.memory_manager.loaded_paths)} loaded | {len(rt.memory_manager.list_inbox())} pending `.inbox` patch(es)",
     ]
@@ -789,6 +795,58 @@ def handle_slash_command(
             print(f"  - {h.event:20s} matcher=`{h.matcher}` ({h.source}) -> `{h.command}`")
         return False, None, []
 
+    if cmd_name == "evaluators":
+        import shlex
+        from crux_evals.core.registry import scaffold_new_evaluator
+
+        toks = shlex.split(arg_str) if arg_str.strip() else []
+        action = toks[0].lower() if toks else "list"
+        if action == "reload":
+            cnt = rt.hook_system.reload_evaluators(is_workspace_trusted=rt.is_trusted)
+            print(c_green(f"Reloaded {cnt} Crux-Evals lens(es) (workspace_trusted={rt.is_trusted})."))
+            return False, None, []
+        if action == "new":
+            if len(toks) < 2:
+                print("Usage: `/evaluators new <id> [--py|--md] [--workspace]`")
+                return False, None, []
+            eval_id = toks[1]
+            style = "python" if "--py" in toks else "markdown"
+            use_ws = "--workspace" in toks or "--ws" in toks
+            if use_ws and not rt.is_trusted:
+                print(c_yellow("Workspace is untrusted; scaffolding into `~/.ush/evaluators/` (or run `/trust grant` first)."))
+                use_ws = False
+            target_root = (
+                (rt.workspace / ".crux_evals" / "plugins")
+                if use_ws
+                else (rt.ush_home / "evaluators")
+            )
+            created = scaffold_new_evaluator(
+                eval_id,
+                paradigm="deterministic" if style == "python" else "llm_judge",
+                target_root=target_root,
+                style=style,
+            )
+            cnt = rt.hook_system.reload_evaluators(is_workspace_trusted=rt.is_trusted)
+            print(c_green(f"Scaffolded `{eval_id}` ({style}) -> `{created}` ({cnt} active evaluators)."))
+            return False, None, []
+        if action == "run":
+            lens = toks[1] if len(toks) > 1 else "all"
+            cb = rt.runner._build_consult_evaluator_callback()
+            res = cb({"lens": lens, "objective": f"Evaluate workspace {rt.workspace.name}"})
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+            return False, None, []
+
+        manifests = rt.hook_system.eval_registry.list_manifests() if rt.hook_system.eval_registry else []
+        if not manifests:
+            print("No evaluators loaded.")
+        for m in manifests:
+            iso = "blind" if m.requires_blind_context else "grounded"
+            p_info = f" paths={list(m.paths)}" if m.paths else ""
+            wtu = f"\n      when useful: {m.when_to_use}" if m.when_to_use else ""
+            print(f"  - {c_bold(m.evaluator_id):28s} [stage {m.stage} | {m.paradigm:13s} | {iso:8s}]{p_info} — {m.description[:72]}{wtu}")
+        print(c_dim("Usage: `/evaluators [list | new <id> [--md|--py] [--workspace] | run [lens] | reload]`"))
+        return False, None, []
+
     if cmd_name == "policies":
         for r in rt.policy_engine.rules:
             print(f"  [{r.tier:9s} p={r.priority:3d}] {r.decision.value:8s} tool=`{r.tool_pattern}` prefixes={list(r.command_prefixes)} ({r.reason})")
@@ -863,7 +921,8 @@ def handle_slash_command(
 
     if cmd_name == "reload":
         n_sk, n_cmd = rt.reload_extensibility()
-        print(c_green(f"Reloaded {n_sk} skills and {n_cmd} slash commands."))
+        n_ev = len(rt.hook_system.all_evaluator_ids())
+        print(c_green(f"Reloaded {n_sk} skills, {n_ev} evaluators, and {n_cmd} slash commands."))
         return False, None, []
 
     return False, None, []
@@ -1533,6 +1592,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ext_p.add_argument("action", nargs="?", default="list", choices=["list", "install"])
     ext_p.add_argument("path", nargs="?", default=None)
 
+    ev_p = sub.add_parser("eval", help="List, scaffold (`new`), run, or serve Crux-Evals independent evaluators")
+    ev_p.add_argument("eval_action", nargs="?", default="list", choices=["list", "new", "run", "mcp"])
+    ev_p.add_argument("eval_target", nargs="?", default=None, help="Evaluator ID for `new` or lens for `run`")
+    ev_p.add_argument("--style", choices=["markdown", "md", "python", "py"], default="markdown")
+    ev_p.add_argument("--paradigm", choices=["deterministic", "llm_judge", "adversarial"], default="llm_judge")
+    ev_p.add_argument("--scope", choices=["user", "workspace"], default="user")
+    ev_p.add_argument("--description", default="Custom complementary evaluator lens.")
+    ev_p.add_argument("--when-to-use", default="")
+    ev_p.add_argument("--paths", action="append", default=[])
+    ev_p.add_argument("--objective", default="")
+
     sw_p = sub.add_parser("swarm", help="Dispatch task to local 4-Gear Swarm, peer CLI, or remote container cluster")
     sw_p.add_argument("task", nargs="?", default="", help="Task prompt or message to solve")
     sw_p.add_argument(
@@ -1609,6 +1679,76 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.subcommand == "trace":
         return _run_trace_cli(ush_home, workspace, args)
+
+    if args.subcommand == "eval":
+        from crux_evals.core.registry import EvaluatorRegistry, scaffold_new_evaluator
+        from crux_evals.core.runner import build_default_cascade
+        from crux_evals.core.state import HarnessTelemetryStore
+        from crux_evals.mcp_server import CruxEvalsMCPServer
+
+        act = args.eval_action
+        if act == "mcp":
+            return CruxEvalsMCPServer(workspace_root=workspace).serve_stdio()
+        if act == "new":
+            if not args.eval_target:
+                print("Usage: `crux eval new <evaluator_id> [--style md|py] [--scope user|workspace]`", file=sys.stderr)
+                return 2
+            t_root = (workspace / ".crux_evals" / "plugins") if args.scope == "workspace" else (ush_home / "evaluators")
+            created = scaffold_new_evaluator(
+                args.eval_target,
+                paradigm=("deterministic" if args.style in ("python", "py") and args.paradigm == "llm_judge" else args.paradigm),
+                target_root=t_root,
+                description=args.description,
+                when_to_use=args.when_to_use,
+                paths=args.paths,
+                style=args.style,
+            )
+            print(json.dumps({"status": "CREATED", "plugin_dir": str(created), "style": args.style}, indent=2))
+            return 0
+        trust = RepoTrustStore(ush_home).is_trusted(workspace)
+        if act == "run":
+            store = HarnessTelemetryStore(workspace / ".ush" / "evaluator_state")
+            tel = store.load("default", str(workspace))
+            if args.objective:
+                tel.task_objective = args.objective
+            cascade = build_default_cascade(
+                workspace_root=workspace,
+                ush_home=ush_home,
+                is_workspace_trusted=trust,
+                short_circuit_on_stage_veto=False,
+            )
+            frame = tel.to_evaluation_frame("MCPConsult")
+            if args.eval_target and args.eval_target != "all":
+                ev = cascade.get_evaluator(args.eval_target)
+                if ev is None:
+                    print(c_red(f"Unknown evaluator `{args.eval_target}`."), file=sys.stderr)
+                    return 2
+                verdict = ev.evaluate(frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame)
+                print(json.dumps(verdict.to_mcp_payload(), indent=2, ensure_ascii=False))
+                return 0
+            print(json.dumps(cascade.run(frame).to_mcp_payload(), indent=2, ensure_ascii=False))
+            return 0
+        reg = EvaluatorRegistry(workspace_root=workspace, ush_home=ush_home, is_workspace_trusted=trust)
+        print(
+            json.dumps(
+                [
+                    {
+                        "evaluator_id": m.evaluator_id,
+                        "name": m.name,
+                        "paradigm": m.paradigm,
+                        "stage": m.stage,
+                        "requires_blind_context": m.requires_blind_context,
+                        "when_to_use": m.when_to_use,
+                        "paths": list(m.paths),
+                        "description": m.description,
+                    }
+                    for m in reg.list_manifests()
+                ],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
 
     open_sessions_picker = False
     all_recent = list_workspace_sessions(ush_home / "sessions", workspace_filter=None, include_empty=False)

@@ -8,3 +8,4 @@ requires_blind_context: true
 cross_family_preferred: true
 mcp_tool_name: eval_adversarial_prober
 description: Generates and executes boundary/property-based counterexample probes in an isolated sandbox; reports findings strictly when a reproducible runtime failure or invariant violation is triggered.
+when_to_use: After writing algorithms, parsers, numerical code, or state machines to probe boundary inputs cleanly in an isolated /tmp sandbox.

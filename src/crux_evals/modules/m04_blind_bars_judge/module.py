@@ -13,6 +13,7 @@ from crux_evals.core.protocol import (
     EvaluationFrame,
     EvaluationVerdict,
     LLMJudgeCallable,
+    load_package_text_resource,
 )
 from crux_evals.core.registry import register_evaluator
 
@@ -29,7 +30,8 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
         conservatism_lambda: float = 0.25,
     ) -> None:
         super().__init__(pathlib.Path(__file__).with_name("evaluator.yaml"))
-        self.rubric_prompt = pathlib.Path(__file__).with_name("rubric_prompt.md").read_text(encoding="utf-8")
+        pkg_name = self.__class__.__module__.rsplit(".", 1)[0]
+        self.rubric_prompt = load_package_text_resource(__file__, pkg_name, "rubric_prompt.md")
         self.llm_judge = llm_judge
         self.pass_threshold = pass_threshold
         self.conservatism_lambda = conservatism_lambda
@@ -68,6 +70,8 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
             user_payload,
             blind_frame.actor_model_family,
         )
+        if not raw_reply or not raw_reply.strip():
+            return self._deterministic_bars_fallback(blind_frame)
         m = re.search(r"\{.*\}", raw_reply, re.DOTALL)
         if not m:
             return EvaluationVerdict(
@@ -117,6 +121,7 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
 
         failed_checks = [str(x) for x in (parsed.get("failed_checks") or [])]
         remediation = str(parsed.get("remediation", "")).strip()
+        analysis = str(parsed.get("analysis", "")).strip()
 
         decision: Decision = (
             "VETO" if (hard_vetoes or lcb_score < self.pass_threshold) else "ALLOW"
@@ -134,6 +139,8 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
             remediation_directive=remediation if decision != "ALLOW" else "",
             blind_spots=failed_checks,
             suggested_next_probes=[remediation] if remediation and decision != "ALLOW" else [],
+            evaluator_analysis=analysis,
+            isolated_context=True,
         )
 
     def _deterministic_bars_fallback(self, blind_frame: EvaluationFrame) -> EvaluationVerdict:

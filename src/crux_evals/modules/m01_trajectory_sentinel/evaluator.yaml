@@ -8,3 +8,4 @@ requires_blind_context: true
 cross_family_preferred: false
 mcp_tool_name: eval_trajectory_compass
 description: Detects exact action loops, A<->B k-cycle oscillations, error-signature stagnation across edits, diff state hash regressions, and read spirals; returns PAV progress delta and suggested next probes.
+when_to_use: When debugging hits >=2 repeated failures, edits oscillate, or research stalls.

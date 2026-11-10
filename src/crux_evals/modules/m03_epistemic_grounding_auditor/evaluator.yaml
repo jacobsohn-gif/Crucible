@@ -8,3 +8,4 @@ requires_blind_context: false
 cross_family_preferred: true
 mcp_tool_name: eval_epistemic_grounding
 description: Enforces Read-Before-Edit provenance on BeforeTool[edit_file] and audits proposed completion claims against ground-truth tool execution telemetry.
+when_to_use: Before concluding a root-cause investigation or summarizing verification results across multiple files.

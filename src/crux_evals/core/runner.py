@@ -114,12 +114,16 @@ def build_default_cascade(
     enable_ast_property_fuzzer: bool = True,
     extra_plugin_dirs: list[pathlib.Path] | None = None,
     workspace_root: pathlib.Path | None = None,
+    ush_home: pathlib.Path | None = None,
+    is_workspace_trusted: bool = True,
     short_circuit_on_stage_veto: bool = True,
 ) -> EvaluatorCascadeRunner:
     """Constructs the Evaluator Cascade by auto-discovering all built-in + custom plugins."""
     registry = EvaluatorRegistry(
         extra_plugin_dirs=extra_plugin_dirs,
         workspace_root=workspace_root,
+        ush_home=ush_home,
+        is_workspace_trusted=is_workspace_trusted,
     )
     evaluators = registry.instantiate_all(
         llm_judge=llm_judge,

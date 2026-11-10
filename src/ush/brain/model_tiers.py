@@ -286,6 +286,7 @@ def build_adaptive_system_prompt(
     mode: PermissionMode,
     memory_block: str = "",
     initial_skills_block: str = "",
+    initial_evaluators_block: str = "",
 ) -> str:
     """Constructs a cache-invariant Turn-0 system prompt scaled to Tier S / A / B."""
     mode_note = (
@@ -293,6 +294,15 @@ def build_adaptive_system_prompt(
         "Do not modify files until switched out of plan mode."
         if mode == PermissionMode.PLAN
         else "MODE: EXECUTE. Reproduce issues before editing, make surgical changes, and verify via tests/commands before declaring completion."
+    )
+
+    eval_rule_s_a = (
+        "Evaluators (`consult_evaluator`) — choose selectively by usefulness, just like tools (skip on trivial reads/Q&A):\n"
+        "- `trajectory_sentinel`: when debugging hits >=2 repeated failures or edits oscillate.\n"
+        "- `clean_patch_and_contract` / `adversarial_falsifier`: after non-trivial code, math, parser, or test edits.\n"
+        "- `artifact_enhancer`: after creating/updating HTML, SVG, TSX, or interactive visualizations.\n"
+        "- `blind_bars_judge` / `epistemic_grounding_auditor`: before finalizing multi-file changes or summarizing root cause.\n"
+        "- Isolation hardline: blind evaluators inspect ONLY workspace ground truth (never your thoughts); act on findings silently—never print evaluator scorecards into user deliverables."
     )
 
     if profile.tier == ModelTier.S:
@@ -304,7 +314,8 @@ def build_adaptive_system_prompt(
             "1. Read target files before editing; preserve unrelated comments and formatting.\n"
             "2. Verify hypotheses empirically with `exec_pty`/`grep_files` before concluding.\n"
             "3. Never weaken or delete test assertions to make a suite pass; never leak secrets.\n"
-            f"4. Batch independent read tools in parallel (up to {profile.max_parallel_read_tools})."
+            f"4. Batch independent read tools in parallel (up to {profile.max_parallel_read_tools}).\n"
+            f"5. {eval_rule_s_a}"
         )
     elif profile.tier == ModelTier.A:
         core = (
@@ -315,7 +326,8 @@ def build_adaptive_system_prompt(
             "2. REPRODUCE: Run failing test or reproduction command in `exec_pty` first when fixing bugs.\n"
             "3. EDIT: Use `edit_file` with exact surrounding lines copied from `read_file`.\n"
             "4. VERIFY: Re-run tests/lints and read full assertion output before stopping.\n"
-            f"5. You may issue up to {profile.max_parallel_read_tools} parallel read-only tool calls per step."
+            f"5. You may issue up to {profile.max_parallel_read_tools} parallel read-only tool calls per step.\n"
+            f"6. {eval_rule_s_a}"
         )
     else:
         # Tier B (7B-32B local/open-weight): compact, rigid single-step contract + XML fallback format
@@ -326,7 +338,8 @@ def build_adaptive_system_prompt(
             "- Briefly write `<scratchpad>Fact: ... | Hypothesis: ... | Next: tool_name</scratchpad>` (max 4 lines).\n"
             "- Call AT MOST ONE tool per response. Always `read_file` before `edit_file`.\n"
             "- After editing code, ALWAYS run tests via `exec_pty` before saying done.\n"
-            "- Prefer native tool calls; if unavailable, emit `<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>`."
+            "- If stuck >=2 attempts or finishing a complex edit, call `consult_evaluator(lens=..., objective=...)`.\n"
+            "- Prefer native tool calls; if unavailable, emit `<crux_tool_call>{\"name\":\"...\",\"arguments\":{...}}</crux_tool_call>`."
         )
 
     sections = [core]
@@ -334,4 +347,6 @@ def build_adaptive_system_prompt(
         sections.append(f"<workspace_memory>\n{memory_block.strip()}\n</workspace_memory>")
     if initial_skills_block.strip():
         sections.append(initial_skills_block.strip())
+    if initial_evaluators_block.strip():
+        sections.append(initial_evaluators_block.strip())
     return "\n\n".join(sections)

@@ -18,9 +18,23 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
+import importlib.resources
+import json
 import pathlib
 import re
 from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
+
+
+def load_package_text_resource(
+    anchor_path: pathlib.Path | str,
+    package_name: str,
+    resource_name: str,
+) -> str:
+    """Reads a text asset alongside a module cleanly across both filesystem and `.pyz` zipimport."""
+    cand = pathlib.Path(anchor_path).with_name(resource_name)
+    if cand.is_file():
+        return cand.read_text(encoding="utf-8")
+    return importlib.resources.files(package_name).joinpath(resource_name).read_text(encoding="utf-8")
 
 HookEvent = Literal["BeforeTool", "AfterTool", "Stop", "HypothesisCheckpoint", "MCPConsult"]
 EvaluatorParadigm = Literal["deterministic", "llm_judge", "adversarial"]
@@ -150,6 +164,12 @@ class EvaluationVerdict:
     unverified_claims: list[str] = field(default_factory=list)
     suggested_next_probes: list[str] = field(default_factory=list)
 
+    # 4. Isolated Evaluator Thought & Analysis Metadata (separated from Actor CoT)
+    evaluator_analysis: str = ""
+    evaluator_thought: str = ""
+    evaluator_model: str = ""
+    isolated_context: bool = True
+
     @property
     def alignment_score(self) -> float:
         return self.bars_score
@@ -204,11 +224,12 @@ class EvaluationVerdict:
     def to_mcp_payload(self) -> dict[str, Any]:
         """Structured Complementary Feedback JSON returned by MCP `tools/call`."""
         status = "CLEAN" if self.decision == "ALLOW" else "INSIGHTS_FOUND"
-        return {
+        payload: dict[str, Any] = {
             "evaluator": self.evaluator_id,
             "paradigm": self.paradigm,
             "status": status,
             "decision": self.decision,
+            "isolated_context": self.isolated_context,
             "alignment_score": round(self.bars_score, 4),
             "progress_delta": round(self.progress_advantage, 4),
             "uncertainty": round(self.uncertainty, 4),
@@ -223,6 +244,11 @@ class EvaluationVerdict:
             "hard_vetoes_triggered": self.hard_vetoes_triggered,
             "remediation_directive": self.remediation_directive,
         }
+        if self.evaluator_analysis:
+            payload["analysis"] = self.evaluator_analysis
+        if self.evaluator_model:
+            payload["evaluator_model"] = self.evaluator_model
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -319,9 +345,57 @@ class CascadeReport:
         return 0, {"decision": "allow"}
 
 
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?(.*)\Z", re.DOTALL)
+
+
+def _parse_yaml_mapping(raw: str) -> dict[str, Any]:
+    """Dependency-free colon-safe YAML key/value & list parser for `evaluator.yaml` and `EVALUATOR.md`."""
+    data: dict[str, Any] = {}
+    current_key: str | None = None
+    current_list: list[str] | None = None
+
+    for raw_line in raw.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if current_key and stripped.startswith("- ") and (raw_line.startswith(" ") or raw_line.startswith("\t")):
+            item = stripped[2:].strip().strip("'\"")
+            if current_list is None:
+                current_list = []
+                data[current_key] = current_list
+            if item:
+                current_list.append(item)
+            continue
+        if current_key and current_list is None and (raw_line.startswith("  ") or raw_line.startswith("\t")):
+            prev = str(data.get(current_key, "")).strip()
+            data[current_key] = f"{prev} {stripped}".strip()
+            continue
+
+        key_m = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", raw_line)
+        if not key_m:
+            continue
+        key, val = key_m.group(1).strip(), key_m.group(2).strip()
+        current_key = key
+        current_list = None
+        if val in ("|", ">", ""):
+            data[key] = ""
+        elif val.startswith("[") and val.endswith("]"):
+            inner = val[1:-1].strip()
+            data[key] = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()] if inner else []
+        else:
+            unq = val.strip("'\"")
+            if unq.lower() in ("true", "false"):
+                data[key] = unq.lower() == "true"
+            elif unq.isdigit():
+                data[key] = int(unq)
+            else:
+                data[key] = unq
+    return data
+
+
 @dataclass(frozen=True)
 class EvaluatorManifest:
-    """Declarative metadata loaded from each module's `evaluator.yaml`."""
+    """Declarative metadata loaded from `evaluator.yaml` or `EVALUATOR.md` frontmatter."""
 
     evaluator_id: str
     name: str
@@ -333,12 +407,26 @@ class EvaluatorManifest:
     cross_family_preferred: bool = False
     mcp_tool_name: str = ""
     description: str = ""
+    when_to_use: str = ""
+    paths: tuple[str, ...] = ()
 
     @property
     def resolved_mcp_tool_name(self) -> str:
         if self.mcp_tool_name:
             return self.mcp_tool_name
         return f"eval_{self.evaluator_id}"
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256_short(f"{self.evaluator_id}|{self.description}|{self.when_to_use}|{self.paths}")
+
+    def summary_line(self) -> str:
+        wtu = f" (When useful: {self.when_to_use})" if self.when_to_use else ""
+        blind = "blind" if self.requires_blind_context else "grounded"
+        return f"- {self.evaluator_id} [{self.paradigm}, {blind}]: {self.description}{wtu}"
+
+    def approx_catalog_tokens(self) -> int:
+        return max(10, len(self.summary_line()) // 4)
 
     def matches(self, event: HookEvent, tool_name: str | None = None) -> bool:
         if event == "MCPConsult":
@@ -353,39 +441,87 @@ class EvaluatorManifest:
         return True
 
     @classmethod
-    def from_yaml_file(cls, path: pathlib.Path) -> EvaluatorManifest:
-        """Dependency-free parser for `evaluator.yaml` manifests."""
-        raw = path.read_text(encoding="utf-8")
-        data: dict[str, Any] = {}
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or ":" not in stripped:
-                continue
-            key, val = stripped.split(":", 1)
-            key = key.strip()
-            val = val.strip()
-            if val.startswith("[") and val.endswith("]"):
-                items = [x.strip().strip("'\"") for x in val[1:-1].split(",") if x.strip()]
-                data[key] = items
-            elif val.lower() in ("true", "false"):
-                data[key] = val.lower() == "true"
-            elif val.isdigit():
-                data[key] = int(val)
-            else:
-                data[key] = val.strip("'\"")
-        eval_id = str(data.get("evaluator_id", path.parent.name))
+    def from_yaml_text(cls, raw: str, *, default_id: str) -> EvaluatorManifest:
+        """Parses an `evaluator.yaml` string into an `EvaluatorManifest`."""
+        data = _parse_yaml_mapping(raw)
+        eval_id = str(data.get("evaluator_id") or default_id).strip()
+        raw_paths = data.get("paths") or []
+        paths = tuple(str(x) for x in raw_paths) if isinstance(raw_paths, list) else ((str(raw_paths),) if raw_paths else ())
+        raw_events = data.get("events") or ["AfterTool"]
+        events = tuple(raw_events) if isinstance(raw_events, list) else (str(raw_events),)
         return cls(
             evaluator_id=eval_id,
-            name=str(data.get("name", path.parent.name)),
-            paradigm=data.get("paradigm", "deterministic"),
+            name=str(data.get("name", default_id)),
+            paradigm=data.get("paradigm", "deterministic"),  # type: ignore[arg-type]
             stage=int(data.get("stage", 1)),
-            events=tuple(data.get("events", ["AfterTool"])),
+            events=events,  # type: ignore[arg-type]
             tool_matcher=str(data.get("tool_matcher", ".*")),
             requires_blind_context=bool(data.get("requires_blind_context", True)),
             cross_family_preferred=bool(data.get("cross_family_preferred", False)),
             mcp_tool_name=str(data.get("mcp_tool_name", f"eval_{eval_id}")),
             description=str(data.get("description", "")),
+            when_to_use=str(data.get("when_to_use", data.get("whenToUse", ""))),
+            paths=paths,
         )
+
+    @classmethod
+    def from_yaml_file(cls, path: pathlib.Path) -> EvaluatorManifest:
+        """Dependency-free parser for `evaluator.yaml` manifests."""
+        return cls.from_yaml_text(path.read_text(encoding="utf-8"), default_id=path.parent.name)
+
+    @classmethod
+    def from_markdown_text(cls, raw: str, *, default_id: str) -> tuple[EvaluatorManifest, str]:
+        """Parses a skill-style `EVALUATOR.md` (`---` frontmatter + Markdown rubric body)."""
+        m = _FRONTMATTER_RE.match(raw)
+        if not m:
+            manifest = cls(
+                evaluator_id=default_id,
+                name=" ".join(w.capitalize() for w in default_id.split("_")),
+                paradigm="llm_judge",
+                stage=2,
+                events=("MCPConsult", "Stop"),
+                requires_blind_context=True,
+                cross_family_preferred=True,
+                mcp_tool_name=f"eval_{default_id}",
+                description=raw.strip().splitlines()[0].lstrip("# ").strip()[:240] if raw.strip() else default_id,
+            )
+            return manifest, raw.strip()
+
+        fm_raw, body = m.group(1), m.group(2).strip()
+        data = _parse_yaml_mapping(fm_raw)
+        raw_id = str(data.get("evaluator_id") or data.get("name") or default_id).strip().lower()
+        clean_id = re.sub(r"[^a-z0-9_]", "_", raw_id).strip("_") or default_id
+        paradigm = str(data.get("paradigm") or "llm_judge")
+        if paradigm not in ("deterministic", "llm_judge", "adversarial"):
+            paradigm = "llm_judge"
+        default_stage = 1 if paradigm == "deterministic" else (3 if paradigm == "adversarial" else 2)
+        raw_events = data.get("events") or ["MCPConsult", "Stop"]
+        events = tuple(raw_events) if isinstance(raw_events, list) else (str(raw_events),)
+        raw_paths = data.get("paths") or []
+        paths = tuple(str(x) for x in raw_paths) if isinstance(raw_paths, list) else ((str(raw_paths),) if raw_paths else ())
+        desc = str(data.get("description") or "").strip()
+        if not desc and body:
+            desc = body.splitlines()[0].lstrip("# ").strip()[:240]
+
+        manifest = cls(
+            evaluator_id=clean_id,
+            name=str(data.get("title") or data.get("name") or " ".join(w.capitalize() for w in clean_id.split("_"))),
+            paradigm=paradigm,  # type: ignore[arg-type]
+            stage=int(data.get("stage", default_stage)),
+            events=events,  # type: ignore[arg-type]
+            tool_matcher=str(data.get("tool_matcher", ".*")),
+            requires_blind_context=bool(data.get("requires_blind_context", True)),
+            cross_family_preferred=bool(data.get("cross_family_preferred", True)),
+            mcp_tool_name=str(data.get("mcp_tool_name") or f"eval_{clean_id}"),
+            description=desc,
+            when_to_use=str(data.get("when_to_use", data.get("whenToUse", ""))),
+            paths=paths,
+        )
+        return manifest, body
+
+    @classmethod
+    def from_markdown_file(cls, path: pathlib.Path) -> tuple[EvaluatorManifest, str]:
+        return cls.from_markdown_text(path.read_text(encoding="utf-8", errors="replace"), default_id=path.parent.name)
 
 
 @runtime_checkable
@@ -409,12 +545,16 @@ class BaseEvaluator:
     manifest: EvaluatorManifest
 
     def __init__(self, manifest_path: pathlib.Path | None = None) -> None:
-        if manifest_path is None:
-            import inspect
+        import inspect
 
-            cls_file = pathlib.Path(inspect.getfile(self.__class__))
-            manifest_path = cls_file.with_name("evaluator.yaml")
-        self.manifest = EvaluatorManifest.from_yaml_file(manifest_path)
+        cls_file = pathlib.Path(inspect.getfile(self.__class__))
+        pkg_name = self.__class__.__module__.rsplit(".", 1)[0]
+        if manifest_path is not None and manifest_path.is_file():
+            self.manifest = EvaluatorManifest.from_yaml_file(manifest_path)
+            return
+        yaml_text = load_package_text_resource(cls_file, pkg_name, "evaluator.yaml")
+        default_id = pkg_name.rsplit(".", 1)[-1]
+        self.manifest = EvaluatorManifest.from_yaml_text(yaml_text, default_id=default_id)
 
     def mcp_input_schema(self) -> dict[str, Any]:
         """Default MCP JSON Schema (Actor CoT excluded by design to prevent self-grading)."""
@@ -447,3 +587,173 @@ class BaseEvaluator:
 
     def evaluate(self, frame: EvaluationFrame) -> EvaluationVerdict:
         raise NotImplementedError
+
+
+class MarkdownPromptEvaluator(BaseEvaluator):
+    """Skill-like declarative evaluator loaded from `EVALUATOR.md` and run in strict model isolation.
+
+    Enforces epistemic firewalling (`with_epistemic_firewall()`) whenever `requires_blind_context`
+    is True so the Actor model's Chain-of-Thought never biases the evaluator's independent analysis.
+    """
+
+    def __init__(
+        self,
+        *,
+        manifest: EvaluatorManifest,
+        rubric_body: str,
+        llm_judge: LLMJudgeCallable | None = None,
+    ) -> None:
+        self.manifest = manifest
+        self.rubric_body = rubric_body.strip()
+        self.llm_judge = llm_judge
+
+    def build_isolated_prompt(self, frame: EvaluationFrame) -> tuple[str, str]:
+        safe_frame = frame.with_epistemic_firewall() if self.manifest.requires_blind_context else frame
+        ws = pathlib.Path(safe_frame.workspace_root).resolve()
+
+        system_prompt = (
+            f"You are an independent Crux-Evals lens (`{self.manifest.evaluator_id}`: {self.manifest.name}).\n"
+            "You operate in STRICT ISOLATION from the coding agent: zero prior chat history, zero Actor reasoning, "
+            "and ground-truth artifacts only.\n\n"
+            f"Evaluator Instructions / Rubric:\n{self.rubric_body}\n\n"
+            "Return STRICT JSON matching:\n"
+            '{"analysis":"clear independent technical analysis","bars":0.0|0.5|1.0,'
+            '"criterion_scores":{},"hard_vetoes":[],"blind_spots":[],'
+            '"suggested_next_probes":[],"remediation":"","uncertainty":0.1}'
+        )
+
+        file_excerpts: list[str] = []
+        for rel in safe_frame.modified_files[:6]:
+            fp = pathlib.Path(rel)
+            if not fp.is_absolute():
+                fp = (ws / fp).resolve()
+            if fp.is_file():
+                try:
+                    content = fp.read_text(encoding="utf-8", errors="replace")[:4_000]
+                    file_excerpts.append(f"--- {rel} ---\n{content}")
+                except OSError:
+                    continue
+
+        diff_block = safe_frame.unified_git_diff[:16_000] if safe_frame.unified_git_diff.strip() else "(no git diff)"
+        verif_block = (
+            safe_frame.last_verification_output[:4_000]
+            if safe_frame.last_verification_output.strip()
+            else "(no verification command output recorded)"
+        )
+        claims_block = (
+            f"\n\n<actor_claims>\n{safe_frame.actor_claim_text[:4_000]}\n</actor_claims>"
+            if not self.manifest.requires_blind_context and safe_frame.actor_claim_text
+            else ""
+        )
+        excerpts_block = "\n\n".join(file_excerpts) if file_excerpts else "(none)"
+
+        user_payload = (
+            f"<task_objective>\n{safe_frame.task_objective}\n</task_objective>\n\n"
+            f"<declared_invariants>\n"
+            + ("\n".join(f"- {inv}" for inv in safe_frame.declared_invariants) or "(none)")
+            + "\n</declared_invariants>\n\n"
+            f"<modified_files>\n{', '.join(safe_frame.modified_files) or '(none)'}\n</modified_files>\n\n"
+            f"<anonymous_git_diff>\n{diff_block}\n</anonymous_git_diff>\n\n"
+            f"<target_file_excerpts>\n{excerpts_block}\n</target_file_excerpts>\n\n"
+            f"<raw_verification_output passed=\"{safe_frame.last_verification_passed}\">\n"
+            f"{verif_block}\n</raw_verification_output>{claims_block}"
+        )
+        return system_prompt, user_payload
+
+    def evaluate(self, frame: EvaluationFrame) -> EvaluationVerdict:
+        safe_frame = frame.with_epistemic_firewall() if self.manifest.requires_blind_context else frame
+        if self.llm_judge is None:
+            return EvaluationVerdict(
+                evaluator_id=self.manifest.evaluator_id,
+                paradigm=self.manifest.paradigm,
+                decision="ALLOW",
+                bars_score=1.0,
+                progress_advantage=0.05,
+                uncertainty=0.25,
+                isolated_context=True,
+                evaluator_analysis=(
+                    f"Declarative lens `{self.manifest.evaluator_id}` inspected {len(safe_frame.modified_files)} "
+                    f"target path(s) in deterministic mode (attach an isolated LLM judge for full semantic critique)."
+                ),
+            )
+
+        sys_p, user_p = self.build_isolated_prompt(safe_frame)
+        raw = self.llm_judge(sys_p, user_p, safe_frame.actor_model_family)
+        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if not m:
+            snippet = (raw or "").strip()[:500]
+            return EvaluationVerdict(
+                evaluator_id=self.manifest.evaluator_id,
+                paradigm=self.manifest.paradigm,
+                decision="ALLOW" if not snippet else "WARN",
+                bars_score=0.75 if snippet else 1.0,
+                uncertainty=0.3,
+                isolated_context=True,
+                evaluator_analysis=snippet or f"Lens `{self.manifest.evaluator_id}` completed.",
+                blind_spots=[snippet] if snippet else [],
+            )
+
+        try:
+            parsed = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            snippet = raw.strip()[:500]
+            return EvaluationVerdict(
+                evaluator_id=self.manifest.evaluator_id,
+                paradigm=self.manifest.paradigm,
+                decision="WARN",
+                bars_score=0.5,
+                uncertainty=0.4,
+                isolated_context=True,
+                evaluator_analysis=snippet,
+                blind_spots=[snippet] if snippet else [],
+            )
+
+        crit: dict[str, float] = {}
+        raw_crit = parsed.get("criterion_scores")
+        if isinstance(raw_crit, dict):
+            for k, v in raw_crit.items():
+                try:
+                    fv = float(v)
+                    crit[str(k)] = 1.0 if fv >= 0.75 else (0.5 if fv >= 0.25 else 0.0)
+                except (TypeError, ValueError):
+                    pass
+
+        try:
+            raw_bars = float(parsed.get("bars", sum(crit.values()) / len(crit) if crit else 1.0))
+        except (TypeError, ValueError):
+            raw_bars = 1.0
+        bars_score = 1.0 if raw_bars >= 0.75 else (0.5 if raw_bars >= 0.25 else 0.0)
+        hard_vetoes = [str(v) for v in (parsed.get("hard_vetoes") or []) if str(v).strip()]
+        blind_spots = [str(x) for x in (parsed.get("blind_spots") or []) if str(x).strip()]
+        probes = [str(x) for x in (parsed.get("suggested_next_probes") or []) if str(x).strip()]
+        remediation = str(parsed.get("remediation") or "").strip()
+        analysis = str(parsed.get("analysis") or "").strip()
+        try:
+            uncertainty = max(0.0, min(1.0, float(parsed.get("uncertainty", 0.15))))
+        except (TypeError, ValueError):
+            uncertainty = 0.15
+
+        if hard_vetoes:
+            decision: Decision = "VETO"
+            bars_score = 0.0
+        elif bars_score < 0.75 or blind_spots:
+            decision = "WARN"
+        else:
+            decision = "ALLOW"
+
+        return EvaluationVerdict(
+            evaluator_id=self.manifest.evaluator_id,
+            paradigm=self.manifest.paradigm,
+            decision=decision,
+            bars_score=bars_score,
+            progress_advantage=round(bars_score - 0.5, 4),
+            uncertainty=uncertainty,
+            criterion_scores=crit,
+            hard_vetoes_triggered=hard_vetoes,
+            evidence_citations=blind_spots,
+            remediation_directive=remediation,
+            blind_spots=blind_spots,
+            suggested_next_probes=probes,
+            evaluator_analysis=analysis,
+            isolated_context=True,
+        )

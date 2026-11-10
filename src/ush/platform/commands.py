@@ -80,6 +80,7 @@ BUILTIN_COMMAND_SPECS: tuple[tuple[str, str, bool], ...] = (
     ("skills", "List discovered 4-tier skills and activation states", True),
     ("commands", "List all resolved slash commands and any rename notices", True),
     ("hooks", "List active 9-event lifecycle hooks", True),
+    ("evaluators", "List, scaffold, reload, or run independent Crux-Evals plugins (`/evaluators [list|new <id>|run [lens]|reload]`)", True),
     ("policies", "Inspect loaded 4-tier `policies.toml` rules and privilege-clamp warnings", True),
     ("trust", "Approve or revoke SHA-256 trust for repo skills, hooks, and `.mcp.json` (`/trust [grant|revoke]`)", False),
     ("memory", "Inspect 4-scope memory or review/apply `.inbox` patches (`/memory [show|inbox|apply <id>]`)", True),

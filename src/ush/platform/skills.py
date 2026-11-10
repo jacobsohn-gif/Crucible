@@ -89,6 +89,37 @@ BUILTIN_SKILLS: tuple[SkillDefinition, ...] = (
             "via `swarm_dispatch` so sibling workers code against proven reality."
         ),
     ),
+    SkillDefinition(
+        name="crux-evals",
+        description="Select independent, model-isolated Crux-Evals lenses (`consult_evaluator`) based on usefulness to uncover blind spots and counterexamples.",
+        when_to_use="When debugging loops (>=2 failures), after non-trivial code/UI edits, or before finalizing complex work.",
+        tier="builtin",
+        body=(
+            "Use `consult_evaluator(lens, objective, target_paths)` selectively when genuinely useful (skip for trivial reads):\n"
+            "- `trajectory_sentinel`: when repeated errors or edit oscillations happen.\n"
+            "- `clean_patch_and_contract`: after multi-file edits to audit AST syntax, secret hygiene, and test integrity.\n"
+            "- `adversarial_falsifier`: after non-trivial algorithms, parsers, or math to synthesize & run `/tmp` boundary probes.\n"
+            "- `artifact_enhancer`: after generating HTML/TSX/SVG visualizations or UI deliverables.\n"
+            "- `epistemic_grounding_auditor`: before concluding root-cause investigations or summarizing verification.\n"
+            "- `blind_bars_judge`: for provenance-blind cross-family quality scoring of complex changes.\n"
+            "All blind lenses strip Actor Chain-of-Thought cleanly; use findings silently without leaking scorecards."
+        ),
+    ),
+    SkillDefinition(
+        name="create-evaluator",
+        description="Author custom plug-and-play evaluators just like skills (`EVALUATOR.md` or `evaluator.yaml` + `module.py`) with strict model isolation.",
+        when_to_use="When the user asks to add a new evaluator, audit lens, or domain-specific rubric.",
+        tier="builtin",
+        body=(
+            "Create custom evaluators just like skills in `~/.ush/evaluators/<id>/` (user-global) or trusted `<workspace>/.crux_evals/plugins/<id>/`:\n"
+            "1. Declarative Rubric Lens (zero Python — create `EVALUATOR.md`):\n"
+            "   Frontmatter keys: `evaluator_id`, `name`, `description`, `when_to_use`, `paths: [\"*.ext\"]`, `paradigm: llm_judge`, "
+            "`requires_blind_context: true`, `cross_family_preferred: true`.\n"
+            "   Body: crisp rubric instructions evaluated in strict isolation (no Actor CoT).\n"
+            "2. Or run `/evaluators new <id>` / `crux eval new <id> [--style md|py]` to scaffold either format.\n"
+            "3. Run `/reload` or `/evaluators reload` so it immediately appears in `consult_evaluator(lens=...)` and MCP `tools/list`."
+        ),
+    ),
 )
 
 

@@ -1005,6 +1005,7 @@ class AgyAcpBridge:
         tool_decl = _render_tool_declarations(tools)
         sys_h = _hash_text(system_prompt)
         tools_h = _hash_text(tool_decl)
+        is_isolated_eval = session_id.startswith("crux_eval_isolated:")
         sess_key = f"{session_id}::__notools__" if not tools else session_id
         durable_pairs = [
             (idx, m, _build_acp_msg_record(m))
@@ -1012,11 +1013,12 @@ class AgyAcpBridge:
             if not _is_pure_dynamic_msg(m)
         ]
 
-        tracked = self._sessions.get(sess_key)
+        tracked = None if is_isolated_eval else self._sessions.get(sess_key)
         can_reuse = False
         delta_msgs: list[CanonicalMessage] = []
         if (
-            tracked is not None
+            not is_isolated_eval
+            and tracked is not None
             and tracked.sys_hash == sys_h
             and len(durable_pairs) >= len(tracked.msg_records)
             and all(
@@ -1036,7 +1038,7 @@ class AgyAcpBridge:
             prompt_blocks = _build_bounded_delta_blocks(delta_msgs, updated_tool_decl=updated_decl)
             tracked.tools_hash = tools_h
         else:
-            spare = self._sessions.pop("__warm_spare__", None)
+            spare = None if is_isolated_eval else self._sessions.pop("__warm_spare__", None)
             if spare is not None:
                 tracked = _TrackedAcpSession(
                     acp_session_id=spare.acp_session_id,
@@ -1210,12 +1212,13 @@ class AgyAcpBridge:
             usage=usage,
         )
 
-        # Record durable prefix state including the assistant reply `agy` now holds in this ACP session!
-        next_records = [rec for _, _, rec in durable_pairs]
-        if assistant_msg.parts and stop_r != StopReason.EMPTY_200_RESPONSE:
-            next_records.append(_build_acp_msg_record(assistant_msg))
-        tracked.msg_records = next_records
-        self._sessions[sess_key] = tracked
+        # Record durable prefix state only for reusable non-isolated sessions
+        if not is_isolated_eval:
+            next_records = [rec for _, _, rec in durable_pairs]
+            if assistant_msg.parts and stop_r != StopReason.EMPTY_200_RESPONSE:
+                next_records.append(_build_acp_msg_record(assistant_msg))
+            tracked.msg_records = next_records
+            self._sessions[sess_key] = tracked
         return assistant_msg
 
 
