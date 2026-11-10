@@ -308,5 +308,44 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
             self.assertEqual(stage_a.crux_evals_report.get("final_decision"), "ALLOW")
 
 
+
+    def test_native_consult_evaluator_tool_and_artifact_enhancer_lens(self) -> None:
+        """Verifies `consult_evaluator` is a native read-only tool in ToolRegistry and `artifact_enhancer` catches scorecard pollution vs clean interactive visualizations."""
+        import json
+        from ush.core.types import CanonicalPart, PermissionMode
+        from ush.kernel.patch import StaleReadTracker
+        from ush.kernel.pty_manager import PersistentPtyManager
+        from ush.kernel.security import PolicyEngine, SecurityFirewall
+        from ush.kernel.tools import ToolExecutionContext, build_default_tool_registry
+
+        reg = build_default_tool_registry()
+        spec = reg.get("consult_evaluator")
+        self.assertIsNotNone(spec)
+        self.assertTrue(spec.read_only)
+        self.assertIn("consult_evaluator", PolicyEngine.READ_ONLY_TOOLS)
+
+        with tempfile.TemporaryDirectory() as td:
+            ws = pathlib.Path(td)
+            polluted = ws / "viz.html"
+            polluted.write_text("<html><body><h1>Crux-Evals Scorecard</h1></body></html>")
+            pty = PersistentPtyManager(ws)
+            try:
+                res1 = reg.dispatch_batch(
+                    [CanonicalPart(kind="tool_call", tool_call_id="c1", tool_name="consult_evaluator", tool_args={
+                        "lens": "artifact_enhancer",
+                        "objective": "Interactive Ozaki TPU visualization",
+                        "target_paths": ["viz.html"],
+                    })],
+                    ctx_factory=lambda cid: ToolExecutionContext(call_id=cid, firewall=SecurityFirewall(ws), stale_tracker=StaleReadTracker(), pty=pty, policy_engine=PolicyEngine(), mode=PermissionMode.DEFAULT),
+                )
+                payload1 = json.loads(res1[0].text)
+                self.assertEqual(payload1["evaluator"], "artifact_enhancer")
+                self.assertEqual(payload1["status"], "INSIGHTS_FOUND")
+                self.assertEqual(payload1["criterion_scores"]["deliverable_purity"], 0.0)
+                self.assertTrue(any("DELIVERABLE_POLLUTION" in b for b in payload1["blind_spots"]))
+            finally:
+                pty.close_all()
+
+
 if __name__ == "__main__":
     unittest.main()

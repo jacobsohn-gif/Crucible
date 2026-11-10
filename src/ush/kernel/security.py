@@ -679,7 +679,7 @@ class PolicyEngine:
     """Gemini-CLI-inspired declarative TOML policy engine with extension privilege clamping."""
 
     READ_ONLY_TOOLS: frozenset[str] = frozenset(
-        {"read_file", "grep_files", "glob_files", "lsp_query", "activate_skill"}
+        {"read_file", "grep_files", "glob_files", "lsp_query", "activate_skill", "consult_evaluator"}
     )
 
     def __init__(self) -> None:

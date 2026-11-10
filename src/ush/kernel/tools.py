@@ -600,6 +600,63 @@ def build_default_tool_registry() -> ToolRegistry:
             return CanonicalPart(kind="tool_result", text="Swarm blackboard callback not attached.", is_error=True)
         return CanonicalPart(kind="tool_result", text=ctx.swarm_callback(args))
 
+    
+    def _consult_evaluator(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
+        """Native read-only enhancement tool allowing the agent to query Crux-Evals lenses mid-task."""
+        import json
+        from crux_evals.core.protocol import EvaluationFrame
+        from crux_evals.core.runner import build_default_cascade
+        from crux_evals.core.state import capture_git_diff, discover_git_modified_files
+
+        ws = ctx.firewall.workspace_root
+        lens = str(args.get("lens", "artifact_enhancer") or "artifact_enhancer")
+        objective = str(args.get("objective", "Enhance artifact quality and correctness"))
+        raw_paths = args.get("target_paths") or []
+        target_paths: list[str] = []
+        if isinstance(raw_paths, list):
+            for rp in raw_paths:
+                try:
+                    resolved = ctx.firewall.resolve_and_validate(str(rp), write=False)
+                    try:
+                        target_paths.append(str(resolved.relative_to(ws)))
+                    except ValueError:
+                        target_paths.append(str(resolved))
+                except Exception:
+                    target_paths.append(str(rp))
+        if not target_paths:
+            target_paths = discover_git_modified_files(ws)
+
+        diff = capture_git_diff(ws, target_paths if target_paths else None)
+        cascade = build_default_cascade(enforce_read_before_edit=False, workspace_root=ws)
+        frame = EvaluationFrame(
+            session_id="native_tool",
+            workspace_root=str(ws),
+            event="MCPConsult",
+            step_index=1,
+            task_objective=objective,
+            unified_git_diff=diff,
+            modified_files=tuple(target_paths),
+        )
+        if lens != "all":
+            ev = cascade.get_evaluator(lens)
+            if ev is not None:
+                verdict = ev.evaluate(frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame)
+                payload = verdict.to_mcp_payload()
+                payload["usage_note"] = (
+                    "Use `blind_spots` and `suggested_next_probes` to enhance the user's artifact directly. "
+                    "NEVER render evaluator scorecards or harness metadata inside user deliverables."
+                )
+                return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
+
+        report = cascade.run(frame)
+        payload = report.to_mcp_payload()
+        payload["usage_note"] = (
+            "Use `blind_spots` and `suggested_next_probes` to enhance the user's artifact directly. "
+            "NEVER render evaluator scorecards or harness metadata inside user deliverables."
+        )
+        return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
+
+
     def _activate_skill(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
         if ctx.skill_activate_callback is None:
             return CanonicalPart(kind="tool_result", text="Skill engine not initialized.", is_error=True)
@@ -764,6 +821,32 @@ def build_default_tool_registry() -> ToolRegistry:
             },
             True,
             _activate_skill,
+        ),
+        ToolSpec(
+            "consult_evaluator",
+            "Consult a specialized enhancement & verification lens (`artifact_enhancer`, `clean_patch_and_contract`, `trajectory_sentinel`, `epistemic_grounding_auditor`, `blind_bars_judge`, `adversarial_falsifier`, or `all`) to discover UX/pedagogical upgrades, blind spots, and numerical edge cases without blocking.",
+            {
+                "type": "object",
+                "properties": {
+                    "lens": {
+                        "type": "string",
+                        "enum": [
+                            "artifact_enhancer",
+                            "all",
+                            "clean_patch_and_contract",
+                            "trajectory_sentinel",
+                            "epistemic_grounding_auditor",
+                            "blind_bars_judge",
+                            "adversarial_falsifier",
+                        ],
+                    },
+                    "objective": {"type": "string"},
+                    "target_paths": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["objective"],
+            },
+            True,
+            _consult_evaluator,
         ),
     ]
     for s in specs:

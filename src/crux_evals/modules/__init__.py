@@ -5,9 +5,11 @@ from crux_evals.modules.m02_clean_patch_and_contract import CleanPatchAndContrac
 from crux_evals.modules.m03_epistemic_grounding_auditor import EpistemicGroundingAuditor
 from crux_evals.modules.m04_blind_bars_judge import BlindBarsJudgeEvaluator
 from crux_evals.modules.m05_adversarial_falsifier import AdversarialFalsifierEvaluator
+from crux_evals.modules.m06_artifact_enhancer import ArtifactEnhancerEvaluator
 
 __all__ = [
     "AdversarialFalsifierEvaluator",
+    "ArtifactEnhancerEvaluator",
     "BlindBarsJudgeEvaluator",
     "CleanPatchAndContractEvaluator",
     "EpistemicGroundingAuditor",
