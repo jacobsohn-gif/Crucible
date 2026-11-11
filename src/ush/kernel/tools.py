@@ -14,6 +14,8 @@ import mimetypes
 import os
 import pathlib
 import re
+import signal
+import subprocess
 import threading
 import time
 from typing import Any, Callable
@@ -22,6 +24,7 @@ from ush.core.types import CanonicalPart, PermissionMode, PolicyDecision
 from ush.kernel.patch import StaleReadTracker, atomic_write_bytes, edit_file_safe
 from ush.kernel.pty_manager import PersistentPtyManager
 from ush.kernel.security import PolicyEngine, SecurityFirewall, redact_secrets
+from ush.kernel.ui_renderer import render_ui_capture
 
 IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 SKIP_WALK_DIRS: frozenset[str] = frozenset(
@@ -148,7 +151,7 @@ class ToolRegistry:
             elif name == "consult_evaluator":
                 base_schema = d["input_schema"]
                 props = dict(base_schema.get("properties") or {})
-                wf_head = ["cold_eyes_review", "challenge_design", "break_loop"]
+                wf_head = ["cold_eyes_review", "challenge_design", "break_loop", "tournament"]
                 extra_ids = [
                     str(e)
                     for e in (evaluator_enum or [])
@@ -189,6 +192,11 @@ class ToolRegistry:
             for c in calls
         }
 
+        batch_has_mutation = any(
+            not (self._specs.get(c.tool_name or "") and self._specs[c.tool_name or ""].read_only)
+            for c in calls
+        )
+
         # Partition contiguous read calls for concurrent dispatch vs serialized write calls
         idx = 0
         n = len(calls)
@@ -217,6 +225,7 @@ class ToolRegistry:
                                     before_tool_hook,
                                     after_tool_hook,
                                     on_tool_result,
+                                    batch_has_mutation,
                                 ),
                             )
                             for rc in read_group
@@ -235,6 +244,7 @@ class ToolRegistry:
                     before_tool_hook,
                     after_tool_hook,
                     on_tool_result,
+                    batch_has_mutation,
                 )
                 results[str(read_group[0].tool_call_id)] = res
             else:
@@ -244,6 +254,7 @@ class ToolRegistry:
                     before_tool_hook,
                     after_tool_hook,
                     on_tool_result,
+                    batch_has_mutation,
                 )
                 results[str(call.tool_call_id)] = res
                 idx += 1
@@ -254,12 +265,13 @@ class ToolRegistry:
         self,
         call: CanonicalPart,
         ctx: ToolExecutionContext,
-        before_hook: Callable[[str, dict[str, Any]], tuple[bool, dict[str, Any], str]] | None,
-        after_hook: Callable[[str, CanonicalPart], str] | None,
+        before_hook: Callable[..., tuple[bool, dict[str, Any], str]] | None,
+        after_hook: Callable[..., str] | None,
         on_tool_result: Callable[[CanonicalPart, float], None] | None,
+        batch_has_mutation: bool = False,
     ) -> tuple[CanonicalPart, float]:
         t0 = time.monotonic()
-        part = self._run_single(call, ctx, before_hook, after_hook)
+        part = self._run_single(call, ctx, before_hook, after_hook, batch_has_mutation=batch_has_mutation)
         ms = (time.monotonic() - t0) * 1000.0
         if on_tool_result is not None:
             try:
@@ -272,8 +284,10 @@ class ToolRegistry:
         self,
         call: CanonicalPart,
         ctx: ToolExecutionContext,
-        before_hook: Callable[[str, dict[str, Any]], tuple[bool, dict[str, Any], str]] | None,
-        after_hook: Callable[[str, CanonicalPart], str] | None,
+        before_hook: Callable[..., tuple[bool, dict[str, Any], str]] | None,
+        after_hook: Callable[..., str] | None,
+        *,
+        batch_has_mutation: bool = False,
     ) -> CanonicalPart:
         cid = str(call.tool_call_id)
         tname = str(call.tool_name or "")
@@ -301,7 +315,10 @@ class ToolRegistry:
 
             # 1. Lifecycle BeforeTool hook (may veto or rewrite args)
             if before_hook:
-                allow, args, reason = before_hook(tname, args)
+                if getattr(before_hook, "_accepts_call_id", False):
+                    allow, args, reason = before_hook(tname, args, call_id=cid)
+                else:
+                    allow, args, reason = before_hook(tname, args)
                 if not allow:
                     return CanonicalPart(
                         kind="tool_result",
@@ -312,7 +329,7 @@ class ToolRegistry:
                     )
 
             # 2. PolicyEngine gating + interactive human approval
-            cmd_str = str(args.get("command", "")) if tname == "exec_pty" else None
+            cmd_str = str(args.get("command", "")) if tname in ("exec_pty", "run_command") else None
             decision, reason = ctx.policy_engine.check(tname, command=cmd_str, mode=ctx.mode)
             if decision == PolicyDecision.DENY:
                 return CanonicalPart(
@@ -357,7 +374,10 @@ class ToolRegistry:
 
             if after_hook:
                 try:
-                    extra = after_hook(tname, part)
+                    if getattr(after_hook, "_accepts_batch_meta", False):
+                        extra = after_hook(tname, part, batch_has_mutation=batch_has_mutation)
+                    else:
+                        extra = after_hook(tname, part)
                     if extra:
                         part.text = f"{part.text}\n{extra}".strip()
                 except Exception as exc:  # noqa: BLE001
@@ -475,17 +495,35 @@ def build_default_tool_registry() -> ToolRegistry:
 
     def _write_file(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
         target = ctx.firewall.resolve_and_validate(str(args["path"]), write=True)
+        mode = str(args.get("mode") or "overwrite").strip().lower()
+        if mode not in ("overwrite", "append"):
+            return CanonicalPart(
+                kind="tool_result",
+                text=f"Invalid `mode={mode!r}` for `write_file`; expected `'overwrite'` or `'append'`.",
+                is_error=True,
+            )
         content = str(args.get("content", ""))
         raw = content.encode("utf-8")
-        if target.is_file():
-            conflict = ctx.stale_tracker.check_fresh(target, target.read_bytes())
+        existing = b""
+        existed = target.is_file()
+        if existed:
+            existing = target.read_bytes()
+            conflict = ctx.stale_tracker.check_fresh(target, existing)
             if conflict:
                 return CanonicalPart(kind="tool_result", text=conflict, is_error=True)
-        atomic_write_bytes(target, raw)
-        ctx.stale_tracker.record_read(target, raw)
+        final_raw = (existing + raw) if (mode == "append" and existed) else raw
+        atomic_write_bytes(target, final_raw)
+        ctx.stale_tracker.record_read(target, final_raw)
+        if mode == "append" and existed:
+            if ctx.on_file_modified:
+                ctx.on_file_modified(target, f"Appended {len(raw):,} bytes to {target.name} (total {len(final_raw):,} bytes)")
+            return CanonicalPart(
+                kind="tool_result",
+                text=f"Appended {len(raw):,} bytes to `{target}` (total {len(final_raw):,} bytes).",
+            )
         if ctx.on_file_modified:
-            ctx.on_file_modified(target, f"Wrote {len(raw):,} bytes to {target.name}")
-        return CanonicalPart(kind="tool_result", text=f"Wrote `{target}` ({len(raw):,} bytes).")
+            ctx.on_file_modified(target, f"Wrote {len(final_raw):,} bytes to {target.name}")
+        return CanonicalPart(kind="tool_result", text=f"Wrote `{target}` ({len(final_raw):,} bytes).")
 
     def _grep_files(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
         pattern = str(args["pattern"])
@@ -602,6 +640,96 @@ def build_default_tool_registry() -> ToolRegistry:
             kind="tool_result",
             text=f"[pty_id={res.pty_id} status={res.status} exit_code={res.exit_code}]\n{res.output}".strip(),
             is_error=res.status in ("not_found", "timed_out", "killed", "crashed"),
+        )
+
+    def _run_command(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
+        cmd = str(args["command"])
+        cwd_arg = str(args.get("cwd") or "").strip()
+        if cwd_arg:
+            run_cwd = ctx.firewall.resolve_and_validate(cwd_arg, write=False)
+            if not run_cwd.is_dir():
+                return CanonicalPart(kind="tool_result", text=f"Directory not found: `{run_cwd}`", is_error=True)
+        else:
+            run_cwd = ctx.firewall.workspace_root
+        timeout_s = max(0.5, min(float(args.get("timeout_seconds") or 30.0), 300.0))
+        shell_argv = ["/bin/bash", "--noprofile", "--norc", "-c", cmd] if os.path.exists("/bin/bash") else ["/bin/sh", "-c", cmd]
+        proc = subprocess.Popen(
+            shell_argv,
+            cwd=str(run_cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=ctx.firewall.scrubbed_env(),
+            start_new_session=True,
+        )
+        status = "completed"
+        out_b = b""
+        err_b = b""
+        deadline = time.monotonic() + timeout_s
+        try:
+            while True:
+                if ctx.cancel_event and ctx.cancel_event.is_set():
+                    status = "cancelled"
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        proc.kill()
+                    out_b, err_b = proc.communicate()
+                    break
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    status = "timed_out"
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        proc.kill()
+                    out_b, err_b = proc.communicate()
+                    break
+                try:
+                    out_b, err_b = proc.communicate(timeout=min(0.25, rem))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+        rc = proc.returncode
+        out_txt = out_b.decode("utf-8", errors="replace")
+        err_txt = err_b.decode("utf-8", errors="replace")
+        combined = out_txt if not err_txt else (f"{out_txt}\n{err_txt}" if out_txt else err_txt)
+        clean = redact_secrets(combined.strip())
+        cap = max(1024, int(ctx.preview_bytes))
+        if len(clean) > cap:
+            half = cap // 2
+            clean = f"{clean[:half]}\n... [truncated {len(clean) - cap:,} chars] ...\n{clean[-half:]}"
+        meta = f"[status={status} exit_code={rc} cwd={run_cwd}]"
+        body = f"{meta}\n{clean}".strip()
+        return CanonicalPart(kind="tool_result", text=body, is_error=(status != "completed" or rc != 0))
+
+    def _render_ui(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
+        res = render_ui_capture(
+            target=str(args["target"]),
+            firewall=ctx.firewall,
+            output_path=str(args["output_path"]) if args.get("output_path") else None,
+            width=int(args.get("width") or 1440),
+            height=int(args.get("height") or 900),
+            wait_ms=int(args.get("wait_ms") or 350),
+            allow_workspace_write=(ctx.mode != PermissionMode.PLAN),
+        )
+        if not res.success:
+            return CanonicalPart(kind="tool_result", text=res.summary, is_error=True)
+        if res.screenshot_path is not None:
+            ctx.stale_tracker.record_read(res.screenshot_path, res.png_bytes)
+            if ctx.on_file_accessed:
+                ctx.on_file_accessed(res.screenshot_path)
+        include_img = 0 < len(res.png_bytes) <= 8 * 1024 * 1024
+        return CanonicalPart(
+            kind="tool_result",
+            text=res.summary,
+            mime_type="image/png" if include_img else None,
+            base64_data=base64.b64encode(res.png_bytes).decode("ascii") if include_img else None,
         )
 
     def _ask_user(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
@@ -739,10 +867,18 @@ def build_default_tool_registry() -> ToolRegistry:
         ),
         ToolSpec(
             "write_file",
-            "Create or atomically overwrite a file inside the workspace.",
+            "Create, atomically overwrite (`mode='overwrite'`), or chunk-append (`mode='append'`) a file inside the workspace.",
             {
                 "type": "object",
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "append"],
+                        "description": "Default 'overwrite'; use 'append' to author large files in clean chunks without temp files.",
+                    },
+                },
                 "required": ["path", "content"],
             },
             False,
@@ -823,6 +959,38 @@ def build_default_tool_registry() -> ToolRegistry:
             _write_stdin,
         ),
         ToolSpec(
+            "run_command",
+            "Execute a fast, stateless, non-interactive shell command (`stdin=/dev/null`, clean timeout, zero PTY line-buffer limits). Prefer `run_command` for tests, linters, git, and one-shot scripts; use `exec_pty` for stateful shells or interactive REPLs/daemons.",
+            {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string", "description": "Optional workspace-relative directory."},
+                    "timeout_seconds": {"type": "number", "description": "Timeout in seconds (default 30, max 300)."},
+                },
+                "required": ["command"],
+            },
+            False,
+            _run_command,
+        ),
+        ToolSpec(
+            "render_ui",
+            "Render a local `.html`/`.svg` file or loopback `http://127.0.0.1:<port>` URL in headless Chromium with WebGL drawing-buffer preservation, automatic rAF loop capping, and JS console error capture, returning the PNG image directly.",
+            {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Workspace HTML/SVG file path (with optional `?query`) or `http://127.0.0.1:<port>` URL."},
+                    "output_path": {"type": "string", "description": "Optional workspace PNG path to save the rendered screenshot."},
+                    "width": {"type": "integer", "description": "Viewport width in px (default 1440)."},
+                    "height": {"type": "integer", "description": "Viewport height in px (default 900)."},
+                    "wait_ms": {"type": "integer", "description": "Post-load settle delay in ms before WebGL snapshot (default 350)."},
+                },
+                "required": ["target"],
+            },
+            True,
+            _render_ui,
+        ),
+        ToolSpec(
             "ask_user",
             "Ask the user a brief multiple-choice clarification question when intent is genuinely ambiguous.",
             {
@@ -875,7 +1043,7 @@ def build_default_tool_registry() -> ToolRegistry:
                 "Use at workflow transitions (skip for trivial reads/Q&A): "
                 "`challenge_design` before writing >250L files or multi-file rewrites; "
                 "`cold_eyes_review` right before shipping non-trivial code, algorithms, or UIs (pass files + screenshots `.png`); "
-                "`break_loop` after 2 failed attempts on the same bug/render issue; or any custom plugin ID."
+                "`break_loop` after 2 failed attempts on the same bug/render issue; `tournament` to contrastively rank 2+ candidate designs/patches; or any custom plugin ID."
             ),
             {
                 "type": "object",
@@ -886,6 +1054,7 @@ def build_default_tool_registry() -> ToolRegistry:
                             "cold_eyes_review",
                             "challenge_design",
                             "break_loop",
+                            "tournament",
                             "trajectory_sentinel",
                             "clean_patch_and_contract",
                             "epistemic_grounding_auditor",

@@ -240,6 +240,7 @@ class EvaluatorRegistry:
             "- cold_eyes_review [pre_ship, clean-room]: Right before final answer on non-trivial code/UI/viz — inspects raw files, diffs, tests & screenshots cold; returns PASS or <=5 surgical fixes.",
             "- challenge_design [pre_build, clean-room]: Right before writing >250L files or multi-file rewrites — catches schema/state/layout traps early (<=5 items or PASS).",
             "- break_loop [when_stuck, clean-room]: After 2 failed attempts at a bug/render issue — ignores failed chat history and returns <=3 orthogonal hypotheses + probes.",
+            "- tournament [contrastive_selection, clean-room]: Compare 2+ candidate architectures, algorithms, or files side-by-side and return the winner + falsification trade-offs.",
         ]
         used = sum(max(12, len(ln) // 4) for ln in lines)
         for m in candidates:

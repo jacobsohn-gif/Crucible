@@ -83,6 +83,7 @@ class HookSystem:
         ] = []
         self._telemetry_lock = threading.Lock()
         self._last_tool_args: dict[str, dict[str, Any]] = {}
+        self._in_flight_tool_args: dict[str, dict[str, Any]] = {}
         self.last_eval_report: Any = None
         self.eval_reports: list[Any] = []
         self.eval_registry: Any = None
@@ -463,20 +464,45 @@ class HookSystem:
             active &= {str(x) for x in meta["allowedTools"]}
         return None if (current_allowed is None and active == all_tools) else active
 
-    def before_tool(self, tool_name: str, args: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
+    def before_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        call_id: str = "",
+    ) -> tuple[bool, dict[str, Any], str]:
         with self._telemetry_lock:
             self._last_tool_args[tool_name] = dict(args)
+            if call_id:
+                self._in_flight_tool_args[call_id] = dict(args)
         rc, msg, meta = self._run_matching("BeforeTool", tool_name, {"tool_name": tool_name, "tool_input": args})
         if rc == 2:
+            if call_id:
+                with self._telemetry_lock:
+                    self._in_flight_tool_args.pop(call_id, None)
             return False, args, msg
         updated = meta.get("updatedInput")
         if isinstance(updated, dict):
             args = {**args, **updated}
             with self._telemetry_lock:
                 self._last_tool_args[tool_name] = dict(args)
+                if call_id:
+                    self._in_flight_tool_args[call_id] = dict(args)
         return True, args, msg
 
-    def after_tool(self, tool_name: str, result_part: CanonicalPart) -> str:
+    before_tool._accepts_call_id = True  # type: ignore[attr-defined]
+
+    def after_tool(
+        self,
+        tool_name: str,
+        result_part: CanonicalPart,
+        *,
+        batch_has_mutation: bool = False,
+    ) -> str:
+        cid = str(result_part.tool_call_id or "")
+        with self._telemetry_lock:
+            popped_args = self._in_flight_tool_args.pop(cid, None) if cid else None
+            t_args = dict(popped_args if popped_args is not None else self._last_tool_args.get(tool_name, {}))
         _, msg, _ = self._run_matching(
             "AfterTool",
             tool_name,
@@ -491,8 +517,6 @@ class HookSystem:
             try:
                 from crux_evals.core.state import capture_git_diff
 
-                with self._telemetry_lock:
-                    t_args = dict(self._last_tool_args.get(tool_name, {}))
                 diff = capture_git_diff(self.workspace_root) if tool_name in ("write_file", "edit_file") else ""
                 with self._telemetry_lock:
                     self.session_telemetry.record_after_tool(
@@ -510,6 +534,7 @@ class HookSystem:
                         tool_output_raw=result_part.text,
                         tool_is_error=result_part.is_error,
                         tool_exit_code=1 if result_part.is_error else 0,
+                        batch_has_mutation=batch_has_mutation,
                         unified_git_diff=diff,
                     )
                 report = self.evals_cascade.run(frame)
@@ -524,6 +549,8 @@ class HookSystem:
             except Exception:
                 pass
         return msg
+
+    after_tool._accepts_batch_meta = True  # type: ignore[attr-defined]
 
 
 # ============================================================================

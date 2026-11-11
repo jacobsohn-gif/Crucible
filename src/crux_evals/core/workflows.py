@@ -21,12 +21,13 @@ from crux_evals.core.protocol import (
 )
 from crux_evals.core.runner import EvaluatorCascadeRunner
 
-WORKFLOW_MODES: tuple[str, ...] = ("cold_eyes_review", "challenge_design", "break_loop")
+WORKFLOW_MODES: tuple[str, ...] = ("cold_eyes_review", "challenge_design", "break_loop", "tournament")
 
 _WORKFLOW_PHASE_MAP: dict[str, str] = {
     "challenge_design": "pre_build",
     "cold_eyes_review": "pre_ship",
     "break_loop": "when_stuck",
+    "tournament": "contrastive_selection",
 }
 
 _PROMPT_BY_MODE: dict[str, str] = {
@@ -56,12 +57,21 @@ _PROMPT_BY_MODE: dict[str, str] = {
         "Return STRICT JSON with AT MOST 3 distinct orthogonal root-cause hypotheses paired with concrete 1-line falsifying probes:\n"
         '{"status":"FINDINGS"|"PASS","summary":"1-sentence diagnosis","findings":[{"target":"file/symbol or runtime layer","issue":"orthogonal root cause","fix":"exact 1-line diagnostic probe or fix"}]}'
     ),
+    "tournament": (
+        "You are a Clean-Room Contrastive Architecture & Patch Tournament Judge operating in ZERO-HISTORY isolation.\n"
+        "Single-artifact grading suffers from calibration drift; contrastive comparison between >=2 explicit candidates surfaces "
+        "concrete algorithmic, state-model, and edge-case trade-offs.\n"
+        "Inspect `<task_objective>`, `<candidate_proposals>`, any candidate files/diffs on disk, deterministic checks, and screenshots.\n"
+        "Rank the candidates strictly on correctness, simplicity, failure modes, and invariant preservation. Return STRICT JSON (<=5 items):\n"
+        '{"status":"PASS"|"FINDINGS","winner":"winning candidate ID/file","summary":"1-sentence winner + decisive reason","findings":[{"target":"candidate/file","issue":"concrete trade-off or flaw","fix":"adopt winner or merge specific safeguard"}]}'
+    ),
 }
 
 _MAX_FINDINGS_BY_MODE: dict[str, int] = {
     "challenge_design": 5,
     "cold_eyes_review": 5,
     "break_loop": 3,
+    "tournament": 5,
 }
 
 
@@ -76,6 +86,9 @@ def _collect_deterministic_findings(
 
     if mode == "challenge_design":
         checks_run.append("clean_room_design_context")
+        return findings, checks_run
+    if mode == "tournament" and not frame.modified_files:
+        checks_run.append("clean_room_tournament_context")
         return findings, checks_run
 
     want_ids: list[str]
@@ -170,6 +183,7 @@ def run_workflow_evaluator(
 
     llm_findings: list[dict[str, str]] = []
     llm_summary = ""
+    llm_winner = ""
     if llm_judge is not None:
         checks_run.append(f"clean_room_llm:{norm_mode}")
         sys_prompt = _PROMPT_BY_MODE[norm_mode]
@@ -197,7 +211,13 @@ def run_workflow_evaluator(
 
         det_block = json.dumps(det_findings[:5], ensure_ascii=False) if det_findings else "[]"
         imgs_str = ", ".join(i.path for i in blind_frame.attached_images) or "(none)"
-        focus_xml = f"\n<proposed_focus>\n{focus_note.strip()[:1_200]}\n</proposed_focus>\n" if (focus_note.strip() and norm_mode == "challenge_design") else ""
+        focus_xml = (
+            f"\n<proposed_focus>\n{focus_note.strip()[:1_600]}\n</proposed_focus>\n"
+            if (focus_note.strip() and norm_mode in ("challenge_design", "tournament"))
+            else ""
+        )
+        if norm_mode == "tournament" and frame.actor_claim_text:
+            focus_xml += f"\n<candidate_proposals>\n{frame.actor_claim_text.strip()[:4_000]}\n</candidate_proposals>\n"
 
         user_payload = (
             f"<task_objective>\n{blind_frame.task_objective}\n</task_objective>\n"
@@ -217,6 +237,7 @@ def run_workflow_evaluator(
             try:
                 parsed = json.loads(m.group(0))
                 llm_summary = str(parsed.get("summary") or "").strip()
+                llm_winner = str(parsed.get("winner") or "").strip()
                 raw_items = parsed.get("findings")
                 if isinstance(raw_items, list):
                     for item in raw_items:
@@ -250,7 +271,7 @@ def run_workflow_evaluator(
         if not merged
         else f"Found {len(merged)} surgical item(s) during clean-room {norm_mode}."
     )
-    return {
+    out_payload: dict[str, Any] = {
         "evaluator": norm_mode,
         "workflow_phase": _WORKFLOW_PHASE_MAP.get(norm_mode, "pre_ship"),
         "status": status,
@@ -265,3 +286,6 @@ def run_workflow_evaluator(
         "screenshots_inspected": [img.path for img in frame.attached_images],
         "usage_note": "Apply concrete fixes above silently or address blockers before shipping. Never expose internal evaluator tags to users.",
     }
+    if norm_mode == "tournament":
+        out_payload["winner"] = llm_winner or (frame.modified_files[0] if frame.modified_files and not merged else "")
+    return out_payload

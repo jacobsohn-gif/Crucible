@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import os
 import pathlib
 import subprocess
 import threading
@@ -79,6 +80,8 @@ class SessionRunner:
         memory_manager: Any | None = None,
         thinking_effort: ThinkingEffort = ThinkingEffort.HIGH,
         trace_ledger: ThoughtTraceLedger | None = None,
+        auto_pre_ship_review: bool = True,
+        auto_cold_eyes_llm: bool = False,
     ) -> None:
         self.workspace_root = workspace_root.expanduser().resolve()
         self.session_id = session_id or new_id("sess")
@@ -141,6 +144,8 @@ class SessionRunner:
         self.checkpoints: list[TurnCheckpoint] = []
         self.edits_attempted = 0
         self.edits_failed = 0
+        self.auto_pre_ship_review = auto_pre_ship_review
+        self.auto_cold_eyes_llm = auto_cold_eyes_llm
 
         self._steer_lock = threading.Lock()
         self._pending_steers: deque[CanonicalMessage] = deque()
@@ -377,6 +382,8 @@ class SessionRunner:
         complementary_stop_nudges = 0
         context_overflow_recoveries = 0
         modified_in_step: list[str] = []
+        turn_modified_files: list[str] = []
+        did_consult_eval_in_turn = False
         turn_edits_since_eval = 0
         eval_wave_nudge_sent = False
         thrash_eval_nudge_sent = False
@@ -889,9 +896,14 @@ class SessionRunner:
                     guard_notes: list[str] = []
                     did_consult_eval = False
                     ui_edited_in_step = False
+                    for mf in modified_in_step:
+                        if mf not in turn_modified_files:
+                            turn_modified_files.append(mf)
                     for tc, tr in zip(tcalls, results):
                         if tc.tool_name == "consult_evaluator":
                             did_consult_eval = True
+                            if not tr.is_error:
+                                did_consult_eval_in_turn = True
                             turn_edits_since_eval = 0
                             eval_wave_nudge_sent = False
                             thrash_eval_nudge_sent = False
@@ -926,12 +938,12 @@ class SessionRunner:
                             eval_wave_nudge_sent = True
                             if ui_edited_in_step:
                                 guard_notes.append(
-                                    "Pre-ship cold-eyes hint: UI/visualization updated — after verifying/screenshotting, call "
-                                    "`consult_evaluator(evaluator='cold_eyes_review', files=[..., 'shot.png'])` (PASS or <=5 fixes)."
+                                    "Pre-ship cold-eyes hint: UI/visualization updated — capture a screenshot via `render_ui(target=...)`, "
+                                    "then call `consult_evaluator(evaluator='cold_eyes_review', files=[..., 'shot.png'])` (PASS or <=5 fixes)."
                                 )
                             else:
                                 guard_notes.append(
-                                    "Pre-ship cold-eyes hint: non-trivial code updated — after running tests via `exec_pty`, "
+                                    "Pre-ship cold-eyes hint: non-trivial code updated — after running tests via `run_command` / `exec_pty`, "
                                     "call `consult_evaluator(evaluator='cold_eyes_review', files=[...])` before finalizing (PASS or <=5 fixes)."
                                 )
 
@@ -1048,6 +1060,69 @@ class SessionRunner:
                                             wrap_dynamic_instructions(
                                                 f"[CRUX_EVALS_ADVISORY]: {advisory}\n"
                                                 "Resolve or empirically verify the findings above before finishing."
+                                            )
+                                        ],
+                                    )
+                                )
+                                self.phase = LoopPhase.PRE_INVOCATION
+                                continue
+                        if (
+                            self.auto_pre_ship_review
+                            and getattr(self.hook_runner, "enable_crux_evals", False)
+                            and hasattr(self.hook_runner, "consult_evaluator")
+                            and complementary_stop_nudges == 0
+                            and steps < max_steps
+                            and not did_consult_eval_in_turn
+                            and (
+                                len(turn_modified_files) >= 2
+                                or any(
+                                    fp.lower().endswith((".html", ".htm", ".jsx", ".tsx", ".vue", ".svg"))
+                                    for fp in turn_modified_files
+                                )
+                            )
+                        ):
+                            use_llm = self.auto_cold_eyes_llm or (os.environ.get("CRUX_AUTO_COLD_EYES_LLM") == "1")
+                            auto_res = self.hook_runner.consult_evaluator(
+                                lens="cold_eyes_review",
+                                target_paths=list(turn_modified_files),
+                                actor_model_family=self.model_profile.family,
+                                llm_judge=(
+                                    self.isolated_evaluator.make_llm_callable("cold_eyes_review")
+                                    if use_llm
+                                    else None
+                                ),
+                                llm_breaker=None,
+                                record_consult=False,
+                            )
+                            findings = auto_res.get("findings") if isinstance(auto_res, dict) else None
+                            if isinstance(findings, list) and findings and auto_res.get("status") == "FINDINGS":
+                                did_consult_eval_in_turn = True
+                                complementary_stop_nudges += 1
+                                bullet_lines = [
+                                    f"- [{it.get('target', 'artifact')}] {it.get('issue', '')} -> Fix: {it.get('fix', '')}"
+                                    for it in findings[:5]
+                                    if isinstance(it, dict)
+                                ]
+                                _emit(
+                                    StreamEvent(
+                                        kind="cognitive_event",
+                                        step=steps,
+                                        text=f"Auto Pre-Ship Cold-Eyes Gate caught {len(bullet_lines)} defect(s) across {len(turn_modified_files)} modified file(s)",
+                                        meta={
+                                            "event": "auto_pre_ship_cold_eyes",
+                                            "findings_count": len(bullet_lines),
+                                            "files": list(turn_modified_files),
+                                        },
+                                    )
+                                )
+                                self.dag.append(
+                                    CanonicalMessage(
+                                        role="user",
+                                        parts=[
+                                            wrap_dynamic_instructions(
+                                                "[AUTO_PRE_SHIP_COLD_EYES]: Clean-room pre-ship checks found concrete issues in modified deliverables:\n"
+                                                + "\n".join(bullet_lines)
+                                                + "\nResolve these surgical items before delivering the final answer (never expose internal evaluator tags to the user)."
                                             )
                                         ],
                                     )

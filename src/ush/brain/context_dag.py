@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import pathlib
+import re
 import threading
 from typing import Callable
 
@@ -327,7 +328,70 @@ class SessionDAG:
             tail = trimmed_tail
         anchor_id = msgs[-1].entry_id
         summary = summarizer(head) if summarizer else build_deterministic_epistemic_summary(head)
+        if "<verified_environment_facts>" not in summary:
+            env_facts = extract_verified_environment_facts(head)
+            if env_facts:
+                facts_xml = "<verified_environment_facts>\n" + "\n".join(f"- {f}" for f in env_facts) + "\n</verified_environment_facts>"
+                summary = f"{summary.rstrip()}\n{facts_xml}"
         return self.commit_compaction(ver, anchor_id, summary, keep_tail=tail)
+
+
+_ENV_FACT_BLOCK_RE = re.compile(
+    r"<verified_environment_facts>\s*(.*?)\s*</verified_environment_facts>",
+    re.DOTALL | re.IGNORECASE,
+)
+_ENV_DISCOVERY_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(ModuleNotFoundError:\s*No module named\s+[^\r\n]+)"),
+    re.compile(r"(ImportError:\s*[^\r\n]+)"),
+    re.compile(r"([^\r\n:]+:\s*command not found)", re.IGNORECASE),
+    re.compile(r"(Sandbox boundary violation[^\r\n]*)", re.IGNORECASE),
+    re.compile(r"(\[POLICY_DENIED\]:\s*[^\r\n]+)"),
+    re.compile(r"(No headless Chromium/Chrome binary found[^\r\n]*)"),
+)
+_VERIFY_PASS_CMD_RE = re.compile(
+    r"\b(pytest|py\.test|unittest|cargo\s+(?:test|check)|npm\s+test|pnpm\s+test|vitest|jest|node\s+--check|ruff\s+check|mypy|pyright|tsc|go\s+test)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_verified_environment_facts(messages: list[CanonicalMessage], max_facts: int = 16) -> list[str]:
+    """Extracts & carries forward empirical environment constraints and verified test commands across compactions."""
+    facts: list[str] = []
+    seen: set[str] = set()
+    call_cmd_by_id: dict[str, str] = {}
+
+    def _add(fact: str) -> None:
+        cleaned = " ".join(fact.strip().lstrip("- ").split())[:200]
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            facts.append(cleaned)
+
+    for m in messages:
+        if m.role == "user":
+            txt = m.plain_text() or ""
+            for blk in _ENV_FACT_BLOCK_RE.findall(txt):
+                for ln in blk.splitlines():
+                    if ln.strip():
+                        _add(ln)
+        for p in m.parts:
+            if p.kind == "tool_call" and p.tool_call_id and isinstance(p.tool_args, dict):
+                if p.tool_name in ("exec_pty", "run_command") and p.tool_args.get("command"):
+                    call_cmd_by_id[p.tool_call_id] = str(p.tool_args["command"]).strip()
+            elif p.kind == "tool_result" and p.text:
+                for rx in _ENV_DISCOVERY_RES:
+                    hit = rx.search(p.text)
+                    if hit:
+                        _add(hit.group(1))
+                cmd = call_cmd_by_id.get(p.tool_call_id or "", "")
+                if cmd and not p.is_error and _VERIFY_PASS_CMD_RE.search(cmd) and "FAILED" not in p.text:
+                    _add(f"Verified passing command: `{cmd[:120]}`")
+
+    if len(facts) <= max_facts:
+        return facts
+    # Preserve earliest environment constraints + latest verification milestones
+    half = max_facts // 2
+    return facts[:half] + facts[-(max_facts - half) :]
 
 
 def build_deterministic_epistemic_summary(messages: list[CanonicalMessage]) -> str:
@@ -360,14 +424,18 @@ def build_deterministic_epistemic_summary(messages: list[CanonicalMessage]) -> s
     else:
         selected_obj = [objectives[0], f"... ({len(objectives) - 8} intermediate turns) ...", *objectives[-7:]]
 
-    return "\n".join(
-        [
-            "1. OBJECTIVE & USER REQUESTS (INITIAL -> LATEST): " + (" -> ".join(selected_obj) or "Continue active task"),
-            "2. VERIFIED TOUCHED/READ FILES: " + (", ".join(files_seen[-20:]) or "none yet"),
-            "3. FALSIFIED PATHS / OBSERVED ERRORS (DO NOT REPEAT): " + (" | ".join(errors_seen[-5:]) or "none"),
-            "4. RECENT PROGRESS NOTES: " + (" | ".join(key_notes[-6:]) or "in progress"),
-        ]
-    )
+    lines = [
+        "1. OBJECTIVE & USER REQUESTS (INITIAL -> LATEST): " + (" -> ".join(selected_obj) or "Continue active task"),
+        "2. VERIFIED TOUCHED/READ FILES: " + (", ".join(files_seen[-20:]) or "none yet"),
+        "3. FALSIFIED PATHS / OBSERVED ERRORS (DO NOT REPEAT): " + (" | ".join(errors_seen[-5:]) or "none"),
+        "4. RECENT PROGRESS NOTES: " + (" | ".join(key_notes[-6:]) or "in progress"),
+    ]
+    env_facts = extract_verified_environment_facts(messages)
+    if env_facts:
+        lines.append("<verified_environment_facts>")
+        lines.extend(f"- {f}" for f in env_facts)
+        lines.append("</verified_environment_facts>")
+    return "\n".join(lines)
 
 
 def tombstone_superseded_reads(messages: list[CanonicalMessage]) -> list[CanonicalMessage]:

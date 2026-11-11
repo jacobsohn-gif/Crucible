@@ -16,7 +16,7 @@ VERIFICATION_CMD_RE = re.compile(
     r"python3?\s+[^\s]+_test\.py|python3?\s+test_[^\s]+\.py|"
     r"uv\s+run\b|python3?\s+[^\s]+\.py|"
     r"python3?\s+-c\b|cargo\s+(test|check)|go\s+test|npm\s+test|"
-    r"pnpm\s+test|vitest|jest|ruff\s+check|mypy|pyright|tsc\b|bazel\s+test)\b",
+    r"pnpm\s+test|vitest|jest|node\s+--check|ruff\s+check|mypy|pyright|tsc\b|bazel\s+test)\b",
     re.IGNORECASE,
 )
 
@@ -204,6 +204,7 @@ class SessionTelemetry:
         tool_output_raw: str = "",
         tool_is_error: bool = False,
         tool_exit_code: int | None = None,
+        batch_has_mutation: bool = False,
         unified_git_diff: str | None = None,
         target_paths: list[str] | None = None,
         actor_claim_text: str | None = None,
@@ -232,6 +233,7 @@ class SessionTelemetry:
             tool_output_raw=tool_output_raw,
             tool_is_error=tool_is_error,
             tool_exit_code=tool_exit_code,
+            batch_has_mutation=batch_has_mutation,
             unified_git_diff=diff,
             modified_files=tuple(mod_files),
             read_files=tuple(self.read_files),

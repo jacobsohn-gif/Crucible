@@ -52,7 +52,14 @@ Every hypothesis is tested in the fire: `crux` pairs a **Popperian falsification
 
 ## 2. Recent Bug Fixes & Feature Updates
 
+> Deep-dive engineering rationale (**what** changed and **why**): [`docs/HARNESS_UPGRADES_AND_RATIONALE.md`](docs/HARNESS_UPGRADES_AND_RATIONALE.md)
+
 ### Bug Fixes & Reliability Hardening
+- **Fixed Parallel `read_file` Telemetry Race, Mixed-Batch Read-Spiral False Positives & ACP Host-Tool Co-Emission** ([`src/ush/platform/hooks_memory_ext.py`](src/ush/platform/hooks_memory_ext.py), [`src/ush/kernel/tools.py`](src/ush/kernel/tools.py), [`src/crux_evals/modules/m01_trajectory_sentinel/module.py`](src/crux_evals/modules/m01_trajectory_sentinel/module.py), [`src/ush/brain/agy_acp.py`](src/ush/brain/agy_acp.py)):
+  - Isolated in-flight `HookSystem` tool arguments by unique `call_id` (`_in_flight_tool_args`) so concurrent `ThreadPoolExecutor` `read_file` batches never overwrite `_last_tool_args["read_file"]`, preserving exact `read_files` provenance and eliminating false `"Tool call read_file repeated 3 consecutive times"` warnings.
+  - Propagated `batch_has_mutation` across mixed `[read_file, edit_file]` batches so `TrajectorySentinel` never fires a spurious read-spiral warning when an edit is already queued in the same batch, and hardened `agy_acp.py` to suppress host-injected `default_api:manage_task` calls.
+- **Pinned `<verified_environment_facts>` Across Multi-Generation Context Compaction** ([`src/ush/brain/context_dag.py`](src/ush/brain/context_dag.py)):
+  - `SessionDAG.maybe_compact` now extracts and carries forward empirical environment constraints (`ModuleNotFoundError`, missing binaries, sandbox/policy boundaries, and verified passing test commands) inside `<verified_environment_facts>` across arbitrarily many `0.85` compactions.
 - **Fixed Cut-Off `ask_user` Options & Clipped Approval Targets** ([`src/ush/cli/tui.py`](src/ush/cli/tui.py), [`src/ush/cli/main.py`](src/ush/cli/main.py)):
   - Removed the 34-column label truncation on interactive `ask_user` question cards. Questions and all multiple-choice options now word-wrap across full terminal width (`_render_ask_user_menu_lines`).
   - Automatically expands every option in full when they fit inside the dock, always expands the currently highlighted option across multiple lines, and adds **`Space`** to toggle full scrollable expansion of all options (`←`/`→`/`PgUp`/`PgDn`), **`1`–`9`** & **`c`** instant quick-select keys, persistent wrapped question display while typing a custom reply, and wrapped detail footers for long tool-approval targets and `/`, `@`, `$` picker items.
@@ -72,6 +79,12 @@ Every hypothesis is tested in the fire: `crux` pairs a **Popperian falsification
   - Added interruptible `429`/`503`/`529` exponential backoff, `HTTP 401` ADC token auto-refresh, context-overflow auto-compaction, dead-PTY shell auto-respawn, strict `functionCall` $\leftrightarrow$ `functionResponse` bijection across mid-history orphan repairs, deadlock-free `/steer`, shell-wrapper unwrapping (`sudo`/`env`/`sh -c`), `.ushignore` negation hardening, and constant-time bearer auth on `crux serve --acp`.
 
 ### Major New Capabilities
+- **First-Class `render_ui`, Stateless `run_command` & Chunked `write_file(mode='append')` Tools** ([`src/ush/kernel/ui_renderer.py`](src/ush/kernel/ui_renderer.py), [`src/ush/kernel/tools.py`](src/ush/kernel/tools.py)):
+  - `render_ui`: Renders workspace `.html`/`.svg` files or loopback `http://127.0.0.1:<port>` apps over an SSRF-firewalled ephemeral HTTP server with in-memory WebGL `preserveDrawingBuffer` + ANGLE SwiftShader compositing, `requestAnimationFrame` loop capping, JS console error extraction, and direct `image/png` multimodal return.
+  - `run_command` & `write_file(mode='append')`: Fast non-PTY command execution (`stdin=/dev/null`, process-group timeout kill, full `PolicyEngine` gating, zero `1,024`-byte PTY canonical line limits) plus stale-read-safe chunked file appending for large deliverables.
+- **Complexity-Triggered Auto Pre-Ship Cold-Eyes Gate & Contrastive `tournament` Evaluator** ([`src/ush/kernel/fsm.py`](src/ush/kernel/fsm.py), [`src/crux_evals/core/workflows.py`](src/crux_evals/core/workflows.py), [`src/crux_evals/mcp_server.py`](src/crux_evals/mcp_server.py)):
+  - `SessionRunner` (`STOP_HOOKS`) automatically runs a clean-room `cold_eyes_review` whenever `>=2` files or any UI artifact (`.html`/`.jsx`/`.tsx`/`.vue`/`.svg`) was modified in a turn without `consult_evaluator`, catching leaked scorecards, `TODO` stubs, missing viewports, and contract bugs before final output.
+  - Added `tournament` (`contrastive_selection`) to `consult_evaluator` and Open MCP to rank `>=2` candidate designs or implementations side-by-side in zero-history isolation.
 - **Native `Crux-Evals` (Crucible Assay) Clean-Room Workflow Critics & Linter Contract** ([`src/crux_evals/`](src/crux_evals/), [`src/ush/brain/evaluator_isolation.py`](src/ush/brain/evaluator_isolation.py)): Zero-history workflow-transition critics (`challenge_design` pre-build, `cold_eyes_review` pre-ship, `break_loop` when stuck) with zero-briefing `{evaluator, files, goal}` calls, multimodal screenshot (`.png`/`.jpg`/`.webp`) inspection, untracked disk head+tail file hydration, compiler-style `PASS` / `<=3–5` surgical fix output, 6 underlying modules (`m01`–`m06`), cross-family `tools=[]` isolation, and drop-in `EVALUATOR.md` / `.py` plugins (`/evaluators`, `crux eval`).
 - **Streaming Terminal Markdown Engine** ([`src/ush/cli/markdown.py`](src/ush/cli/markdown.py)): Zero-dependency incremental Markdown stream formatter with syntax-highlighted fenced blocks, Unicode box-drawn GFM tables, callout blocks, semantic headings, lists, and clickable file links.
 - **Enterprise Multi-Provider Auth & Peer CLI Delegation** ([`src/ush/auth/vault.py`](src/ush/auth/vault.py), [`src/ush/swarm/engine.py`](src/ush/swarm/engine.py)): Support for Gemini Enterprise (VPC-SC, Priority Tier, Express), OpenAI `/v1/responses` + Device/PKCE OAuth, Claude OAuth/Vertex, LiteLLM proxy discovery, workstation command-auth helpers, and `crux swarm --peer-cli` external agent delegation.
@@ -210,7 +223,7 @@ crux serve --acp
 ┌───────────────────────────────────────────▼─────────────────────────────────────────────┐
 │                  Layer 3: 6-Phase Execution Kernel & Security Firewall                  │
 │  fsm.py (SessionRunner + Safe-Boundary Live Steer + /btw Zero-History Fork)             │
-│  tools.py (Essential-11 RwLock Tools) · patch.py (4-Pass Fuzzy Edit + Stale-Read Guard) │
+│  tools.py (Essential-13 RwLock Tools + run_command + render_ui) · patch.py (Fuzzy Edit) │
 │  pty_manager.py (Persistent OSC 633 PTY + Auto-Respawn) · shadow_git.py (Out-of-Tree)   │
 │  security.py (3-Layer Firewall: Shell Unwrap + .ushignore + Repo Trust Fingerprinting)  │
 └──────────────────────┬───────────────────────────┬──────────────────────────────────────┘
@@ -293,6 +306,7 @@ Crucible ships with **[`Crux-Evals`](src/crux_evals/)** built directly into `src
 | **Pre-Build** | `challenge_design` | Existing files, mockups/screenshots, optional 1-line `goal` | Returns `PASS` or `<=5` surgical schema/state/layout traps before `>250L` edits or multi-file rewrites |
 | **Pre-Ship** | `cold_eyes_review` | Raw code/HTML files + rendered screenshots (`.png`/`.jpg`/`.webp`) | Hydrates untracked disk files (head+tail bounded) + deterministic/UX/`/tmp` checks + clean-room vision/code inspection; returns `PASS` or `<=5` concrete fixes |
 | **When Stuck** | `break_loop` | Target files, failing stdout/tracebacks, trajectory state, screenshots | Returns `<=3` orthogonal root-cause hypotheses paired with 1-line falsifying probes after `>=2` repeated failures |
+| **Architecture / Patch Selection** | `tournament` | Candidate files (`opt_a.py`, `opt_b.py`) and/or `proposed_claims` + `goal` | Contrastively ranks `>=2` candidates in clean-room isolation; returns `winner` + `<=5` falsifying trade-offs |
 
 ### Underlying Engines (`m01` – `m06` & Custom Plugins)
 
@@ -386,6 +400,7 @@ Run the complete `56`-test zero-dependency verification suite (`28` conformance 
 | **`CT-27`** | Antigravity ACP dynamic models, Gemini Enterprise, Claude, OpenAI `/v1/responses`, LiteLLM & `429` recovery | ✅ Pass |
 | **`CT-28`** | Zero-spam interactive tool approval dock deduplication & parallel `RwLock` prompt serialization | ✅ Pass |
 | **Security & UX Suite** | Warm multi-turn ACP session reuse, `<=135 KB` tail-safe cold hydration, LaTeX/Markdown rendering, full-width `ask_user` wrapping/`Space` expand, PTY respawn, authenticated ACP & stateful fuzzing ([`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py)) | ✅ `15/15` |
+| **Harness Upgrades Suite** | Parallel `call_id` telemetry isolation, mixed-batch spiral suppression, `run_command` (`stdin=DEVNULL`, timeout kill, policy gates), `write_file(mode='append')`, `render_ui` SSRF/WebGL probe/PNG capture, `tournament` mode, Auto Pre-Ship Cold-Eyes Gate & multi-generation `<verified_environment_facts>` compaction ([`tests/test_harness_upgrades.py`](tests/test_harness_upgrades.py)) | ✅ `8/8` |
 | **Crux-Evals Suite** | Clean-room workflows (`challenge_design`, `cold_eyes_review`, `break_loop`), multimodal PNG screenshots, untracked disk head+tail hydration, `<=3–5` linter caps, Trajectory Sentinel, Anti-Goodhart `clean_patch`, Epistemic Grounding, Blind `BARS` Judge, `/tmp` Adversarial Falsifier, `artifact_enhancer`, `EVALUATOR.md` Skill Parity, Hardline Isolation & Open MCP ([`tests/test_crux_evals.py`](tests/test_crux_evals.py)) | ✅ `15/15` |
 
 ---
@@ -411,7 +426,7 @@ Run the complete `56`-test zero-dependency verification suite (`28` conformance 
   - [`src/ush/auth/vault.py`](src/ush/auth/vault.py) — Ambient credential & `agy` discovery, Google Code Assist, Vertex ADC, OAuth 2.0 + PKCE/Device flows, workstation command-auth, and macOS Keychain / `0600` file vault.
 - **Execution Kernel & Security Firewall (`src/ush/kernel/`)**
   - [`src/ush/kernel/fsm.py`](src/ush/kernel/fsm.py) — 6-phase `SessionRunner`, `StreamEvent` dispatcher, safe-boundary `enqueue_steer`, and `/btw` side-chat fork.
-  - [`src/ush/kernel/tools.py`](src/ush/kernel/tools.py) & [`src/ush/kernel/patch.py`](src/ush/kernel/patch.py) — Essential-11 `RwLock` tools, 4-pass fuzzy `edit_file`, and `StaleReadTracker`.
+  - [`src/ush/kernel/tools.py`](src/ush/kernel/tools.py), [`src/ush/kernel/ui_renderer.py`](src/ush/kernel/ui_renderer.py) & [`src/ush/kernel/patch.py`](src/ush/kernel/patch.py) — Essential-13 `RwLock` tools (`run_command`, `render_ui`, chunked `write_file`), SSRF-safe headless WebGL renderer, 4-pass fuzzy `edit_file`, and `StaleReadTracker`.
   - [`src/ush/kernel/pty_manager.py`](src/ush/kernel/pty_manager.py) — Persistent stateful `OSC 633` PTY engine with prompt auto-detection and dead-shell auto-respawn.
   - [`src/ush/kernel/shadow_git.py`](src/ush/kernel/shadow_git.py) & [`src/ush/kernel/security.py`](src/ush/kernel/security.py) — Out-of-tree Shadow Git store, shell-unwrapping 3-layer security firewall, and fingerprinted `RepoTrustStore`.
 - **Extensibility Platform, 4-Gear Swarm & Native Evaluators (`src/ush/platform/`, `src/ush/swarm/`, `src/crux_evals/`)**
@@ -420,7 +435,8 @@ Run the complete `56`-test zero-dependency verification suite (`28` conformance 
   - [`src/crux_evals/`](src/crux_evals/) & [`src/ush/evaluators/`](src/ush/evaluators/) — Native `Crux-Evals` (Crucible Assay) 6-module engine (`m01`–`m06`), workflow primitives (`workflows.py`), auto-discovery `EvaluatorRegistry`, `cli.py` scaffolder, `cli_hook.py`, and `mcp_server.py`.
 - **Build, Release & Test Suites (`scripts/`, `releases/v0.1/`, `tests/`)**
   - [`scripts/build_release.py`](scripts/build_release.py) & [`Makefile`](Makefile) — Reproducible compiler pipeline producing native `arm64` Mach-O `crux`, portable `crux.pyz`, clean `crucible-0.1-src.tar.gz`, and `SHA256SUMS.txt`.
-  - [`tests/test_conformance_ct01_to_ct20.py`](tests/test_conformance_ct01_to_ct20.py), [`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py), [`tests/test_crux_evals.py`](tests/test_crux_evals.py) — `56` deterministic conformance, security, TUI, ACP, isolation, workflow, and evaluator tests.
+  - [`tests/test_conformance_ct01_to_ct20.py`](tests/test_conformance_ct01_to_ct20.py), [`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py), [`tests/test_crux_evals.py`](tests/test_crux_evals.py), [`tests/test_harness_upgrades.py`](tests/test_harness_upgrades.py) — `64` deterministic conformance, security, TUI, ACP, isolation, workflow, renderer, and harness upgrade tests.
+  - [`docs/HARNESS_UPGRADES_AND_RATIONALE.md`](docs/HARNESS_UPGRADES_AND_RATIONALE.md) — Architectural rationale documenting what changed and why across tool ergonomics, clean-room gates, concurrency, and compaction.
 
 ---
 

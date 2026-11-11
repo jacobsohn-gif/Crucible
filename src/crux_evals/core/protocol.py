@@ -229,6 +229,7 @@ class EvaluationFrame:
     tool_output_raw: str = ""
     tool_is_error: bool = False
     tool_exit_code: int | None = None
+    batch_has_mutation: bool = False
 
     # 3. Ground-Truth Workspace & Git State (hydrated from disk, never Actor CoT)
     unified_git_diff: str = ""

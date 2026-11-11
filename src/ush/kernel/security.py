@@ -268,6 +268,9 @@ class SecurityFirewall:
             self.extra_write_roots.append(resolved)
         return resolved
 
+    def scrubbed_env(self, extra_overrides: dict[str, str] | None = None) -> dict[str, str]:
+        return scrub_child_environment(extra_overrides=extra_overrides)
+
     def _load_ignore_rules(self) -> tuple[list[str], list[str]]:
         repo_deny: list[str] = []
         repo_negate: list[str] = []
@@ -679,7 +682,7 @@ class PolicyEngine:
     """Gemini-CLI-inspired declarative TOML policy engine with extension privilege clamping."""
 
     READ_ONLY_TOOLS: frozenset[str] = frozenset(
-        {"read_file", "grep_files", "glob_files", "lsp_query", "activate_skill", "consult_evaluator"}
+        {"read_file", "grep_files", "glob_files", "lsp_query", "activate_skill", "consult_evaluator", "render_ui"}
     )
 
     def __init__(self) -> None:

@@ -12,7 +12,7 @@ from crux_evals.core.protocol import (
 )
 from crux_evals.core.registry import register_evaluator
 
-READ_ONLY_TOOLS = frozenset({"read_file", "grep_files", "glob_files", "lsp_query"})
+READ_ONLY_TOOLS = frozenset({"read_file", "grep_files", "glob_files", "lsp_query", "render_ui", "activate_skill"})
 
 
 @register_evaluator
@@ -187,8 +187,8 @@ class TrajectorySentinelEvaluator(BaseEvaluator):
                     )
                     suggested_probes.append(remediation)
 
-        # 5. Read-Without-Hypothesis Spiral
-        if decision == "ALLOW" and len(history) >= self.max_read_spiral:
+        # 5. Read-Without-Hypothesis Spiral (suppressed when current tool batch already contains a mutation/action)
+        if decision == "ALLOW" and not safe_frame.batch_has_mutation and len(history) >= self.max_read_spiral:
             tail = history[-self.max_read_spiral :]
             if all(r.tool_name in READ_ONLY_TOOLS for r in tail):
                 decision = "WARN"

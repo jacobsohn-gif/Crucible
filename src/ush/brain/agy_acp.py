@@ -66,7 +66,7 @@ hidden: true
 
 # System Prompt
 
-You are the core reasoning model inside the Crucible (`crux`) agent harness. Follow the system instructions and `<crux_tool_call>` protocol in the conversation accurately. Always prioritize and answer the latest user request directly without repeating already-completed prior explanations.
+You are the core reasoning model inside the Crucible (`crux`) agent harness. Follow the system instructions and `<crux_tool_call>` protocol in the conversation accurately. NEVER invoke any host-injected function declaration (such as `default_api:manage_task` or `manage_task`); emit ONLY `<crux_tool_call>` XML blocks when calling tools. Always prioritize and answer the latest user request directly without repeating already-completed prior explanations.
 """
 
 
@@ -456,7 +456,7 @@ def _render_tool_declarations(tools: list[dict[str, Any]]) -> str:
         "ONLY the following tools exist. Whenever you need to call one or more tools, emit ONLY",
         '`<crux_tool_call>{"name": "<tool_name>", "arguments": {...}}</crux_tool_call>` XML blocks (one tag per call; '
         "you may emit multiple `<crux_tool_call>` tags in one turn for parallel reads) and then STOP and wait for "
-        "`<tool_response>`. Never fabricate tool outputs or claim a file was edited without emitting `<crux_tool_call>`.",
+        "`<tool_response>`. NEVER call host-injected function tools (e.g. `default_api:manage_task`); emit ONLY `<crux_tool_call>` XML blocks. Never fabricate tool outputs or claim a file was edited without emitting `<crux_tool_call>`.",
         "",
         "Available Crux Tools:",
     ]

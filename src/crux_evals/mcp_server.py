@@ -110,6 +110,9 @@ class CruxEvalsMCPServer:
             "break_loop": (
                 "[When-Stuck | Clean-Room] Call after 2 failed attempts on the same bug/render issue for <=3 orthogonal root-cause hypotheses & probes."
             ),
+            "tournament": (
+                "[Contrastive-Selection | Clean-Room] Compare >=2 candidate designs, algorithms, or files side-by-side and return the winner + falsifying trade-offs."
+            ),
         }
         for wf_name in WORKFLOW_MODES:
             tools.append(
@@ -128,6 +131,16 @@ class CruxEvalsMCPServer:
                                 "type": "string",
                                 "description": "Short 1-line objective (optional).",
                             },
+                            **( 
+                                {
+                                    "proposed_claims": {
+                                        "type": "string",
+                                        "description": "Candidate A vs Candidate B proposals to rank contrastively (optional).",
+                                    }
+                                }
+                                if wf_name == "tournament"
+                                else {}
+                            ),
                         },
                         "additionalProperties": False,
                     },

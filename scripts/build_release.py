@@ -42,6 +42,7 @@ def build_source_tarball(out_dir: pathlib.Path) -> pathlib.Path:
     include_items = [
         "pyproject.toml",
         "README.md",
+        "docs",
         "Makefile",
         ".gitignore",
         ".ushignore",
