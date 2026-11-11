@@ -89,9 +89,12 @@ def split_targets_and_load_images(
         raw = str(rp).strip()
         if not raw:
             continue
-        fp = validate_path(raw) if validate_path is not None else (
-            pathlib.Path(raw).resolve() if pathlib.Path(raw).is_absolute() else (ws / raw).resolve()
-        )
+        try:
+            fp = validate_path(raw) if validate_path is not None else (
+                pathlib.Path(raw).resolve() if pathlib.Path(raw).is_absolute() else (ws / raw).resolve()
+            )
+        except (PermissionError, OSError):
+            continue
         try:
             rel = fp.relative_to(ws).as_posix()
         except ValueError:

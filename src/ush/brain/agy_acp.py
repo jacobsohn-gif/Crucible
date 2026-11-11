@@ -22,7 +22,12 @@ import threading
 import time
 from typing import Any, Callable
 
-from ush.brain.wire import DYNAMIC_TAG_RE, extract_fallback_tool_calls, parse_lenient_json_object
+from ush.brain.wire import (
+    DYNAMIC_TAG_RE,
+    UNPARSED_TOOL_TAG_RE,
+    extract_fallback_tool_calls,
+    parse_lenient_json_object,
+)
 from ush.core.types import (
     CanonicalMessage,
     CanonicalPart,
@@ -44,6 +49,24 @@ _AGY_MALFORMED_BANNER_RE = re.compile(
 _AGY_MALFORMED_BANNER_STREAM_RE = re.compile(
     r"⚠\s*Your previous response contained an improperly formatted function call[\s\S]*?Retries remaining:\s*\d+[ \t]*\r?\n+"
 )
+_AGY_HALLUCINATED_TAIL_RE = re.compile(
+    r"(?:\n+|\A)\s*(?:Waiting for tool response\.|Let's wait for the tool response\.|"
+    r"<tool_response\b[\s\S]*$|</tool_response>[\s\S]*$|<USER_REQUEST>[\s\S]*$|"
+    r"</USER_REQUEST>[\s\S]*$|<ADDITIONAL_METADATA>[\s\S]*$)[\s\S]*$",
+    re.IGNORECASE,
+)
+_AGY_WAITING_LINE_RE = re.compile(
+    r"(?m)^[ \t]*Waiting for tool response\.[ \t]*\r?\n?"
+)
+
+
+def _strip_acp_hallucinated_wrappers(text: str) -> str:
+    """Strips echoed `Waiting for tool response.` lines and hallucinated `<tool_response>` / `<USER_REQUEST>` tails."""
+    if not text:
+        return ""
+    cleaned = _AGY_HALLUCINATED_TAIL_RE.sub("", text)
+    cleaned = _AGY_WAITING_LINE_RE.sub("", cleaned)
+    return cleaned.strip()
 
 # `agy acp` silently front-truncates any single `session/prompt` payload above ~195,000 chars (~54.8k tokens).
 # Enforce a strict 135,000-char ceiling with tail-first preservation so the user's latest prompt is NEVER cut off.
@@ -222,53 +245,64 @@ def resolve_acp_variant_id(
 
 
 class ToolCallTagStreamSplitter:
-    """Streams assistant prose with zero lag while withholding `<crux_tool_call>` / `<tool_call>` XML from TUI."""
+    """Streams assistant prose with zero lag while withholding `<crux_tool_call>{...}` XML & hallucinated wrappers from TUI."""
 
     TAG_PAIRS: tuple[tuple[str, str], ...] = (
         ("<crux_tool_call>", "</crux_tool_call>"),
         ("<tool_call>", "</tool_call>"),
     )
+    _OPEN_TOOL_JSON_RE = re.compile(r"<(?P<tag>crux_tool_call|tool_call)>\s*(?=\{)")
+    _PENDING_OPEN_TAIL_RE = re.compile(r"<(?:crux_tool_call|tool_call)>\s*\Z")
     _BANNER_PREFIX = "⚠ Your previous response contained an improperly formatted function call"
 
     def __init__(self) -> None:
         self._active_close_tag: str | None = None
+        self._suppress_hallucinated_tail: bool = False
         self._buf = ""
 
     def feed(self, chunk: str) -> str:
         """Accepts a streamed text delta and returns only the visible prose safe to emit immediately."""
         if not chunk:
             return ""
+        if self._suppress_hallucinated_tail:
+            return ""
         self._buf += chunk
         visible: list[str] = []
         while self._buf:
             if self._active_close_tag is None:
                 self._buf = _AGY_MALFORMED_BANNER_STREAM_RE.sub("", self._buf)
+                self._buf = _AGY_WAITING_LINE_RE.sub("", self._buf)
                 if not self._buf:
                     break
 
-                best_idx = -1
-                best_open = ""
-                best_close = ""
-                for otag, ctag in self.TAG_PAIRS:
-                    idx = self._buf.find(otag)
-                    if idx != -1 and (best_idx == -1 or idx < best_idx):
-                        best_idx = idx
-                        best_open = otag
-                        best_close = ctag
+                hm = _AGY_HALLUCINATED_TAIL_RE.search(self._buf)
+                m = self._OPEN_TOOL_JSON_RE.search(self._buf)
+                if hm is not None and (m is None or hm.start() < m.start()):
+                    if hm.start() > 0:
+                        visible.append(self._buf[: hm.start()].rstrip())
+                    self._buf = ""
+                    self._suppress_hallucinated_tail = True
+                    break
 
-                if best_idx != -1:
+                if m is not None:
+                    best_idx = m.start()
                     if best_idx > 0:
                         visible.append(self._buf[:best_idx])
-                    self._buf = self._buf[best_idx + len(best_open) :]
-                    self._active_close_tag = best_close
+                    self._buf = self._buf[m.end() :]
+                    self._active_close_tag = f"</{m.group('tag')}>"
                     continue
 
                 hold = max(self._partial_suffix_len(self._buf, otag) for otag, _ in self.TAG_PAIRS)
+                pm = self._PENDING_OPEN_TAIL_RE.search(self._buf)
+                if pm is not None:
+                    hold = max(hold, len(self._buf) - pm.start())
                 warn_idx = self._buf.rfind("⚠")
                 if warn_idx != -1 and len(self._buf) - warn_idx < 260:
                     tail = self._buf[warn_idx:]
                     if self._BANNER_PREFIX.startswith(tail) or tail.startswith("⚠ Your previous response"):
                         hold = max(hold, len(tail))
+                for prefix_tok in ("Waiting for tool response.", "Let's wait for the tool response.", "<tool_response", "</tool_response>", "<USER_REQUEST>", "</USER_REQUEST>", "<ADDITIONAL_METADATA>"):
+                    hold = max(hold, self._partial_suffix_len(self._buf, prefix_tok))
 
                 emit_end = len(self._buf) - hold
                 if emit_end > 0:
@@ -287,7 +321,11 @@ class ToolCallTagStreamSplitter:
         return "".join(visible)
 
     def flush(self) -> str:
-        rem = "" if self._active_close_tag is not None else _AGY_MALFORMED_BANNER_RE.sub("", self._buf)
+        if self._suppress_hallucinated_tail or self._active_close_tag is not None:
+            self._buf = ""
+            self._active_close_tag = None
+            return ""
+        rem = _strip_acp_hallucinated_wrappers(_AGY_MALFORMED_BANNER_RE.sub("", self._buf))
         self._buf = ""
         self._active_close_tag = None
         return rem
@@ -509,7 +547,9 @@ def _message_to_acp_blocks(
         seg: list[str] = []
         for p in msg.parts:
             if p.kind == "text" and p.text:
-                seg.append(_AGY_MALFORMED_BANNER_RE.sub("", p.text))
+                cleaned_p = _strip_acp_hallucinated_wrappers(_AGY_MALFORMED_BANNER_RE.sub("", p.text))
+                if cleaned_p:
+                    seg.append(cleaned_p)
             elif p.kind == "tool_call":
                 seg.append(
                     f'<crux_tool_call>{canonical_json({"name": p.tool_name, "arguments": p.tool_args or {}})}</crux_tool_call>'
@@ -1165,10 +1205,20 @@ class AgyAcpBridge:
         if think_buf and usage.reasoning_tokens == 0:
             usage.reasoning_tokens = max(1, sum(len(x) for x in think_buf) // 4)
 
-        full_raw_text = _AGY_MALFORMED_BANNER_RE.sub("", "".join(raw_text_buf))
+        raw_combined = "".join(raw_text_buf)
+        if _AGY_MALFORMED_BANNER_RE.search(raw_combined):
+            segments = [s.strip() for s in _AGY_MALFORMED_BANNER_RE.split(raw_combined) if s.strip()]
+            # If `agy` internally retried after a malformed native function call, prefer the final retry segment
+            if segments and UNPARSED_TOOL_TAG_RE.search(segments[-1]):
+                full_raw_text = segments[-1]
+            else:
+                full_raw_text = "\n".join(segments)
+        else:
+            full_raw_text = raw_combined
+
         known_names = {str(t["name"]) for t in tools if t.get("name")} if tools else None
         cleaned_text, tool_calls = extract_fallback_tool_calls(full_raw_text, known_names)
-        cleaned_text = cleaned_text.strip()
+        cleaned_text = _strip_acp_hallucinated_wrappers(cleaned_text)
 
         # Also catch bare JSON tool invocation if model emitted a standalone JSON tool object without XML tags
         if not tool_calls and known_names and cleaned_text.startswith("{") and cleaned_text.endswith("}"):
@@ -1187,6 +1237,13 @@ class AgyAcpBridge:
                     ]
                     cleaned_text = ""
 
+        has_unparsed_tool_tag = False
+        if not tool_calls:
+            m_unparsed = UNPARSED_TOOL_TAG_RE.search(cleaned_text)
+            if m_unparsed is not None:
+                has_unparsed_tool_tag = True
+                cleaned_text = _strip_acp_hallucinated_wrappers(cleaned_text[: m_unparsed.start()])
+
         parts: list[CanonicalPart] = []
         if think_buf:
             parts.append(CanonicalPart(kind="thinking", text="".join(think_buf)))
@@ -1200,6 +1257,8 @@ class AgyAcpBridge:
         stop_r = StopReason.STOP
         if res.get("stopReason") == "max_tokens":
             stop_r = StopReason.MAX_TOKENS
+        elif has_unparsed_tool_tag and not tool_calls:
+            stop_r = StopReason.IMPROPER_FORMAT
         elif not parts:
             stop_r = StopReason.EMPTY_200_RESPONSE
 

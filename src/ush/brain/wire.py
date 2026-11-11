@@ -436,10 +436,154 @@ def transform_messages(
     return normalized
 
 
+UNPARSED_TOOL_TAG_RE = re.compile(r"<(?:crux_tool_call|tool_call)>\s*\{", re.DOTALL)
+_HEX_CHARS: frozenset[str] = frozenset("0123456789abcdefABCDEF")
+_VALID_JSON_ESCAPES: frozenset[str] = frozenset('"\\/bfnrtu')
+_SALVAGE_CMD_TOOL_RE = re.compile(
+    r'^\s*\{\s*"(?:name|tool)"\s*:\s*"(?P<name>run_command|exec_pty)"\s*,\s*'
+    r'"(?:arguments|args)"\s*:\s*\{\s*"command"\s*:\s*"(?P<cmd>[\s\S]*)"'
+    r'(?P<tail>(?:\s*,\s*"(?:timeout_seconds|cwd|is_daemon|pty_id)"\s*:\s*'
+    r'(?:\d+(?:\.\d+)?|true|false|null|"[^"]*"))*)\s*\}\s*\}\s*$'
+)
+
+
+def _repair_json_string_literals(raw: str, *, escape_interior_quotes: bool = False) -> str:
+    """Repairs Python/shell escapes (`\\xHH`, `\\'`, raw newlines, unescaped interior quotes) inside JSON string literals."""
+    out: list[str] = []
+    in_str = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if not in_str:
+            out.append(ch)
+            if ch == '"':
+                in_str = True
+            i += 1
+            continue
+
+        if ch == "\\":
+            if i + 1 >= n:
+                out.append("\\\\")
+                i += 1
+                continue
+            nxt = raw[i + 1]
+            if nxt == "x" and i + 3 < n and raw[i + 2] in _HEX_CHARS and raw[i + 3] in _HEX_CHARS:
+                out.append(f"\\u00{raw[i + 2 : i + 4]}")
+                i += 4
+                continue
+            if nxt == "'":
+                out.append("'")
+                i += 2
+                continue
+            if nxt == "\n":
+                out.append("\\n")
+                i += 2
+                continue
+            if nxt == "\r":
+                i += 2
+                if i < n and raw[i] == "\n":
+                    i += 1
+                out.append("\\n")
+                continue
+            if nxt == "u":
+                if i + 5 < n and all(c in _HEX_CHARS for c in raw[i + 2 : i + 6]):
+                    out.append(raw[i : i + 6])
+                    i += 6
+                    continue
+                out.append("\\\\u")
+                i += 2
+                continue
+            if nxt in _VALID_JSON_ESCAPES:
+                out.append("\\" + nxt)
+                i += 2
+                continue
+            out.append("\\\\" + nxt)
+            i += 2
+            continue
+
+        if ch == '"':
+            if escape_interior_quotes:
+                j = i + 1
+                while j < n and raw[j] in " \t\r\n":
+                    j += 1
+                next_tok = raw[j] if j < n else ""
+                is_structural_close = False
+                if next_tok in (":", "}", "]", ""):
+                    is_structural_close = True
+                elif next_tok == ",":
+                    k = j + 1
+                    while k < n and raw[k] in " \t\r\n":
+                        k += 1
+                    after_comma = raw[k] if k < n else ""
+                    if after_comma in ('"', "{", "[", "-", "t", "f", "n") or after_comma.isdigit():
+                        is_structural_close = True
+                if not is_structural_close:
+                    out.append('\\"')
+                    i += 1
+                    continue
+            out.append('"')
+            in_str = False
+            i += 1
+            continue
+
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _salvage_command_tool_call(raw: str) -> dict[str, Any] | None:
+    """Salvages `run_command` / `exec_pty` tool calls when multi-line heredocs contain unescaped interior quotes."""
+    m = _SALVAGE_CMD_TOOL_RE.match(raw)
+    if not m:
+        return None
+    name = m.group("name")
+    raw_cmd = m.group("cmd")
+    tail = m.group("tail") or ""
+    cmd_unescaped = (
+        raw_cmd.replace('\\"', '"')
+        .replace("\\'", "'")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\\", "\\")
+    )
+    args: dict[str, Any] = {"command": cmd_unescaped}
+    if tail.strip():
+        try:
+            tail_obj = json.loads("{" + tail.lstrip().lstrip(",") + "}")
+            if isinstance(tail_obj, dict):
+                args.update(tail_obj)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {"name": name, "arguments": args}
+
+
 def parse_lenient_json_object(raw: str) -> dict[str, Any] | None:
-    """Repairs common Tier-B model JSON quirks (trailing commas, outer stringification)."""
+    """Repairs common model JSON quirks (trailing commas, `\\xHH`/`\\'` escapes, raw newlines, unescaped quotes)."""
     cleaned = raw.strip()
-    for candidate in (cleaned, TRAILING_COMMA_RE.sub(r"\1", cleaned)):
+    if not cleaned:
+        return None
+    repaired_esc = _repair_json_string_literals(cleaned, escape_interior_quotes=False)
+    repaired_quotes = _repair_json_string_literals(cleaned, escape_interior_quotes=True)
+    candidates = (
+        cleaned,
+        TRAILING_COMMA_RE.sub(r"\1", cleaned),
+        repaired_esc,
+        TRAILING_COMMA_RE.sub(r"\1", repaired_esc),
+        repaired_quotes,
+        TRAILING_COMMA_RE.sub(r"\1", repaired_quotes),
+    )
+    for candidate in candidates:
         try:
             parsed = json.loads(candidate)
             if isinstance(parsed, str):
@@ -448,17 +592,19 @@ def parse_lenient_json_object(raw: str) -> dict[str, Any] | None:
                 return parsed
         except (json.JSONDecodeError, TypeError):
             continue
-    return None
+    return _salvage_command_tool_call(cleaned)
 
 
 def extract_fallback_tool_calls(
     text: str, known_tool_names: set[str] | None = None
 ) -> tuple[str, list[CanonicalPart]]:
-    """Extracts `<tool_call>{...}</tool_call>` or fenced JSON tool invocations for Tier-B models (CT-04)."""
+    """Extracts `<crux_tool_call>{...}</crux_tool_call>` / `<tool_call>{...}</tool_call>` or fenced JSON tool calls (CT-04)."""
     calls: list[CanonicalPart] = []
     spans_to_strip: list[tuple[int, int]] = []
+    seen_call_keys: set[tuple[str, str]] = set()
+    matched_xml = False
 
-    for regex in (XML_TOOL_CALL_RE, FENCED_JSON_RE):
+    for is_xml, regex in ((True, XML_TOOL_CALL_RE), (False, FENCED_JSON_RE)):
         for m in regex.finditer(text):
             raw_json = m.groupdict().get("body") or m.group(1)
             obj = parse_lenient_json_object(raw_json)
@@ -472,6 +618,11 @@ def extract_fallback_tool_calls(
                 continue
             if known_tool_names is not None and name not in known_tool_names:
                 continue
+            spans_to_strip.append(m.span())
+            dedup_key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            if dedup_key in seen_call_keys:
+                continue
+            seen_call_keys.add(dedup_key)
             calls.append(
                 CanonicalPart(
                     kind="tool_call",
@@ -480,8 +631,8 @@ def extract_fallback_tool_calls(
                     tool_args=args,
                 )
             )
-            spans_to_strip.append(m.span())
         if calls:
+            matched_xml = is_xml
             break
 
     if not spans_to_strip:

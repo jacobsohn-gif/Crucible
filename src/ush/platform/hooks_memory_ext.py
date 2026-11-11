@@ -624,12 +624,19 @@ class MemoryManager:
         self.loaded_paths.clear()
         chunks: list[str] = []
 
-        # Scope 1: User Global (`~/.ush/USH.md`, `~/.ush/memory/MEMORY.md`)
+        # Scope 1: User Global (`~/.ush/USH.md`, `~/.ush/memory/MEMORY.md`, `~/.ush/rules/*.md`)
         for gp in (self.ush_home / "USH.md", self.memory_index_path):
             if gp.is_file():
                 c = self._read_with_imports(gp)
                 if c:
                     chunks.append(c)
+        rules_dir = self.ush_home / "rules"
+        if rules_dir.is_dir():
+            for rp in sorted(rules_dir.glob("*.md")):
+                if rp.is_file():
+                    c = self._read_with_imports(rp)
+                    if c:
+                        chunks.append(c)
 
         # Scope 2: Active Extensions
         for ep in self.extension_context_files:

@@ -532,6 +532,148 @@ class TestHarnessUpgrades(unittest.TestCase):
         self.assertIn("Sandbox boundary violation", joined_facts)
         self.assertIn("pytest -q", joined_facts)
 
+    def test_xml_tool_call_escape_repair_dedup_unparsed_retry_and_evaluator_resilience(self) -> None:
+        from ush.brain.agy_acp import ToolCallTagStreamSplitter, _strip_acp_hallucinated_wrappers
+        from ush.brain.evaluator_isolation import IsolatedEvaluatorRunner
+        from ush.brain.wire import extract_fallback_tool_calls
+        from ush.platform.hooks_memory_ext import MemoryManager
+
+        # 1. Repair \x27 hex escapes, \' single-quote escapes, and unescaped interior quotes in run_command
+        raw_hex = (
+            '<crux_tool_call>{"name": "run_command", "arguments": {"command": '
+            '"python3 -c \\"print(d.get(\\x27id\\x27))\\""}}</crux_tool_call>'
+        )
+        txt1, calls1 = extract_fallback_tool_calls(raw_hex, {"run_command"})
+        self.assertEqual(len(calls1), 1)
+        self.assertEqual(calls1[0].tool_name, "run_command")
+        self.assertIn("'id'", calls1[0].tool_args["command"])
+
+        raw_sq = (
+            "Waiting for tool response.\n\n"
+            '<crux_tool_call>{"name": "run_command", "arguments": {"command": '
+            '"echo \\"Stephen\\\'s Crucible\\""}}</crux_tool_call>\n'
+            "Waiting for tool response.\n</tool_response>\n</USER_REQUEST>"
+        )
+        txt2, calls2 = extract_fallback_tool_calls(raw_sq, {"run_command"})
+        self.assertEqual(len(calls2), 1)
+        self.assertEqual(_strip_acp_hallucinated_wrappers(txt2), "")
+        self.assertIn("Stephen's Crucible", calls2[0].tool_args["command"])
+
+        raw_heredoc = (
+            '<crux_tool_call>{"name": "run_command", "arguments": {"command": '
+            '"python3 - << \'PY\'\\nmsg = (\n    "Hello @commander"\n)\\nprint(json.dumps({"a": msg}))\\nPY", '
+            '"timeout_seconds": 55}}</crux_tool_call>\nWaiting for tool response.'
+        )
+        txt3, calls3 = extract_fallback_tool_calls(raw_heredoc, {"run_command"})
+        self.assertEqual(len(calls3), 1)
+        self.assertEqual(calls3[0].tool_args.get("timeout_seconds"), 55)
+        self.assertIn("Hello @commander", calls3[0].tool_args["command"])
+
+        # 2. Deduplicate identical tool calls emitted in the same turn & keep inline `<crux_tool_call>` prose intact
+        dup_raw = f"{raw_hex}\n{raw_hex}"
+        _, calls_dup = extract_fallback_tool_calls(dup_raw, {"run_command"})
+        self.assertEqual(len(calls_dup), 1)
+
+        sp = ToolCallTagStreamSplitter()
+        vis_md = sp.feed("Documenting `<crux_tool_call>` inline in markdown table.") + sp.flush()
+        self.assertEqual(vis_md, "Documenting `<crux_tool_call>` inline in markdown table.")
+
+        sp2 = ToolCallTagStreamSplitter()
+        vis_tc = (
+            sp2.feed("Checking status.\n<crux_tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"ls\"}}</crux_tool_call>\nWaiting for tool response.\n<tool_response>fake</tool_response>")
+            + sp2.flush()
+        )
+        self.assertEqual(vis_tc.strip(), "Checking status.")
+
+        # 3. Unparsed `<crux_tool_call>{...` in SessionRunner triggers 1-turn IMPROPER_FORMAT repair instead of stopping mid-task!
+        class _UnparsedThenValidTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def stream_turn(self, **_kwargs: Any) -> CanonicalMessage:
+                self.calls += 1
+                if self.calls == 1:
+                    return CanonicalMessage(
+                        role="assistant",
+                        parts=[CanonicalPart(kind="text", text='<crux_tool_call>{"name": "run_command", "arguments": {BROKEN}}')],
+                        stop_reason=StopReason.STOP,
+                    )
+                if self.calls == 2:
+                    return CanonicalMessage(
+                        role="assistant",
+                        parts=[
+                            CanonicalPart(
+                                kind="tool_call",
+                                tool_call_id="c_fix",
+                                tool_name="run_command",
+                                tool_args={"command": "echo RECOVERED_OK"},
+                            )
+                        ],
+                        stop_reason=StopReason.STOP,
+                    )
+                return CanonicalMessage(
+                    role="assistant",
+                    parts=[CanonicalPart(kind="text", text="Task completed after repair.")],
+                    stop_reason=StopReason.STOP,
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            ws = root / "ws"
+            home = root / "home"
+            ws.mkdir()
+            (home / "rules").mkdir(parents=True)
+            (home / "rules" / "swarm.md").write_text("# Swarm Rule\nUse SWARM_HOST.", encoding="utf-8")
+
+            mm = MemoryManager(ws, ush_home=home)
+            self.assertIn("Use SWARM_HOST.", mm.initial_memory_block())
+
+            # Outside-sandbox paths passed to consult_evaluator are skipped cleanly without raising PermissionError
+            fw = SecurityFirewall(ws)
+            reg = build_default_tool_registry()
+            ctx = ToolExecutionContext(
+                call_id="ce_out",
+                firewall=fw,
+                stale_tracker=StaleReadTracker(),
+                pty=PersistentPtyManager(ws),
+                policy_engine=PolicyEngine(),
+                mode=PermissionMode.AUTO_EDIT,
+            )
+            try:
+                ce_part = reg.get("consult_evaluator").handler(
+                    {"evaluator": "challenge_design", "files": ["../outside_repo/file.py"], "goal": "Test sibling path resilience"},
+                    ctx,
+                )
+                self.assertFalse(ce_part.is_error)
+            finally:
+                ctx.pty.close_all()
+
+            vault = CredentialVault(home / "creds.json")
+            auth = AuthProfile(
+                name="agy-antigravity",
+                provider="antigravity",
+                auth_kind="none",
+                base_url="agy://acp",
+                default_model="gemini-4-argon",
+                source="agy_cli",
+                api_mode="agy_acp",
+            )
+            runner = SessionRunner(
+                workspace_root=ws,
+                client=UniversalModelClient(vault, _UnparsedThenValidTransport()),
+                auth_profile=auth,
+                model_profile=resolve_model_profile("gemini-4-argon", "antigravity"),
+                mode=PermissionMode.AUTO_EDIT,
+                ush_home=home,
+            )
+            try:
+                out = runner.run_turn("Run check")
+                self.assertEqual(out.steps_executed, 3)
+                self.assertIn("Task completed after repair.", out.final_message.plain_text())
+                self.assertTrue(runner.isolated_evaluator._is_usable_auth(auth))
+            finally:
+                runner.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,7 +66,14 @@ class IsolatedEvaluatorRunner:
         self.thinking_effort = thinking_effort
         self._on_trace_event = on_trace_event
         self._lock = threading.Lock()
+        self._failed_profile_names: set[str] = set()
         self.last_trace: IsolatedEvalTrace | None = None
+
+    @staticmethod
+    def _is_usable_auth(auth: AuthProfile | None) -> bool:
+        if auth is None:
+            return False
+        return bool(auth.auth_kind != "none" or getattr(auth, "api_mode", "") == "agy_acp")
 
     def is_live_llm_available(self) -> bool:
         """Returns True iff a real isolated LLM call can be issued without hijacking test doubles."""
@@ -81,7 +88,7 @@ class IsolatedEvaluatorRunner:
         eval_auth, _, _ = self.select_evaluator_target()
         if eval_auth is None:
             eval_auth = actor_auth
-        return eval_auth is not None and eval_auth.auth_kind != "none"
+        return self._is_usable_auth(eval_auth)
 
     def select_evaluator_target(
         self,
@@ -99,12 +106,16 @@ class IsolatedEvaluatorRunner:
 
         chosen_auth: AuthProfile | None = None
         if self.vault is not None and actor_fam:
-            chosen_auth = self.vault.select_cross_family_profile(actor_fam, exclude_profile=actor_name)
-        if chosen_auth is None:
+            cand = self.vault.select_cross_family_profile(actor_fam, exclude_profile=actor_name)
+            if cand is not None and cand.name not in self._failed_profile_names:
+                chosen_auth = cand
+        if chosen_auth is None or not self._is_usable_auth(chosen_auth):
             chosen_auth = actor_auth
-        if chosen_auth is None and self.vault is not None:
-            chosen_auth = self.vault.get_active_profile()
-        if chosen_auth is None:
+        if (chosen_auth is None or not self._is_usable_auth(chosen_auth)) and self.vault is not None:
+            cand_active = self.vault.get_active_profile()
+            if cand_active is not None and cand_active.name not in self._failed_profile_names:
+                chosen_auth = cand_active
+        if chosen_auth is None or not self._is_usable_auth(chosen_auth):
             return None, None, False
 
         env_model = os.environ.get("CRUX_EVAL_MODEL", "").strip()
@@ -191,7 +202,32 @@ class IsolatedEvaluatorRunner:
                 on_event=None,
             )
         except Exception:
-            return ""
+            self._failed_profile_names.add(eval_auth.name)
+            actor_auth = self._get_actor_auth()
+            actor_prof = self._get_actor_profile()
+            if (
+                actor_auth is not None
+                and actor_auth.name != eval_auth.name
+                and self._is_usable_auth(actor_auth)
+                and actor_prof is not None
+            ):
+                eval_auth = actor_auth
+                eval_prof = actor_prof
+                is_cross = False
+                try:
+                    reply = eval_client.generate(
+                        profile=eval_prof,
+                        auth_profile=eval_auth,
+                        system_prompt=system_prompt,
+                        history=[user_msg],
+                        tools=[],
+                        session_id=isolated_sid,
+                        on_event=None,
+                    )
+                except Exception:
+                    return ""
+            else:
+                return ""
 
         raw_text = reply.plain_text().strip()
         thought_text = reply.thinking_text().strip()

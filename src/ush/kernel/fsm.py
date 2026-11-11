@@ -684,6 +684,20 @@ class SessionRunner:
 
                     sr = last_assistant.stop_reason
                     tcalls = last_assistant.tool_calls()
+                    if not tcalls and sr == StopReason.STOP and ("<crux_tool_call>" in plain_txt or "<tool_call>" in plain_txt):
+                        import re as _re
+
+                        if _re.search(r"<(?:crux_tool_call|tool_call)>\s*\{", plain_txt):
+                            sr = StopReason.IMPROPER_FORMAT
+                            last_assistant.stop_reason = StopReason.IMPROPER_FORMAT
+                            last_assistant.parts = [
+                                p
+                                for p in last_assistant.parts
+                                if not (
+                                    p.kind == "text"
+                                    and _re.search(r"<(?:crux_tool_call|tool_call)>\s*\{", p.text or "")
+                                )
+                            ]
 
                     # Deterministic ModelStopReason transition table
                     if sr in (StopReason.CANCELED, StopReason.CONTENT_FILTER, StopReason.FATAL_ERROR):
@@ -781,6 +795,7 @@ class SessionRunner:
                         committed_steps += 1
                         self.phase = LoopPhase.POST_INVOCATION
                     elif tcalls:
+                        output_retries = 0
                         # Tier-B stability: clamp to 1 tool call per step if compact local model emitted multiple
                         if self.model_profile.tier == ModelTier.B and len(tcalls) > 1:
                             keep_first = tcalls[0]

@@ -255,6 +255,12 @@ class SecurityFirewall:
         # Dynamically expandable read roots (e.g. granted when `activate_skill` activates an external skill!)
         self.extra_read_roots: list[pathlib.Path] = []
         self.extra_write_roots: list[pathlib.Path] = []
+        raw_extra_read = (os.environ.get("CRUX_EXTRA_READ_ROOTS") or os.environ.get("USH_EXTRA_READ_ROOTS") or "").strip()
+        if raw_extra_read:
+            for item in raw_extra_read.split(os.pathsep):
+                clean_item = item.strip()
+                if clean_item:
+                    self.grant_read_directory(pathlib.Path(clean_item))
 
     def grant_read_directory(self, directory: pathlib.Path) -> pathlib.Path:
         resolved = directory.expanduser().resolve()
