@@ -384,7 +384,9 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
 
             # `sql_guard` has `paths: ["*.sql"]`, so it is excluded from Turn-0 `<available_evaluators>`
             t0_catalog = hs.initial_evaluator_catalog()
-            self.assertIn("trajectory_sentinel", t0_catalog)
+            self.assertIn("cold_eyes_review", t0_catalog)
+            self.assertIn("challenge_design", t0_catalog)
+            self.assertIn("break_loop", t0_catalog)
             self.assertNotIn("sql_guard", t0_catalog)
 
             # Touching `queries/report.sql` unlocks `<evaluators_delta>`
@@ -392,11 +394,13 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
             self.assertIn("<evaluators_delta>", delta)
             self.assertIn("sql_guard", delta)
 
-            # Live ToolRegistry wire schema dynamically exposes custom plugin in `lens` enum!
+            # Live ToolRegistry wire schema dynamically exposes workflow modes + custom plugin in `evaluator` enum!
             reg = build_default_tool_registry()
             schemas = reg.wire_schemas(evaluator_enum=hs.all_evaluator_ids())
             ce_schema = next(s for s in schemas if s["name"] == "consult_evaluator")
-            self.assertIn("sql_guard", ce_schema["input_schema"]["properties"]["lens"]["enum"])
+            ev_enum = ce_schema["input_schema"]["properties"]["evaluator"]["enum"]
+            self.assertEqual(ev_enum[:3], ["cold_eyes_review", "challenge_design", "break_loop"])
+            self.assertIn("sql_guard", ev_enum)
 
             # 3. Declarative MarkdownPromptEvaluator enforces blind isolation (`actor_claim_text` stripped!)
             captured_prompts: list[tuple[str, str]] = []
@@ -727,11 +731,284 @@ class TestOpenMCPServerAndDynamicExtensibility(unittest.TestCase):
             try:
                 out = runner.run_turn("Create ratio.py cleanly")
                 self.assertEqual(out.steps_executed, 5)
-                self.assertIn("trajectory_sentinel", seen_msgs[2])
+                self.assertIn("break_loop", seen_msgs[2])
                 self.assertTrue(any("[CRUX_EVALS_ADVISORY]" in m and "ZeroDivisionError" in m for m in seen_msgs))
                 self.assertIn("Acknowledged advisory", out.final_message.plain_text())
             finally:
                 runner.close()
+
+    def test_zero_briefing_workflow_evaluators_multimodal_screenshots_and_linter_cap(self) -> None:
+        """Verifies zero-briefing {evaluator, files} API, untracked disk head+tail hydration, multimodal PNG screenshot parts, linter caps, and MCP exposure."""
+        import base64
+        import struct
+        import zlib
+        from crux_evals.mcp_server import CruxEvalsMCPServer
+        from ush.auth.vault import AuthProfile, CredentialVault
+        from ush.brain.model_tiers import resolve_model_profile
+        from ush.brain.providers import ProviderTransport, UniversalModelClient
+        from ush.core.types import CanonicalMessage, CanonicalPart, PermissionMode, StopReason, StreamEvent
+        from ush.kernel.fsm import SessionRunner
+
+        def _make_tiny_png() -> bytes:
+            def _chunk(tag: bytes, data: bytes) -> bytes:
+                return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+            ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+            idat = zlib.compress(b"\x00\xff\x00\x00")
+            return b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+        png_bytes = _make_tiny_png()
+        png_b64 = base64.b64encode(png_bytes).decode("ascii")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            ws = root / "ws"
+            home = root / "ush_home"
+            ws.mkdir(parents=True)
+            home.mkdir(parents=True)
+
+            # Untracked >16k responsive interactive HTML file (no git repo needed) + PNG screenshot
+            large_html = (
+                '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">'
+                '<title>HEAD_MARKER_STUDIO</title></head><body>\n'
+                '<button id="run">Run</button><input id="speed" type="range" min="1" max="10" value="5"/>\n'
+                + ("<!-- filler padding line -->\n" * 620)
+                + "<script>document.getElementById('run').addEventListener('click',()=>{window.__state={scheme:'ok'};}); // TAIL_MARKER_SHADER_FIX</script>\n</body></html>\n"
+            )
+            self.assertGreater(len(large_html), 16_000)
+            (ws / "studio.html").write_text(large_html, encoding="utf-8")
+            (ws / "shot.png").write_bytes(png_bytes)
+
+            vault = CredentialVault(ush_home=home, probe_ambient=False)
+            actor_auth = vault.register_api_key_profile(
+                "stub_actor", "openai", "stub-actor-key", base_url="https://api.openai.com/v1", default_model="gpt-5"
+            )
+            vault.register_api_key_profile(
+                "stub_eval", "anthropic", "stub-eval-key", base_url="https://api.anthropic.com", default_model="claude-sonnet-4"
+            )
+
+            actor_calls = 0
+            cold_calls = 0
+            eval_calls: list[dict[str, Any]] = []
+
+            class _WorkflowStubTransport(ProviderTransport):
+                allow_isolated_evaluator = True
+
+                def stream_turn(
+                    self,
+                    *,
+                    profile: Any,
+                    auth_profile: AuthProfile,
+                    system_prompt: str,
+                    messages: list[CanonicalMessage],
+                    tools: list[dict[str, Any]],
+                    session_id: str,
+                    on_event: Any = None,
+                ) -> CanonicalMessage:
+                    nonlocal actor_calls, cold_calls
+                    # Clean-room isolated evaluator invocation (`tools == []`, single user message)
+                    if not tools:
+                        user_msg = messages[-1]
+                        text_blob = "\n".join(p.text for p in user_msg.parts if p.kind == "text")
+                        img_parts = [p for p in user_msg.parts if p.kind == "image"]
+                        is_workflow = (
+                            "Cold-Eyes Clean-Room Pre-Ship Critic" in system_prompt
+                            or "Cold-Eyes Architecture & Design Critic" in system_prompt
+                            or "Orthogonal Clean-Room Debugger" in system_prompt
+                        )
+                        eval_calls.append(
+                            {
+                                "sys": system_prompt,
+                                "text": text_blob,
+                                "images": img_parts,
+                                "msg_count": len(messages),
+                                "tools_count": len(tools),
+                                "is_workflow": is_workflow,
+                            }
+                        )
+                        if "Cold-Eyes Clean-Room Pre-Ship Critic" in system_prompt:
+                            cold_calls += 1
+                            if cold_calls == 1:
+                                # Return 7 findings to verify cold_eyes_review <= 5 linter cap
+                                payload = {
+                                    "status": "FINDINGS",
+                                    "summary": "Detected 7 defects; top 5 surfaced.",
+                                    "findings": [
+                                        {"target": f"studio.html:{i}", "issue": f"Defect number {i}", "fix": f"Apply fix {i}"}
+                                        for i in range(1, 8)
+                                    ],
+                                }
+                            else:
+                                payload = {"status": "PASS", "summary": "Verified clean render and script.", "findings": []}
+                        elif "Cold-Eyes Architecture & Design Critic" in system_prompt:
+                            payload = {
+                                "status": "FINDINGS",
+                                "summary": "1 pre-build uniform mismatch caught.",
+                                "findings": [{"target": "studio.html:state", "issue": "Uniform key drift", "fix": "Use single schema key"}],
+                            }
+                        elif "Orthogonal Clean-Room Debugger" in system_prompt:
+                            # Return 5 hypotheses to verify break_loop <= 3 cap
+                            payload = {
+                                "status": "FINDINGS",
+                                "summary": "3 orthogonal framebuffer hypotheses.",
+                                "findings": [
+                                    {"target": f"shader_layer_{i}", "issue": f"Orthogonal cause {i}", "fix": f"Probe {i}"}
+                                    for i in range(1, 6)
+                                ],
+                            }
+                        else:
+                            payload = {"analysis": "Clean patch.", "bars": 1.0, "blind_spots": [], "unverified_claims": []}
+                        raw = json.dumps(payload)
+                        if on_event:
+                            on_event(StreamEvent(kind="text_delta", text=raw))
+                        return CanonicalMessage(
+                            role="assistant",
+                            parts=[CanonicalPart(kind="text", text=raw)],
+                            stop_reason=StopReason.STOP,
+                        )
+
+                    actor_calls += 1
+                    if actor_calls == 1:
+                        # Zero-briefing call: ONLY evaluator + files (no goal/objective!)
+                        tc = CanonicalPart(
+                            kind="tool_call",
+                            tool_call_id="call_cold_1",
+                            tool_name="consult_evaluator",
+                            tool_args={"evaluator": "cold_eyes_review", "files": ["studio.html", "shot.png"]},
+                        )
+                    elif actor_calls == 2:
+                        tc = CanonicalPart(
+                            kind="tool_call",
+                            tool_call_id="call_cold_2",
+                            tool_name="consult_evaluator",
+                            tool_args={"evaluator": "cold_eyes_review", "files": ["studio.html", "shot.png"]},
+                        )
+                    elif actor_calls == 3:
+                        tc = CanonicalPart(
+                            kind="tool_call",
+                            tool_call_id="call_design",
+                            tool_name="consult_evaluator",
+                            tool_args={"evaluator": "challenge_design", "files": ["studio.html"], "goal": "Verify uniform state keys"},
+                        )
+                    else:
+                        return CanonicalMessage(
+                            role="assistant",
+                            parts=[CanonicalPart(kind="text", text="Workflow verification finished cleanly.")],
+                            stop_reason=StopReason.STOP,
+                        )
+                    return CanonicalMessage(
+                        role="assistant",
+                        parts=[CanonicalPart(kind="text", text="SECRET_ACTOR_REASONING_COT"), tc],
+                        stop_reason=StopReason.STOP,
+                    )
+
+            client = UniversalModelClient(vault=vault, transport=_WorkflowStubTransport(), sleep_fn=lambda _: None)
+            runner = SessionRunner(
+                workspace_root=ws,
+                client=client,
+                auth_profile=actor_auth,
+                model_profile=resolve_model_profile("gpt-5", "openai"),
+                mode=PermissionMode.YOLO,
+                ush_home=home,
+            )
+            try:
+                out = runner.run_turn("Build an interactive 3D WebGL visualizer")
+                self.assertIn("Workflow verification finished cleanly", out.final_message.plain_text())
+                wf_calls = [c for c in eval_calls if c["is_workflow"]]
+                self.assertEqual(len(wf_calls), 3)
+                for ec in eval_calls:
+                    self.assertEqual(ec["msg_count"], 1)
+                    self.assertEqual(ec["tools_count"], 0)
+                    self.assertNotIn("SECRET_ACTOR_REASONING_COT", ec["text"])
+
+                # Inspect captured isolated call #0 (`cold_eyes_review` with zero briefing + screenshot)
+                c0 = wf_calls[0]
+                self.assertIn("<task_objective>\nBuild an interactive 3D WebGL visualizer\n</task_objective>", c0["text"])
+                self.assertIn("HEAD_MARKER_STUDIO", c0["text"])
+                self.assertIn("middle chars elided", c0["text"])
+                self.assertIn("TAIL_MARKER_SHADER_FIX", c0["text"])
+                self.assertIn("<attached_screenshots>\nshot.png", c0["text"])
+                self.assertEqual(len(c0["images"]), 1)
+                self.assertEqual(c0["images"][0].mime_type, "image/png")
+                self.assertEqual(c0["images"][0].base64_data, png_b64)
+
+                # Inspect tool outputs recorded in conversation history (cold_eyes #1 FINDINGS<=5, cold_eyes #2 PASS, challenge_design)
+                tool_results = [
+                    json.loads(p.text)
+                    for m in runner.dag.active_messages()
+                    if m.role == "tool"
+                    for p in m.parts
+                    if p.kind == "tool_result" and p.text.lstrip().startswith("{")
+                ]
+                self.assertGreaterEqual(len(tool_results), 3)
+                r0, r1, r2 = tool_results[0], tool_results[1], tool_results[2]
+                self.assertEqual(r0["status"], "FINDINGS")
+                self.assertEqual(r0["workflow_phase"], "pre_ship")
+                self.assertEqual(len(r0["findings"]), 5)
+                self.assertEqual(r1["status"], "PASS")
+                self.assertEqual(r1["findings"], [])
+                self.assertEqual(r2["evaluator"], "challenge_design")
+                self.assertEqual(r2["workflow_phase"], "pre_build")
+                self.assertIn("<proposed_focus>\nVerify uniform state keys", wf_calls[2]["text"])
+                self.assertIn("<task_objective>\nBuild an interactive 3D WebGL visualizer\n</task_objective>", wf_calls[2]["text"])
+
+                # Record 2 failing tool attempts and verify break_loop <= 3 cap + error & screenshot hydration
+                tel = runner.hook_runner.session_telemetry
+                assert tel is not None
+                tel.record_after_tool(
+                    tool_name="exec_pty",
+                    tool_args={"command": "node check.js"},
+                    output_raw="RuntimeError: black WebGL framebuffer #1",
+                    is_error=True,
+                    exit_code=1,
+                )
+                tel.record_after_tool(
+                    tool_name="exec_pty",
+                    tool_args={"command": "node check.js"},
+                    output_raw="RuntimeError: black WebGL framebuffer #2",
+                    is_error=True,
+                    exit_code=1,
+                )
+                brk = runner.hook_runner.consult_evaluator(
+                    lens="break_loop",
+                    target_paths=["studio.html", "shot.png"],
+                    llm_judge=runner.isolated_evaluator.make_llm_callable("break_loop"),
+                )
+                self.assertEqual(brk["workflow_phase"], "when_stuck")
+                self.assertEqual(brk["status"], "FINDINGS")
+                self.assertLessEqual(len(brk["findings"]), 3)
+                wf_calls_after = [c for c in eval_calls if c["is_workflow"]]
+                self.assertEqual(len(wf_calls_after), 4)
+                self.assertIn("black WebGL framebuffer", wf_calls_after[3]["text"])
+                self.assertEqual(len(wf_calls_after[3]["images"]), 1)
+            finally:
+                runner.close()
+
+            # Verify Open-Protocol MCP server exposes and runs workflow primitives with screenshots
+            server = CruxEvalsMCPServer(workspace_root=ws)
+            list_resp = server.handle_jsonrpc({"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}})
+            tool_names = [t["name"] for t in list_resp["result"]["tools"]]
+            for wf in ("cold_eyes_review", "challenge_design", "break_loop"):
+                self.assertIn(wf, tool_names)
+
+            call_resp = server.handle_jsonrpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "cold_eyes_review",
+                        "arguments": {"files": ["studio.html", "shot.png"], "goal": "Verify studio render"},
+                    },
+                }
+            )
+            self.assertFalse(call_resp["result"]["isError"])
+            sc = call_resp["result"]["structuredContent"]
+            self.assertEqual(sc["evaluator"], "cold_eyes_review")
+            self.assertEqual(sc["workflow_phase"], "pre_ship")
+            self.assertEqual(sc["files_inspected"], ["studio.html"])
+            self.assertEqual(sc["screenshots_inspected"], ["shot.png"])
+            self.assertLessEqual(len(sc["findings"]), 5)
 
 
 if __name__ == "__main__":

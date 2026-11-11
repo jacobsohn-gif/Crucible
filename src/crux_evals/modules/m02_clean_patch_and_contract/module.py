@@ -93,7 +93,7 @@ class CleanPatchAndContractEvaluator(BaseEvaluator):
                 continue
             try:
                 content = fp.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 continue
             if CONFLICT_MARKER_RE.search(content):
                 vetoes.append("HARD_VETO_CONFLICT_MARKERS")

@@ -16,13 +16,136 @@ Architectural Principles:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+import base64
 import hashlib
 import importlib.resources
 import json
+import mimetypes
 import pathlib
 import re
-from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
+import threading
+from typing import Any, Callable, Iterator, Literal, Optional, Protocol, Sequence, runtime_checkable
+
+_IMAGE_MIME_BY_EXT: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+_MAX_EVAL_IMAGE_BYTES = 4 * 1024 * 1024
+_EVAL_IMAGE_TLS = threading.local()
+
+
+@dataclass(frozen=True)
+class ImageAttachment:
+    """Screenshot or image artifact hydrated cleanly from workspace disk for multimodal cold-eyes inspection."""
+
+    path: str
+    mime_type: str
+    base64_data: str
+
+
+@contextmanager
+def scoped_eval_images(images: Sequence[ImageAttachment]) -> Iterator[None]:
+    """Attaches multimodal images in thread-local scope for an isolated `LLMJudgeCallable` call."""
+    prev = getattr(_EVAL_IMAGE_TLS, "images", ())
+    _EVAL_IMAGE_TLS.images = tuple(images)
+    try:
+        yield
+    finally:
+        _EVAL_IMAGE_TLS.images = prev
+
+
+def get_current_eval_images() -> tuple[ImageAttachment, ...]:
+    """Returns any screenshot attachments bound to the current evaluator call."""
+    return tuple(getattr(_EVAL_IMAGE_TLS, "images", ()))
+
+
+def _elide_middle_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 80:
+        return text[:max_chars]
+    half = (max_chars - 64) // 2
+    omitted = len(text) - (2 * half)
+    return f"{text[:half]}\n\n... [{omitted:,} middle chars elided] ...\n\n{text[-half:]}"
+
+
+def split_targets_and_load_images(
+    workspace_root: pathlib.Path,
+    raw_paths: Sequence[str],
+    *,
+    validate_path: Callable[[str], pathlib.Path] | None = None,
+) -> tuple[list[str], list[ImageAttachment]]:
+    """Splits requested paths into non-image workspace files and base64-loaded image screenshots."""
+    ws = workspace_root.expanduser().resolve()
+    text_paths: list[str] = []
+    images: list[ImageAttachment] = []
+
+    for rp in raw_paths:
+        raw = str(rp).strip()
+        if not raw:
+            continue
+        fp = validate_path(raw) if validate_path is not None else (
+            pathlib.Path(raw).resolve() if pathlib.Path(raw).is_absolute() else (ws / raw).resolve()
+        )
+        try:
+            rel = fp.relative_to(ws).as_posix()
+        except ValueError:
+            rel = str(fp)
+
+        ext = fp.suffix.lower()
+        if ext in _IMAGE_MIME_BY_EXT and fp.is_file():
+            try:
+                raw_bytes = fp.read_bytes()
+                if 0 < len(raw_bytes) <= _MAX_EVAL_IMAGE_BYTES:
+                    mime = mimetypes.guess_type(str(fp))[0] or _IMAGE_MIME_BY_EXT[ext]
+                    b64 = base64.b64encode(raw_bytes).decode("ascii")
+                    if not any(img.path == rel for img in images):
+                        images.append(ImageAttachment(path=rel, mime_type=mime, base64_data=b64))
+                    continue
+            except OSError:
+                pass
+
+        if rel not in text_paths:
+            text_paths.append(rel)
+
+    return text_paths, images
+
+
+def read_bounded_target_excerpts(
+    workspace_root: pathlib.Path,
+    target_paths: Sequence[str],
+    *,
+    max_files: int = 6,
+    max_chars_per_file: int = 12_000,
+    total_chars: int = 36_000,
+) -> str:
+    """Hydrates raw files from disk using head+tail bounding so single-file HTML/JS apps expose both layout & logic."""
+    ws = workspace_root.expanduser().resolve()
+    excerpts: list[str] = []
+    used = 0
+    for rel in target_paths[:max_files]:
+        fp = pathlib.Path(rel)
+        if not fp.is_absolute():
+            fp = (ws / fp).resolve()
+        if fp.suffix.lower() in _IMAGE_MIME_BY_EXT or not fp.is_file():
+            continue
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        budget = min(max_chars_per_file, max(1_000, total_chars - used))
+        bounded = _elide_middle_text(content, budget)
+        block = f"--- {rel} ({len(content):,} chars) ---\n{bounded}"
+        excerpts.append(block)
+        used += len(bounded)
+        if used >= total_chars:
+            break
+    return "\n\n".join(excerpts) if excerpts else "(none)"
 
 
 def load_package_text_resource(
@@ -111,6 +234,7 @@ class EvaluationFrame:
     unified_git_diff: str = ""
     modified_files: tuple[str, ...] = ()
     read_files: tuple[str, ...] = ()
+    attached_images: tuple[ImageAttachment, ...] = ()
 
     # 4. Trajectory & Verification Telemetry
     tool_history: tuple[ToolRecord, ...] = ()
@@ -622,18 +746,6 @@ class MarkdownPromptEvaluator(BaseEvaluator):
             '"suggested_next_probes":[],"remediation":"","uncertainty":0.1}'
         )
 
-        file_excerpts: list[str] = []
-        for rel in safe_frame.modified_files[:6]:
-            fp = pathlib.Path(rel)
-            if not fp.is_absolute():
-                fp = (ws / fp).resolve()
-            if fp.is_file():
-                try:
-                    content = fp.read_text(encoding="utf-8", errors="replace")[:4_000]
-                    file_excerpts.append(f"--- {rel} ---\n{content}")
-                except OSError:
-                    continue
-
         diff_block = safe_frame.unified_git_diff[:16_000] if safe_frame.unified_git_diff.strip() else "(no git diff)"
         verif_block = (
             safe_frame.last_verification_output[:4_000]
@@ -645,7 +757,12 @@ class MarkdownPromptEvaluator(BaseEvaluator):
             if not self.manifest.requires_blind_context and safe_frame.actor_claim_text
             else ""
         )
-        excerpts_block = "\n\n".join(file_excerpts) if file_excerpts else "(none)"
+        excerpts_block = read_bounded_target_excerpts(ws, safe_frame.modified_files)
+        imgs_block = (
+            ", ".join(img.path for img in safe_frame.attached_images)
+            if safe_frame.attached_images
+            else "(none)"
+        )
 
         user_payload = (
             f"<task_objective>\n{safe_frame.task_objective}\n</task_objective>\n\n"
@@ -653,6 +770,7 @@ class MarkdownPromptEvaluator(BaseEvaluator):
             + ("\n".join(f"- {inv}" for inv in safe_frame.declared_invariants) or "(none)")
             + "\n</declared_invariants>\n\n"
             f"<modified_files>\n{', '.join(safe_frame.modified_files) or '(none)'}\n</modified_files>\n\n"
+            f"<attached_screenshots>\n{imgs_block}\n</attached_screenshots>\n\n"
             f"<anonymous_git_diff>\n{diff_block}\n</anonymous_git_diff>\n\n"
             f"<target_file_excerpts>\n{excerpts_block}\n</target_file_excerpts>\n\n"
             f"<raw_verification_output passed=\"{safe_frame.last_verification_passed}\">\n"
@@ -678,7 +796,8 @@ class MarkdownPromptEvaluator(BaseEvaluator):
             )
 
         sys_p, user_p = self.build_isolated_prompt(safe_frame)
-        raw = self.llm_judge(sys_p, user_p, safe_frame.actor_model_family)
+        with scoped_eval_images(safe_frame.attached_images):
+            raw = self.llm_judge(sys_p, user_p, safe_frame.actor_model_family)
         m = re.search(r"\{.*\}", raw or "", re.DOTALL)
         if not m:
             snippet = (raw or "").strip()[:500]

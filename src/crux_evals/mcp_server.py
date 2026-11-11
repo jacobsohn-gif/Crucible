@@ -28,9 +28,14 @@ import subprocess
 import sys
 from typing import Any
 
-from crux_evals.core.protocol import BaseEvaluator, EvaluatorProtocol
+from crux_evals.core.protocol import (
+    BaseEvaluator,
+    EvaluatorProtocol,
+    split_targets_and_load_images,
+)
 from crux_evals.core.runner import build_default_cascade
 from crux_evals.core.state import HarnessTelemetryStore, VERIFICATION_CMD_RE
+from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -92,6 +97,43 @@ class CruxEvalsMCPServer:
                 }
             )
 
+        # Zero-briefing workflow-transition tools (Pre-Build, Pre-Ship, When-Stuck)
+        wf_descs = {
+            "challenge_design": (
+                "[Pre-Build | Clean-Room] Stress-tests architecture, state keys & edge traps before writing >250L code/UI "
+                "(returns PASS or <=5 surgical items)."
+            ),
+            "cold_eyes_review": (
+                "[Pre-Ship | Clean-Room] Zero-history linter over raw files, diffs, tests & screenshots right before finalizing "
+                "(returns PASS or <=5 surgical fixes)."
+            ),
+            "break_loop": (
+                "[When-Stuck | Clean-Room] Call after 2 failed attempts on the same bug/render issue for <=3 orthogonal root-cause hypotheses & probes."
+            ),
+        }
+        for wf_name in WORKFLOW_MODES:
+            tools.append(
+                {
+                    "name": wf_name,
+                    "description": wf_descs[wf_name],
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Workspace file paths and/or screenshots (.png/.jpg) to inspect cold.",
+                            },
+                            "goal": {
+                                "type": "string",
+                                "description": "Short 1-line objective (optional).",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                }
+            )
+
         # Suite-wide meta-tool to run the entire multi-stage cascade in one call
         tools.append(
             {
@@ -136,14 +178,17 @@ class CruxEvalsMCPServer:
         session_id = str(args.get("session_id") or os.environ.get("USH_SESSION_ID", "default"))
         telemetry = self.store.load(session_id=session_id, workspace_root=str(self.workspace_root))
 
-        if args.get("task_objective"):
-            telemetry.task_objective = str(args["task_objective"])
+        if args.get("goal") or args.get("task_objective"):
+            telemetry.task_objective = str(args.get("goal") or args.get("task_objective"))
         if isinstance(args.get("invariants"), list):
             telemetry.declared_invariants = [str(x) for x in args["invariants"]]
 
-        target_paths = (
-            [str(x) for x in args["target_paths"]] if isinstance(args.get("target_paths"), list) else None
+        raw_files = args.get("files") if isinstance(args.get("files"), list) else args.get("target_paths")
+        text_paths, attached_images = split_targets_and_load_images(
+            self.workspace_root,
+            [str(x) for x in raw_files] if isinstance(raw_files, list) else [],
         )
+        target_paths = text_paths if isinstance(raw_files, list) else None
 
         # Optional server-side empirical test command execution (out-of-band from Actor)
         test_cmd = str(args.get("test_cmd", "")).strip()
@@ -181,6 +226,28 @@ class CruxEvalsMCPServer:
             target_paths=target_paths,
             actor_claim_text=str(args["proposed_claims"]) if args.get("proposed_claims") else None,
         )
+        if attached_images:
+            from dataclasses import replace
+
+            frame = replace(frame, attached_images=tuple(attached_images))
+
+        if name in WORKFLOW_MODES:
+            payload = run_workflow_evaluator(
+                name,
+                frame,
+                self.cascade,
+                focus_note=str(args.get("goal") or args.get("objective") or ""),
+            )
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(payload, indent=2, ensure_ascii=False),
+                    }
+                ],
+                "structuredContent": payload,
+                "isError": False,
+            }
 
         if name == "eval_run_suite":
             report = self.cascade.run(frame)

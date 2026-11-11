@@ -91,18 +91,16 @@ BUILTIN_SKILLS: tuple[SkillDefinition, ...] = (
     ),
     SkillDefinition(
         name="crux-evals",
-        description="Select independent, model-isolated Crux-Evals lenses (`consult_evaluator`) based on usefulness to uncover blind spots and counterexamples.",
-        when_to_use="When debugging loops (>=2 failures), after non-trivial code/UI edits, or before finalizing complex work.",
+        description="Run zero-history clean-room evaluators (`consult_evaluator`) at Pre-Build (`challenge_design`), Pre-Ship (`cold_eyes_review`), and When-Stuck (`break_loop`) with zero briefing tax.",
+        when_to_use="Before >250L builds (`challenge_design`), right before shipping non-trivial code/UI/screenshots (`cold_eyes_review`), or after 2 failed attempts (`break_loop`).",
         tier="builtin",
         body=(
-            "Use `consult_evaluator(lens, objective, target_paths)` selectively when genuinely useful (skip for trivial reads):\n"
-            "- `trajectory_sentinel`: when repeated errors or edit oscillations happen.\n"
-            "- `clean_patch_and_contract`: after multi-file edits to audit AST syntax, secret hygiene, and test integrity.\n"
-            "- `adversarial_falsifier`: after non-trivial algorithms, parsers, or math to synthesize & run `/tmp` boundary probes.\n"
-            "- `artifact_enhancer`: after generating HTML/TSX/SVG visualizations or UI deliverables.\n"
-            "- `epistemic_grounding_auditor`: before concluding root-cause investigations or summarizing verification.\n"
-            "- `blind_bars_judge`: for provenance-blind cross-family quality scoring of complex changes.\n"
-            "All blind lenses strip Actor Chain-of-Thought cleanly; use findings silently without leaking scorecards."
+            "`consult_evaluator(evaluator, files, goal)` executes in an isolated zero-history clean-room unpolluted by your build context "
+            "and returns `PASS` or at most 3–5 surgical file/element fixes (zero essays):\n"
+            "- `challenge_design` (Pre-Build): pass target files + 1-line `goal` right before large writes/refactors to catch schema/state/layout traps.\n"
+            "- `cold_eyes_review` (Pre-Ship): pass raw source/HTML files + verification screenshots (`.png`) right before your final answer.\n"
+            "- `break_loop` (When Stuck): call after 2 failed attempts on the same bug/render issue for <=3 orthogonal root-cause hypotheses & probes.\n"
+            "- Custom plugins from `<available_evaluators>` can also be passed by exact ID. Act silently without exposing evaluator metadata."
         ),
     ),
     SkillDefinition(

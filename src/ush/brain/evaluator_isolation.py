@@ -154,7 +154,7 @@ class IsolatedEvaluatorRunner:
         user_payload: str,
         actor_model_family: str | None = None,
     ) -> str:
-        """Executes a single isolated, tool-free, zero-history evaluator model call."""
+        """Executes a single isolated, tool-free, zero-history evaluator model call (including screenshots)."""
         if not self.is_live_llm_available():
             return ""
         eval_auth, eval_prof, is_cross = self.select_evaluator_target(actor_model_family)
@@ -162,11 +162,23 @@ class IsolatedEvaluatorRunner:
         if eval_auth is None or eval_prof is None or eval_client is None:
             return ""
 
+        from crux_evals.core.protocol import get_current_eval_images
+
+        eval_images = get_current_eval_images()
+        parts: list[CanonicalPart] = [CanonicalPart(kind="text", text=user_payload)]
+        for img in eval_images:
+            if img.base64_data:
+                parts.append(
+                    CanonicalPart(
+                        kind="image",
+                        mime_type=img.mime_type or "image/png",
+                        base64_data=img.base64_data,
+                        alt_text=img.path,
+                    )
+                )
+
         isolated_sid = f"crux_eval_isolated:{evaluator_tag}:{new_id('ev')}"
-        user_msg = CanonicalMessage(
-            role="user",
-            parts=[CanonicalPart(kind="text", text=user_payload)],
-        )
+        user_msg = CanonicalMessage(role="user", parts=parts)
         try:
             # Hardline separation: tools=[], empty history, ZERO Actor streaming callback leaks
             reply = eval_client.generate(
@@ -220,6 +232,7 @@ class IsolatedEvaluatorRunner:
                             "cross_family": is_cross,
                             "evaluator_thought": thought_text[:2_400],
                             "evaluator_analysis": analysis_text[:1_200],
+                            "screenshots": len(eval_images),
                         },
                     )
                 )
@@ -249,7 +262,7 @@ def _extract_analysis_summary(raw_text: str) -> str:
         try:
             obj = json.loads(m.group(0))
             if isinstance(obj, dict):
-                for key in ("analysis", "remediation", "critique"):
+                for key in ("summary", "analysis", "remediation", "critique"):
                     val = str(obj.get(key) or "").strip()
                     if val:
                         return val

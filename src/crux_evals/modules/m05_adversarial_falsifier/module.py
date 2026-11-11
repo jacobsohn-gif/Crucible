@@ -164,7 +164,7 @@ class AdversarialFalsifierEvaluator(BaseEvaluator):
                 continue
             try:
                 tree = ast.parse(fp.read_text(encoding="utf-8"), filename=rel_path)
-            except SyntaxError:
+            except (OSError, UnicodeDecodeError, SyntaxError):
                 continue
 
             for node in tree.body:

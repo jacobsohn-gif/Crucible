@@ -14,6 +14,8 @@ from crux_evals.core.protocol import (
     EvaluationVerdict,
     LLMJudgeCallable,
     load_package_text_resource,
+    read_bounded_target_excerpts,
+    scoped_eval_images,
 )
 from crux_evals.core.registry import register_evaluator
 
@@ -44,6 +46,12 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
 
         invariants_block = "\n".join(f"- {inv}" for inv in blind_frame.declared_invariants) or "(none declared)"
         diff_block = blind_frame.unified_git_diff[:24_000] if blind_frame.unified_git_diff.strip() else "(no git diff)"
+        excerpts_block = (
+            read_bounded_target_excerpts(pathlib.Path(blind_frame.workspace_root), blind_frame.modified_files)
+            if blind_frame.modified_files
+            else "(none)"
+        )
+        imgs_block = ", ".join(img.path for img in blind_frame.attached_images) or "(none)"
         verif_block = (
             blind_frame.last_verification_output[:6_000]
             if blind_frame.last_verification_output.strip()
@@ -53,7 +61,9 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
             f"<task_objective>\n{blind_frame.task_objective}\n</task_objective>\n\n"
             f"<declared_invariants>\n{invariants_block}\n</declared_invariants>\n\n"
             f"<modified_files>\n{', '.join(blind_frame.modified_files) or '(none)'}\n</modified_files>\n\n"
+            f"<attached_screenshots>\n{imgs_block}\n</attached_screenshots>\n\n"
             f"<anonymous_git_diff>\n{diff_block}\n</anonymous_git_diff>\n\n"
+            f"<target_files_from_disk>\n{excerpts_block}\n</target_files_from_disk>\n\n"
             f"<raw_verification_output passed=\"{blind_frame.last_verification_passed}\">\n"
             f"{verif_block}\n</raw_verification_output>"
         )
@@ -65,11 +75,12 @@ class BlindBarsJudgeEvaluator(BaseEvaluator):
             return self._deterministic_bars_fallback(blind_frame)
 
         user_payload = self.build_blind_prompt(blind_frame)
-        raw_reply = self.llm_judge(
-            self.rubric_prompt,
-            user_payload,
-            blind_frame.actor_model_family,
-        )
+        with scoped_eval_images(blind_frame.attached_images):
+            raw_reply = self.llm_judge(
+                self.rubric_prompt,
+                user_payload,
+                blind_frame.actor_model_family,
+            )
         if not raw_reply or not raw_reply.strip():
             return self._deterministic_bars_fallback(blind_frame)
         m = re.search(r"\{.*\}", raw_reply, re.DOTALL)

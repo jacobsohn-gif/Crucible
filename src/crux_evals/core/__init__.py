@@ -11,11 +11,16 @@ from crux_evals.core.protocol import (
     EvaluatorParadigm,
     EvaluatorProtocol,
     HookEvent,
+    ImageAttachment,
     LLMJudgeCallable,
     MarkdownPromptEvaluator,
     ToolRecord,
+    get_current_eval_images,
     load_package_text_resource,
+    read_bounded_target_excerpts,
+    scoped_eval_images,
     sha256_short,
+    split_targets_and_load_images,
 )
 from crux_evals.core.registry import EvaluatorRegistry, register_evaluator
 from crux_evals.core.runner import EvaluatorCascadeRunner, build_default_cascade
@@ -27,6 +32,7 @@ from crux_evals.core.state import (
     compute_error_signature,
     discover_git_modified_files,
 )
+from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
 
 __all__ = [
     "BaseEvaluator",
@@ -42,16 +48,23 @@ __all__ = [
     "EvaluatorRegistry",
     "HarnessTelemetryStore",
     "HookEvent",
+    "ImageAttachment",
     "LLMJudgeCallable",
     "MarkdownPromptEvaluator",
     "SessionTelemetry",
     "ToolRecord",
+    "WORKFLOW_MODES",
     "build_default_cascade",
     "capture_git_diff",
     "compute_action_signature",
     "compute_error_signature",
     "discover_git_modified_files",
+    "get_current_eval_images",
     "load_package_text_resource",
+    "read_bounded_target_excerpts",
     "register_evaluator",
+    "run_workflow_evaluator",
+    "scoped_eval_images",
     "sha256_short",
+    "split_targets_and_load_images",
 ]

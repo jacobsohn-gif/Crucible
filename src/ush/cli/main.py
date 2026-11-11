@@ -1707,6 +1707,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         trust = RepoTrustStore(ush_home).is_trusted(workspace)
         if act == "run":
+            from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
+
             store = HarnessTelemetryStore(workspace / ".ush" / "evaluator_state")
             tel = store.load("default", str(workspace))
             if args.objective:
@@ -1718,6 +1720,9 @@ def main(argv: list[str] | None = None) -> int:
                 short_circuit_on_stage_veto=False,
             )
             frame = tel.to_evaluation_frame("MCPConsult")
+            if args.eval_target and args.eval_target in WORKFLOW_MODES:
+                print(json.dumps(run_workflow_evaluator(args.eval_target, frame, cascade), indent=2, ensure_ascii=False))
+                return 0
             if args.eval_target and args.eval_target != "all":
                 ev = cascade.get_evaluator(args.eval_target)
                 if ev is None:

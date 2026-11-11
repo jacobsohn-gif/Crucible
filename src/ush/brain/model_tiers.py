@@ -297,12 +297,13 @@ def build_adaptive_system_prompt(
     )
 
     eval_rule_s_a = (
-        "Evaluators (`consult_evaluator`) — choose selectively by usefulness, just like tools (skip on trivial reads/Q&A):\n"
-        "- `trajectory_sentinel`: when debugging hits >=2 repeated failures or edits oscillate.\n"
-        "- `clean_patch_and_contract` / `adversarial_falsifier`: after non-trivial code, math, parser, or test edits.\n"
-        "- `artifact_enhancer`: after creating/updating HTML, SVG, TSX, or interactive visualizations.\n"
-        "- `blind_bars_judge` / `epistemic_grounding_auditor`: before finalizing multi-file changes or summarizing root cause.\n"
-        "- Isolation hardline: blind evaluators inspect ONLY workspace ground truth (never your thoughts); act on findings silently—never print evaluator scorecards into user deliverables."
+        "Clean-Room Evaluators (`consult_evaluator`) — runs in a ZERO-HISTORY isolated session unpolluted by your "
+        "build context (sees ONLY raw files, diffs, screenshots & test output — never your reasoning), returning `PASS` "
+        "or at most 3–5 surgical fixes (never scope-ballooning essays). Skip on trivial reads/Q&A; invoke reflexively at workflow transitions:\n"
+        "- Pre-Build (`challenge_design`): call right before writing a >250-line file or multi-file change (`files=[...], goal='...'`) to catch schema/state/layout traps early.\n"
+        "- Pre-Ship (`cold_eyes_review`): call right before your final user response on non-trivial code/UI/viz (`files=['app.html', 'shot.png']`) to catch blind-spot bugs (`X vs Y`, dead controls, screenshot defects).\n"
+        "- When Stuck (`break_loop`): call after 2 failed attempts on the same bug/render issue for <=3 orthogonal root-cause hypotheses & probes.\n"
+        "- Never print internal evaluator metadata into user deliverables."
     )
 
     if profile.tier == ModelTier.S:
@@ -338,7 +339,7 @@ def build_adaptive_system_prompt(
             "- Briefly write `<scratchpad>Fact: ... | Hypothesis: ... | Next: tool_name</scratchpad>` (max 4 lines).\n"
             "- Call AT MOST ONE tool per response. Always `read_file` before `edit_file`.\n"
             "- After editing code, ALWAYS run tests via `exec_pty` before saying done.\n"
-            "- If stuck >=2 attempts or finishing a complex edit, call `consult_evaluator(lens=..., objective=...)`.\n"
+            "- If stuck >=2 attempts or pre-ship on complex code/UI, call `consult_evaluator(evaluator='cold_eyes_review'|'break_loop', files=[...])`.\n"
             "- Prefer native tool calls; if unavailable, emit `<crux_tool_call>{\"name\":\"...\",\"arguments\":{...}}</crux_tool_call>`."
         )
 

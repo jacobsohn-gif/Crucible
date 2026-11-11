@@ -145,15 +145,19 @@ class ToolRegistry:
                         "required": ["name"],
                     },
                 }
-            elif name == "consult_evaluator" and evaluator_enum:
+            elif name == "consult_evaluator":
                 base_schema = d["input_schema"]
                 props = dict(base_schema.get("properties") or {})
-                lens_enum = [str(e) for e in evaluator_enum if str(e) and str(e) != "all"]
-                if "all" not in lens_enum:
-                    lens_enum.append("all")
-                lens_prop = dict(props.get("lens") or {"type": "string"})
-                lens_prop["enum"] = lens_enum
-                props["lens"] = lens_prop
+                wf_head = ["cold_eyes_review", "challenge_design", "break_loop"]
+                extra_ids = [
+                    str(e)
+                    for e in (evaluator_enum or [])
+                    if str(e) and str(e) not in (*wf_head, "all")
+                ]
+                eval_enum = [*wf_head, *extra_ids, "all"]
+                ev_prop = dict(props.get("evaluator") or {"type": "string"})
+                ev_prop["enum"] = eval_enum
+                props["evaluator"] = ev_prop
                 d = {
                     "name": d["name"],
                     "description": d["description"],
@@ -618,55 +622,64 @@ def build_default_tool_registry() -> ToolRegistry:
 
     
     def _consult_evaluator(args: dict[str, Any], ctx: ToolExecutionContext) -> CanonicalPart:
-        """Native read-only enhancement & audit tool consulting Crux-Evals in strict isolation."""
+        """Clean-room zero-history evaluator tool supporting workflow transitions (`challenge_design`, `cold_eyes_review`, `break_loop`) and custom plugins."""
         import json
+        from dataclasses import replace
+        from crux_evals.core.protocol import EvaluationFrame, split_targets_and_load_images
+        from crux_evals.core.runner import build_default_cascade
+        from crux_evals.core.state import capture_git_diff, discover_git_modified_files
+        from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
 
         ws = ctx.firewall.workspace_root
-        lens = str(args.get("lens", "blind_bars_judge") or "blind_bars_judge").strip()
-        objective = str(args.get("objective", "Evaluate artifact quality and correctness"))
+        chosen = str(args.get("evaluator") or args.get("lens") or "cold_eyes_review").strip()
+        goal = str(args.get("goal") or args.get("objective") or "").strip()
         proposed_claims = str(args.get("proposed_claims", "")).strip() or None
-        raw_paths = args.get("target_paths") or []
-        target_paths: list[str] = []
-        if isinstance(raw_paths, list):
-            for rp in raw_paths:
-                resolved = ctx.firewall.resolve_and_validate(str(rp), write=False)
-                try:
-                    target_paths.append(str(resolved.relative_to(ws)))
-                except ValueError:
-                    target_paths.append(str(resolved))
+        raw_files = args.get("files") if isinstance(args.get("files"), list) else args.get("target_paths")
+        raw_list = [str(rp) for rp in raw_files] if isinstance(raw_files, list) else []
+
+        text_paths, attached_images = split_targets_and_load_images(
+            ws,
+            raw_list,
+            validate_path=lambda p: ctx.firewall.resolve_and_validate(p, write=False),
+        )
 
         if ctx.evaluator_consult_callback is not None:
             payload = ctx.evaluator_consult_callback(
                 {
-                    "lens": lens,
-                    "objective": objective,
-                    "target_paths": target_paths,
+                    "evaluator": chosen,
+                    "lens": chosen,
+                    "goal": goal,
+                    "objective": goal,
+                    "files": text_paths,
+                    "target_paths": text_paths,
+                    "attached_images": attached_images,
                     "proposed_claims": proposed_claims,
                 }
             )
             return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
 
         # Standalone fallback when ToolRegistry is invoked outside SessionRunner
-        from crux_evals.core.protocol import EvaluationFrame
-        from crux_evals.core.runner import build_default_cascade
-        from crux_evals.core.state import capture_git_diff, discover_git_modified_files
-
-        if not target_paths:
-            target_paths = discover_git_modified_files(ws)
-        diff = capture_git_diff(ws, target_paths if target_paths else None)
+        if not text_paths:
+            text_paths = discover_git_modified_files(ws)
+        diff = capture_git_diff(ws, text_paths if text_paths else None)
         cascade = build_default_cascade(enforce_read_before_edit=False, workspace_root=ws)
         frame = EvaluationFrame(
             session_id="native_tool",
             workspace_root=str(ws),
             event="MCPConsult",
             step_index=1,
-            task_objective=objective,
+            task_objective=goal or "Audit artifact quality and correctness",
             unified_git_diff=diff,
-            modified_files=tuple(target_paths),
+            modified_files=tuple(text_paths),
+            attached_images=tuple(attached_images),
             actor_claim_text=proposed_claims,
         )
-        if lens != "all":
-            ev = cascade.get_evaluator(lens)
+        if chosen in WORKFLOW_MODES:
+            payload = run_workflow_evaluator(chosen, frame, cascade, focus_note=goal)
+            return CanonicalPart(kind="tool_result", text=json.dumps(payload, indent=2, ensure_ascii=False))
+
+        if chosen != "all":
+            ev = cascade.get_evaluator(chosen)
             if ev is not None:
                 verdict = ev.evaluate(frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame)
                 payload = verdict.to_mcp_payload()
@@ -855,19 +868,24 @@ def build_default_tool_registry() -> ToolRegistry:
         ToolSpec(
             "consult_evaluator",
             (
-                "Consult an independent, model-isolated Crux-Evals lens by usefulness (skip for trivial reads/Q&A): "
-                "`trajectory_sentinel` when debugging repeats >=2 failures; `clean_patch_and_contract` after multi-file "
-                "code/test edits; `adversarial_falsifier` after non-trivial logic/math/parsers; `artifact_enhancer` for "
-                "HTML/UI/visualization deliverables; `blind_bars_judge` before finalizing complex changes; "
-                "`epistemic_grounding_auditor` to verify claims; or any custom discovered evaluator / `all`. "
-                "Blind lenses inspect only workspace ground truth (never your reasoning)."
+                "Run a clean-room, zero-history critic in an isolated session unpolluted by your build history "
+                "(inspecting ONLY raw workspace files, diffs, test output & screenshots — ZERO Actor reasoning). "
+                "Just like a compiler or linter, it catches confirmation-bias bugs you can no longer see and is "
+                "guaranteed to return `PASS` or at most 3–5 surgical file/element fixes (no essays). "
+                "Use at workflow transitions (skip for trivial reads/Q&A): "
+                "`challenge_design` before writing >250L files or multi-file rewrites; "
+                "`cold_eyes_review` right before shipping non-trivial code, algorithms, or UIs (pass files + screenshots `.png`); "
+                "`break_loop` after 2 failed attempts on the same bug/render issue; or any custom plugin ID."
             ),
             {
                 "type": "object",
                 "properties": {
-                    "lens": {
+                    "evaluator": {
                         "type": "string",
                         "enum": [
+                            "cold_eyes_review",
+                            "challenge_design",
+                            "break_loop",
                             "trajectory_sentinel",
                             "clean_patch_and_contract",
                             "epistemic_grounding_auditor",
@@ -876,20 +894,23 @@ def build_default_tool_registry() -> ToolRegistry:
                             "artifact_enhancer",
                             "all",
                         ],
-                        "description": "Evaluator lens ID to consult (choose the single most useful lens, or `all`).",
+                        "description": "Clean-room workflow phase (`cold_eyes_review` | `challenge_design` | `break_loop`) or custom evaluator ID (default: `cold_eyes_review`).",
                     },
-                    "objective": {"type": "string", "description": "Focus aspect or task goal for evaluation."},
-                    "target_paths": {
+                    "files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional workspace-relative files to inspect.",
+                        "description": "Raw code/HTML files and screenshots (.png/.jpg) to inspect cold from disk (auto-hydrates modified files if omitted).",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Optional 1-line objective (defaults to user prompt; no briefing paragraph needed).",
                     },
                     "proposed_claims": {
                         "type": "string",
-                        "description": "Optional claims to verify when using `epistemic_grounding_auditor` (stripped for all blind lenses).",
+                        "description": "Optional claims audited only by `epistemic_grounding_auditor` (stripped for all clean-room evaluators).",
                     },
                 },
-                "required": ["objective"],
+                "required": [],
             },
             True,
             _consult_evaluator,

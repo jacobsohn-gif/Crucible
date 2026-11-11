@@ -232,25 +232,32 @@ class EvaluatorRegistry:
     # ---- Skill-Parity Turn-0 Catalog & Path/Situational Delta Discovery ----
 
     def initial_catalog_block(self, budget_tokens: int = 1_200) -> str:
-        """Emits cache-stable Turn-0 catalog of unconditional evaluators (omits path-scoped lenses)."""
+        """Emits cache-stable Turn-0 catalog highlighting clean-room workflow primitives + unconditional evaluators."""
         candidates = [m for m in self.list_manifests() if not m.paths]
-        if not candidates:
-            return ""
-        chosen: list[EvaluatorManifest] = []
-        used = 0
-        for m in candidates:
-            cost = m.approx_catalog_tokens()
-            if chosen and used + cost > budget_tokens:
-                continue
-            chosen.append(m)
-            used += cost
-            self._shown_fingerprints[m.evaluator_id] = m.fingerprint
-
         lines = [
             "<available_evaluators>",
-            "Call `consult_evaluator(lens, objective, target_paths)` when an independent check is genuinely useful (skip for trivial reads or simple Q&A):",
+            "Clean-room zero-history evaluators (`consult_evaluator` — pass `evaluator`, `files` [code/HTML/screenshots.png], optional 1-line `goal`):",
+            "- cold_eyes_review [pre_ship, clean-room]: Right before final answer on non-trivial code/UI/viz — inspects raw files, diffs, tests & screenshots cold; returns PASS or <=5 surgical fixes.",
+            "- challenge_design [pre_build, clean-room]: Right before writing >250L files or multi-file rewrites — catches schema/state/layout traps early (<=5 items or PASS).",
+            "- break_loop [when_stuck, clean-room]: After 2 failed attempts at a bug/render issue — ignores failed chat history and returns <=3 orthogonal hypotheses + probes.",
         ]
-        lines.extend(m.summary_line() for m in chosen)
+        used = sum(max(12, len(ln) // 4) for ln in lines)
+        for m in candidates:
+            # Mark all unconditional builtins as shown in Turn-0 so they aren't re-injected in Turn-1 delta
+            self._shown_fingerprints[m.evaluator_id] = m.fingerprint
+            if m.evaluator_id in (
+                "trajectory_sentinel",
+                "clean_patch_and_contract",
+                "epistemic_grounding_auditor",
+                "blind_bars_judge",
+                "adversarial_falsifier",
+            ):
+                continue
+            # Custom user/workspace unconditional plugins still surface clearly in Turn-0 catalog!
+            cost = m.approx_catalog_tokens()
+            if used + cost <= budget_tokens:
+                lines.append(m.summary_line())
+                used += cost
         lines.append("</available_evaluators>")
         return "\n".join(lines)
 

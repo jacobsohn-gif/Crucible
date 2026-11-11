@@ -11,7 +11,14 @@ import json
 import pathlib
 import re
 
-from crux_evals.core.protocol import BaseEvaluator, EvaluationFrame, EvaluationVerdict, LLMJudgeCallable
+from crux_evals.core.protocol import (
+    BaseEvaluator,
+    EvaluationFrame,
+    EvaluationVerdict,
+    LLMJudgeCallable,
+    read_bounded_target_excerpts,
+    scoped_eval_images,
+)
 from crux_evals.core.registry import register_evaluator
 
 LEAKED_SCORECARD_RE = re.compile(
@@ -116,17 +123,25 @@ class ArtifactEnhancerEvaluator(BaseEvaluator):
                     probes.append(f"Use native JS `BigInt` in `{fp.name}` where values can exceed `Number.MAX_SAFE_INTEGER`.")
 
         analysis = ""
-        if self.llm_judge is not None and excerpts:
+        if self.llm_judge is not None and (excerpts or safe_frame.attached_images):
             sys_p = (
-                "You are an independent Deliverable & UX Quality Evaluator. Inspect ONLY the ground-truth "
-                "user deliverable excerpts below and the task objective (zero Actor CoT). Return STRICT JSON:\n"
-                '{"analysis":"crisp independent UX/accuracy critique","blind_spots":[],"suggested_next_probes":[]}'
+                "You are a Cold-Eyes Deliverable & UX Quality Critic operating in a zero-history clean room. "
+                "Inspect ONLY the raw artifact files, screenshots, and task objective (ZERO Actor CoT). "
+                "Return STRICT JSON with AT MOST 5 surgical defects/improvements or empty lists if clean:\n"
+                '{"analysis":"1-sentence assessment","blind_spots":["target: concrete defect"],"suggested_next_probes":["exact minimal fix"]}'
+            )
+            bounded_excerpts = (
+                read_bounded_target_excerpts(ws, candidates, max_files=4, max_chars_per_file=10_000, total_chars=24_000)
+                if candidates
+                else "(none)"
             )
             usr_p = (
                 f"<task_objective>\n{safe_frame.task_objective}\n</task_objective>\n\n"
-                f"<deliverable_excerpts>\n{chr(10).join(excerpts)[:12_000]}\n</deliverable_excerpts>"
+                f"<attached_screenshots>\n{', '.join(i.path for i in safe_frame.attached_images) or '(none)'}\n</attached_screenshots>\n\n"
+                f"<deliverable_excerpts>\n{bounded_excerpts}\n</deliverable_excerpts>"
             )
-            raw = self.llm_judge(sys_p, usr_p, safe_frame.actor_model_family)
+            with scoped_eval_images(safe_frame.attached_images):
+                raw = self.llm_judge(sys_p, usr_p, safe_frame.actor_model_family)
             m = re.search(r"\{.*\}", raw or "", re.DOTALL)
             if m:
                 try:

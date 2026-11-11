@@ -221,7 +221,7 @@ class SessionRunner:
 
     def _build_consult_evaluator_callback(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
         def _consult(req: dict[str, Any]) -> dict[str, Any]:
-            lens = str(req.get("lens", "blind_bars_judge") or "blind_bars_judge")
+            chosen = str(req.get("evaluator") or req.get("lens") or "cold_eyes_review")
 
             def _last_meta() -> dict[str, Any]:
                 tr = self.isolated_evaluator.last_trace
@@ -233,12 +233,13 @@ class SessionRunner:
                 }
 
             return self.hook_runner.consult_evaluator(
-                lens=lens,
-                objective=str(req.get("objective", "")),
-                target_paths=list(req.get("target_paths") or []),
+                lens=chosen,
+                objective=str(req.get("goal") or req.get("objective") or ""),
+                target_paths=list(req.get("files") or req.get("target_paths") or []),
+                attached_images=list(req.get("attached_images") or []),
                 proposed_claims=req.get("proposed_claims"),
                 actor_model_family=self.model_profile.family,
-                llm_judge=self.isolated_evaluator.make_llm_callable(lens),
+                llm_judge=self.isolated_evaluator.make_llm_callable(chosen),
                 llm_breaker=self.isolated_evaluator.make_llm_callable("adversarial_falsifier"),
                 get_last_eval_meta=_last_meta,
             )
@@ -917,21 +918,21 @@ class SessionRunner:
                         if self.loop_guard.thrash_streak >= 2 and not thrash_eval_nudge_sent:
                             thrash_eval_nudge_sent = True
                             guard_notes.append(
-                                "Evaluator usefulness hint: repeated failures detected — call "
-                                "`consult_evaluator(lens='trajectory_sentinel', ...)` or `lens='adversarial_falsifier'` "
-                                "to inspect the loop/failure blind spot before your next edit."
+                                "Clean-room debugger hint: 2+ repeated failures detected — call "
+                                "`consult_evaluator(evaluator='break_loop', files=[...])` to get <=3 orthogonal "
+                                "root-cause hypotheses & probes unpolluted by failed retries."
                             )
                         elif (ui_edited_in_step or turn_edits_since_eval >= 2) and not eval_wave_nudge_sent:
                             eval_wave_nudge_sent = True
                             if ui_edited_in_step:
                                 guard_notes.append(
-                                    "Evaluator usefulness hint: UI/visualization file updated — consider calling "
-                                    "`consult_evaluator(lens='artifact_enhancer', target_paths=[...])` before finalizing."
+                                    "Pre-ship cold-eyes hint: UI/visualization updated — after verifying/screenshotting, call "
+                                    "`consult_evaluator(evaluator='cold_eyes_review', files=[..., 'shot.png'])` (PASS or <=5 fixes)."
                                 )
                             else:
                                 guard_notes.append(
-                                    "Evaluator usefulness hint: multi-file/non-trivial code modified — run tests via `exec_pty`, "
-                                    "and consider `consult_evaluator(lens='adversarial_falsifier' | 'clean_patch_and_contract')`."
+                                    "Pre-ship cold-eyes hint: non-trivial code updated — after running tests via `exec_pty`, "
+                                    "call `consult_evaluator(evaluator='cold_eyes_review', files=[...])` before finalizing (PASS or <=5 fixes)."
                                 )
 
                     tool_msg = CanonicalMessage(

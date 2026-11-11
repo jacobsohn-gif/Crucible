@@ -1,6 +1,7 @@
 """Crux-Evals (Crucible Assay): Universal Open-Protocol MCP & Hook Reasoning Evaluators."""
 
 from crux_evals.core import (
+    WORKFLOW_MODES,
     BaseEvaluator,
     CascadeReport,
     Decision,
@@ -14,6 +15,7 @@ from crux_evals.core import (
     EvaluatorRegistry,
     HarnessTelemetryStore,
     HookEvent,
+    ImageAttachment,
     LLMJudgeCallable,
     SessionTelemetry,
     ToolRecord,
@@ -22,8 +24,13 @@ from crux_evals.core import (
     compute_action_signature,
     compute_error_signature,
     discover_git_modified_files,
+    get_current_eval_images,
+    read_bounded_target_excerpts,
     register_evaluator,
+    run_workflow_evaluator,
+    scoped_eval_images,
     sha256_short,
+    split_targets_and_load_images,
 )
 from crux_evals.core.registry import scaffold_new_evaluator
 from crux_evals.mcp_server import CruxEvalsMCPServer
@@ -60,10 +67,17 @@ __all__ = [
     "TrajectorySentinelEvaluator",
     "build_default_cascade",
     "capture_git_diff",
+    "WORKFLOW_MODES",
+    "ImageAttachment",
     "compute_action_signature",
     "compute_error_signature",
     "discover_git_modified_files",
+    "get_current_eval_images",
+    "read_bounded_target_excerpts",
     "register_evaluator",
+    "run_workflow_evaluator",
     "scaffold_new_evaluator",
+    "scoped_eval_images",
     "sha256_short",
+    "split_targets_and_load_images",
 ]

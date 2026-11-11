@@ -179,9 +179,10 @@ class HookSystem:
     def consult_evaluator(
         self,
         *,
-        lens: str = "all",
+        lens: str = "cold_eyes_review",
         objective: str = "",
         target_paths: list[str] | None = None,
+        attached_images: list[Any] | None = None,
         proposed_claims: str | None = None,
         actor_model_family: str | None = None,
         llm_judge: Callable[..., str] | None = None,
@@ -190,17 +191,18 @@ class HookSystem:
         enforce_human_objective: bool = True,
         record_consult: bool = True,
     ) -> dict[str, Any]:
-        """Runs an on-demand evaluator lens in strict isolation from Actor reasoning."""
-        from crux_evals.core.protocol import EvaluationFrame
+        """Runs a clean-room evaluator workflow or plugin lens in strict isolation from Actor reasoning."""
+        from dataclasses import replace
+        from crux_evals.core.protocol import EvaluationFrame, split_targets_and_load_images
         from crux_evals.core.runner import build_default_cascade
         from crux_evals.core.state import capture_git_diff, discover_git_modified_files
+        from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
 
-        norm_paths: list[str] = []
-        if target_paths:
-            for rp in target_paths:
-                s = str(rp).strip()
-                if s and s not in norm_paths:
-                    norm_paths.append(s)
+        raw_paths = [str(rp).strip() for rp in (target_paths or []) if str(rp).strip()]
+        norm_paths, loaded_imgs = split_targets_and_load_images(self.workspace_root, raw_paths)
+        all_imgs = list(attached_images or []) + [
+            img for img in loaded_imgs if all(getattr(x, "path", None) != img.path for x in (attached_images or []))
+        ]
 
         with self._telemetry_lock:
             tel = self.session_telemetry
@@ -219,10 +221,12 @@ class HookSystem:
                     actor_claim_text=proposed_claims,
                     actor_model_family=actor_model_family,
                 )
-                if frame.task_objective != effective_objective:
-                    from dataclasses import replace
-
-                    frame = replace(frame, task_objective=effective_objective)
+                if frame.task_objective != effective_objective or all_imgs:
+                    frame = replace(
+                        frame,
+                        task_objective=effective_objective,
+                        attached_images=tuple(all_imgs),
+                    )
                 if record_consult:
                     self.last_consult_step = tel.step_index
                     self.consulted_lenses.add(lens)
@@ -238,6 +242,7 @@ class HookSystem:
                     task_objective=effective_objective,
                     unified_git_diff=diff,
                     modified_files=tuple(norm_paths),
+                    attached_images=tuple(all_imgs),
                     actor_claim_text=proposed_claims,
                     actor_model_family=actor_model_family,
                 )
@@ -252,15 +257,29 @@ class HookSystem:
             short_circuit_on_stage_veto=False,
         )
 
+        if lens in WORKFLOW_MODES:
+            payload = run_workflow_evaluator(
+                lens,
+                frame,
+                cascade,
+                llm_judge=llm_judge,
+                focus_note=(objective if objective.strip() != effective_objective else ""),
+            )
+            if get_last_eval_meta is not None:
+                meta = get_last_eval_meta() or {}
+                if meta.get("evaluator_model"):
+                    payload["evaluator_model"] = str(meta["evaluator_model"])
+            return payload
+
         if lens != "all":
             ev = cascade.get_evaluator(lens)
             if ev is None:
-                available = [e.manifest.evaluator_id for e in cascade.evaluators]
+                available = list(WORKFLOW_MODES) + [e.manifest.evaluator_id for e in cascade.evaluators]
                 return {
                     "evaluator": lens,
                     "status": "UNKNOWN_EVALUATOR",
-                    "error": f"Unknown evaluator lens `{lens}`.",
-                    "available_lenses": available + ["all"],
+                    "error": f"Unknown evaluator `{lens}`.",
+                    "available_evaluators": available + ["all"],
                 }
             ev_frame = frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame
             verdict = ev.evaluate(ev_frame)
@@ -274,7 +293,7 @@ class HookSystem:
             payload["isolated_context"] = True
             payload["epistemic_firewall_active"] = bool(ev.manifest.requires_blind_context)
             payload["usage_note"] = (
-                "Independent evaluator findings hydrated from workspace ground truth (zero Actor CoT). "
+                "Clean-room evaluator findings hydrated from workspace ground truth (zero Actor CoT). "
                 "Act on concrete `blind_spots`, `counterexamples`, `unverified_claims`, and `suggested_next_probes` "
                 "without leaking internal evaluator metadata into user deliverables."
             )

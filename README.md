@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-v0.1-00b4d8?style=flat-square)](https://github.com/jacobsohn-gif/Crucible/releases/tag/v0.1)
 [![Dependencies](https://img.shields.io/badge/PyPI_dependencies-0_(stdlib_only)-2ec4b6?style=flat-square)](pyproject.toml)
 [![Distributions](https://img.shields.io/badge/distributions-Source_%2B_Compiled_(Mach--O_%26_.pyz)-ff9f1c?style=flat-square)](releases/v0.1/)
-[![Verification](https://img.shields.io/badge/tests-55%2F55_passing_(CT--01..CT--28_%2B_Crux--Evals)-38b000?style=flat-square)](tests/)
+[![Verification](https://img.shields.io/badge/tests-56%2F56_passing_(CT--01..CT--28_%2B_Crux--Evals)-38b000?style=flat-square)](tests/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-6c757d?style=flat-square)](pyproject.toml)
 
 **Crucible (`crux`)** is a standalone, zero-third-party-dependency **interactive coding, reasoning-assay & 4-Gear Elastic Swarm CLI** with **uncompacted long-form thought tracing**, **streaming Terminal Markdown + LaTeX math rendering**, and **live runtime model discovery**.
@@ -46,7 +46,7 @@ Every hypothesis is tested in the fire: `crux` pairs a **Popperian falsification
 | **Chain-of-Thought Visibility** | Hidden, truncated, or lost on context compaction | **100% uncompacted `.trace.jsonl` ledger** + live `Ctrl+O` **Thinking Threads Explorer** + Markdown research notebook export |
 | **Concurrent Prompting & Menus** | Blocks keyboard while thinking; clips long options | **Always-live composer** (`Enter` queues `⏭ Up next`, `Alt+S` live-steers) + **full-width multi-line `ask_user` cards** (`Space` expand all, `1`–`9` quick-pick) |
 | **Terminal Scrollback** | Full-screen alt-buffer (`tput smcup`) breaks copy-paste | **Scrollback-native Inline Dock** (`DEC ?2026h` synchronized output, `<= cols - 1` wrapping, mouse copy works natively over SSH/`tmux`) |
-| **Independent Self-Verification** | Model grades its own output | **Native `Crux-Evals` (Crucible Assay)** 5-module MCP/Hook evaluator bank + **3-Stage Blind Cascading Judge** (`clean_patch` + `BARS` + Bradley-Terry) |
+| **Independent Self-Verification** | Model grades its own output | **Native `Crux-Evals` (Crucible Assay)** clean-room workflow critics (`challenge_design`, `cold_eyes_review`, `break_loop`) w/ multimodal screenshots & `<=3–5`-item linter output + **3-Stage Blind Cascading Judge** |
 
 ---
 
@@ -72,7 +72,7 @@ Every hypothesis is tested in the fire: `crux` pairs a **Popperian falsification
   - Added interruptible `429`/`503`/`529` exponential backoff, `HTTP 401` ADC token auto-refresh, context-overflow auto-compaction, dead-PTY shell auto-respawn, strict `functionCall` $\leftrightarrow$ `functionResponse` bijection across mid-history orphan repairs, deadlock-free `/steer`, shell-wrapper unwrapping (`sudo`/`env`/`sh -c`), `.ushignore` negation hardening, and constant-time bearer auth on `crux serve --acp`.
 
 ### Major New Capabilities
-- **Native `Crux-Evals` (Crucible Assay) Suite & Hardline Model Isolation** ([`src/crux_evals/`](src/crux_evals/), [`src/ush/brain/evaluator_isolation.py`](src/ush/brain/evaluator_isolation.py)): 6 plug-and-play evaluators (`trajectory_sentinel`, `clean_patch_and_contract`, `epistemic_grounding_auditor`, `blind_bars_judge`, `adversarial_falsifier`, generalized `artifact_enhancer`) + `consult_evaluator` tool with live `SessionTelemetry` hydration, cross-family isolated LLM inference (`tools=[]`, zero Actor history/CoT), `EVALUATOR.md` skill-like authoring (`/evaluators` & `crux eval`), and utility-driven selection hints.
+- **Native `Crux-Evals` (Crucible Assay) Clean-Room Workflow Critics & Linter Contract** ([`src/crux_evals/`](src/crux_evals/), [`src/ush/brain/evaluator_isolation.py`](src/ush/brain/evaluator_isolation.py)): Zero-history workflow-transition critics (`challenge_design` pre-build, `cold_eyes_review` pre-ship, `break_loop` when stuck) with zero-briefing `{evaluator, files, goal}` calls, multimodal screenshot (`.png`/`.jpg`/`.webp`) inspection, untracked disk head+tail file hydration, compiler-style `PASS` / `<=3–5` surgical fix output, 6 underlying modules (`m01`–`m06`), cross-family `tools=[]` isolation, and drop-in `EVALUATOR.md` / `.py` plugins (`/evaluators`, `crux eval`).
 - **Streaming Terminal Markdown Engine** ([`src/ush/cli/markdown.py`](src/ush/cli/markdown.py)): Zero-dependency incremental Markdown stream formatter with syntax-highlighted fenced blocks, Unicode box-drawn GFM tables, callout blocks, semantic headings, lists, and clickable file links.
 - **Enterprise Multi-Provider Auth & Peer CLI Delegation** ([`src/ush/auth/vault.py`](src/ush/auth/vault.py), [`src/ush/swarm/engine.py`](src/ush/swarm/engine.py)): Support for Gemini Enterprise (VPC-SC, Priority Tier, Express), OpenAI `/v1/responses` + Device/PKCE OAuth, Claude OAuth/Vertex, LiteLLM proxy discovery, workstation command-auth helpers, and `crux swarm --peer-cli` external agent delegation.
 
@@ -284,14 +284,25 @@ Crucible normalizes runtime model discovery, streaming wire protocols, extended 
 
 ## 9. Native Crux-Evals (Crucible Assay) MCP & Hook Evaluator Suite
 
-Crucible ships with **[`Crux-Evals`](src/crux_evals/)** built directly into `src/crux_evals/` (and exposed at `ush.evaluators` and `crux-evals`) so coding agents receive independent, epistemic-firewalled navigational feedback **without grading their own work**:
+Crucible ships with **[`Crux-Evals`](src/crux_evals/)** built directly into `src/crux_evals/` (and exposed at `ush.evaluators` and `crux-evals`) so coding agents run **clean-room, zero-history critics** (`tools=[]`, zero Actor CoT) that counter build-context confirmation bias like a compiler or linter:
+
+### Clean-Room Workflow Transitions (`consult_evaluator` & MCP)
+
+| Transition | Evaluator (`evaluator`) | Input (`files` + optional `goal`) | Contract (Never Balloons Scope) |
+| :--- | :--- | :--- | :--- |
+| **Pre-Build** | `challenge_design` | Existing files, mockups/screenshots, optional 1-line `goal` | Returns `PASS` or `<=5` surgical schema/state/layout traps before `>250L` edits or multi-file rewrites |
+| **Pre-Ship** | `cold_eyes_review` | Raw code/HTML files + rendered screenshots (`.png`/`.jpg`/`.webp`) | Hydrates untracked disk files (head+tail bounded) + deterministic/UX/`/tmp` checks + clean-room vision/code inspection; returns `PASS` or `<=5` concrete fixes |
+| **When Stuck** | `break_loop` | Target files, failing stdout/tracebacks, trajectory state, screenshots | Returns `<=3` orthogonal root-cause hypotheses paired with 1-line falsifying probes after `>=2` repeated failures |
+
+### Underlying Engines (`m01` – `m06` & Custom Plugins)
 
 | Stage | Evaluator ID | MCP Tool Name | Paradigm | Independent Signal Hydrated From Disk |
 | :--- | :--- | :--- | :--- | :--- |
 | **Stage 1** | `trajectory_sentinel` | `eval_trajectory_compass` | **Deterministic** (`<2ms`) | Action/error/diff hashes $\to$ detects exact loops, error-signature stagnation, A$\leftrightarrow$B patch oscillation & read spirals |
 | **Stage 1** | `clean_patch_and_contract` | `eval_invariant_and_patch` | **Deterministic** (`<20ms`) | `git diff HEAD` + Python AST + secret regexes $\to$ blocks test-assertion deletion (Anti-Goodhart), tautological asserts, secrets & unverified edits |
+| **Stage 1** | `artifact_enhancer` | `artifact_enhancer` | **Deterministic** (`<15ms`) | Disk HTML/JSX/SVG inspection $\to$ catches viewport gaps, placeholder stubs, layout/overflow hazards & internal scorecard leaks in deliverables |
 | **Stage 2** | `epistemic_grounding_auditor` | `eval_epistemic_grounding` | **Hybrid** | Read/edit ledger + raw command stdout vs. claims $\to$ enforces read-before-edit provenance & catches unverified completion claims |
-| **Stage 2** | `blind_bars_judge` | `eval_blind_judge` | **Blind LLM Judge** | Anonymous `git diff` + raw test output (**Actor CoT stripped**) $\to$ position-swapped `0.0 \| 0.5 \| 1.0` `BARS` score with Conservative Bayesian LCB |
+| **Stage 2** | `blind_bars_judge` | `eval_blind_judge` | **Blind LLM Judge** | Anonymous `git diff`, disk files, screenshots & raw test output (**Actor CoT stripped**) $\to$ position-swapped `0.0 \| 0.5 \| 1.0` `BARS` score with Conservative Bayesian LCB |
 | **Stage 3** | `adversarial_falsifier` | `eval_adversarial_prober` | **Adversarial Breaker** | Touched `.py` ASTs + isolated `/tmp` sandbox $\to$ synthesizes boundary inputs (`[]`, `0`, `-1`, `{}`, `''`) and reports only reproducible crashes |
 
 ### Using `Crux-Evals` via Built-In Tools, `/evaluators`, `crux eval`, or Open MCP
@@ -304,7 +315,7 @@ Crucible ships with **[`Crux-Evals`](src/crux_evals/)** built directly into `src
 # From any shell (works identically in compiled `crux`, `crux.pyz`, and source):
 crux eval list
 crux eval new sql_cost_guard --style md --when-to-use "When editing .sql queries"
-crux eval run --lens blind_bars_judge
+crux eval run cold_eyes_review
 crux eval mcp                           # Open-Protocol JSON-RPC 2.0 MCP Server
 ```
 
@@ -338,7 +349,7 @@ Every candidate patch in `G3`/`G4` is stripped of model identity (`clean_patch`)
 
 ## 12. Verification Matrix (`CT-01` – `CT-28` & Adversarial Suites)
 
-Run the complete `55`-test zero-dependency verification suite (`28` conformance gates in `26` test cases + `15` adversarial security/TUI/ACP replay invariants + `12` `Crux-Evals` MCP, isolation & skill-parity tests):
+Run the complete `56`-test zero-dependency verification suite (`28` conformance gates in `26` test cases + `15` adversarial security/TUI/ACP replay invariants + `15` `Crux-Evals` workflow, multimodal, MCP, isolation & skill-parity tests):
 
 ```bash
 .venv/bin/python -W error::SyntaxWarning -W error::ResourceWarning -m unittest discover -s tests -v
@@ -375,7 +386,7 @@ Run the complete `55`-test zero-dependency verification suite (`28` conformance 
 | **`CT-27`** | Antigravity ACP dynamic models, Gemini Enterprise, Claude, OpenAI `/v1/responses`, LiteLLM & `429` recovery | ✅ Pass |
 | **`CT-28`** | Zero-spam interactive tool approval dock deduplication & parallel `RwLock` prompt serialization | ✅ Pass |
 | **Security & UX Suite** | Warm multi-turn ACP session reuse, `<=135 KB` tail-safe cold hydration, LaTeX/Markdown rendering, full-width `ask_user` wrapping/`Space` expand, PTY respawn, authenticated ACP & stateful fuzzing ([`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py)) | ✅ `15/15` |
-| **Crux-Evals Suite** | Trajectory Sentinel, Anti-Goodhart `clean_patch`, Epistemic Grounding, Blind `BARS` Judge, `/tmp` Adversarial Falsifier, `artifact_enhancer`, `EVALUATOR.md` Skill Parity, Hardline Model Isolation, Utility Nudges & Open MCP ([`tests/test_crux_evals.py`](tests/test_crux_evals.py)) | ✅ `12/12` |
+| **Crux-Evals Suite** | Clean-room workflows (`challenge_design`, `cold_eyes_review`, `break_loop`), multimodal PNG screenshots, untracked disk head+tail hydration, `<=3–5` linter caps, Trajectory Sentinel, Anti-Goodhart `clean_patch`, Epistemic Grounding, Blind `BARS` Judge, `/tmp` Adversarial Falsifier, `artifact_enhancer`, `EVALUATOR.md` Skill Parity, Hardline Isolation & Open MCP ([`tests/test_crux_evals.py`](tests/test_crux_evals.py)) | ✅ `15/15` |
 
 ---
 
@@ -406,10 +417,10 @@ Run the complete `55`-test zero-dependency verification suite (`28` conformance 
 - **Extensibility Platform, 4-Gear Swarm & Native Evaluators (`src/ush/platform/`, `src/ush/swarm/`, `src/crux_evals/`)**
   - [`src/ush/platform/skills.py`](src/ush/platform/skills.py), [`src/ush/platform/commands.py`](src/ush/platform/commands.py), [`src/ush/platform/hooks_memory_ext.py`](src/ush/platform/hooks_memory_ext.py) — 4-tier `SKILL.md` loader, slash command registry, 9-event hooks, and JIT workspace memory.
   - [`src/ush/swarm/engine.py`](src/ush/swarm/engine.py) & [`src/ush/swarm/judge.py`](src/ush/swarm/judge.py) — 4-Gear Elastic Swarm, peer CLI bridge, SQLite WAL `StigmergicBlackboard`, 3-Stage Cascading Judge, and SHA-256 `ConsensusLedger`.
-  - [`src/crux_evals/`](src/crux_evals/) & [`src/ush/evaluators/`](src/ush/evaluators/) — Native `Crux-Evals` (Crucible Assay) 5-module cascade (`m01`–`m05`), auto-discovery `EvaluatorRegistry`, `cli.py` scaffolder, `cli_hook.py`, and `mcp_server.py`.
+  - [`src/crux_evals/`](src/crux_evals/) & [`src/ush/evaluators/`](src/ush/evaluators/) — Native `Crux-Evals` (Crucible Assay) 6-module engine (`m01`–`m06`), workflow primitives (`workflows.py`), auto-discovery `EvaluatorRegistry`, `cli.py` scaffolder, `cli_hook.py`, and `mcp_server.py`.
 - **Build, Release & Test Suites (`scripts/`, `releases/v0.1/`, `tests/`)**
   - [`scripts/build_release.py`](scripts/build_release.py) & [`Makefile`](Makefile) — Reproducible compiler pipeline producing native `arm64` Mach-O `crux`, portable `crux.pyz`, clean `crucible-0.1-src.tar.gz`, and `SHA256SUMS.txt`.
-  - [`tests/test_conformance_ct01_to_ct20.py`](tests/test_conformance_ct01_to_ct20.py), [`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py), [`tests/test_crux_evals.py`](tests/test_crux_evals.py) — `55` deterministic conformance, security, TUI, ACP, isolation, and evaluator tests.
+  - [`tests/test_conformance_ct01_to_ct20.py`](tests/test_conformance_ct01_to_ct20.py), [`tests/test_security_and_invariants.py`](tests/test_security_and_invariants.py), [`tests/test_crux_evals.py`](tests/test_crux_evals.py) — `56` deterministic conformance, security, TUI, ACP, isolation, workflow, and evaluator tests.
 
 ---
 

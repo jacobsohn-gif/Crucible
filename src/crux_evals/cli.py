@@ -51,9 +51,16 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--when-to-use", default="", help="Usefulness hint explaining when the model should pick this evaluator")
     p_new.add_argument("--paths", action="append", default=[], help="Optional file glob trigger (e.g. --paths '*.sql')")
 
-    p_run = sub.add_parser("run", help="Run the Crux-Evals cascade against the workspace")
+    p_run = sub.add_parser("run", help="Run a Crux-Evals workflow primitive, lens, or full cascade")
+    p_run.add_argument(
+        "evaluator",
+        nargs="?",
+        default=None,
+        help="Optional workflow primitive (cold_eyes_review, challenge_design, break_loop) or evaluator ID",
+    )
     p_run.add_argument("--workspace", default=".", help="Workspace root directory")
     p_run.add_argument("--objective", default="", help="Task objective")
+    p_run.add_argument("--files", nargs="*", default=[], help="Target code files and/or screenshots (.png/.jpg/.webp)")
     p_run.add_argument("--plugin-dir", action="append", default=[], help="Additional plugin directory")
 
     p_mcp = sub.add_parser("mcp", help="Launch the Open-Protocol JSON-RPC 2.0 MCP Server over stdio")
@@ -85,15 +92,39 @@ def main(argv: list[str] | None = None) -> int:
         return server.serve_stdio()
 
     if args.cmd == "run":
+        from crux_evals.core.protocol import scoped_eval_images, split_targets_and_load_images
+        from crux_evals.core.workflows import WORKFLOW_MODES, run_workflow_evaluator
+
         ws = pathlib.Path(args.workspace).expanduser().resolve()
         pdirs = [pathlib.Path(x).expanduser().resolve() for x in args.plugin_dir]
         store = HarnessTelemetryStore(ws / ".ush" / "evaluator_state")
         tel = store.load("default", str(ws))
         if args.objective:
             tel.task_objective = args.objective
+        target_files: list[str] = []
+        attached_images = []
+        if args.files:
+            target_files, attached_images = split_targets_and_load_images(ws, list(args.files))
         cascade = build_default_cascade(extra_plugin_dirs=pdirs, workspace_root=ws, short_circuit_on_stage_veto=False)
-        report = cascade.run(tel.to_evaluation_frame("MCPConsult"))
-        sys.stdout.write(json.dumps(report.to_mcp_payload(), indent=2, ensure_ascii=False) + "\n")
+        frame = tel.to_evaluation_frame(
+            "MCPConsult",
+            target_paths=target_files,
+            attached_images=attached_images,
+        )
+        ev_target = (args.evaluator or "").strip()
+        with scoped_eval_images(attached_images):
+            if ev_target in WORKFLOW_MODES:
+                payload = run_workflow_evaluator(ev_target, frame, cascade)
+            elif ev_target and ev_target != "all":
+                ev = cascade.get_evaluator(ev_target)
+                if ev is None:
+                    sys.stderr.write(f"Unknown evaluator `{ev_target}`.\n")
+                    return 2
+                verdict = ev.evaluate(frame.with_epistemic_firewall() if ev.manifest.requires_blind_context else frame)
+                payload = verdict.to_mcp_payload()
+            else:
+                payload = cascade.run(frame).to_mcp_payload()
+        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         return 0
 
     # Default (`list`)
